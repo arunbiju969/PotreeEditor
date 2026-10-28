@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Potree Hybrid Point Cloud Editor</title>
+
+    <link rel="stylesheet" type="text/css" href="/build/potree/potree.css">
+    <link rel="stylesheet" type="text/css" href="/libs/jquery-ui/jquery-ui.min.css">
+    <link rel="stylesheet" type="text/css" href="/libs/spectrum/spectrum.css">
+    <link rel="stylesheet" type="text/css" href="/libs/jstree/themes/mixed/style.css">
+    <link rel="stylesheet" type="text/css" href="/web/style.css">
+</head>
+<body>
+    <script src="/libs/jquery/jquery-3.1.1.min.js"></script>
+    <script src="/libs/spectrum/spectrum.js"></script>
+    <script src="/libs/jquery-ui/jquery-ui.min.js"></script>
+    <script src="/libs/other/BinaryHeap.js"></script>
+    <script src="/libs/tween/tween.min.js"></script>
+    <script src="/libs/d3/d3.js"></script>
+    <script src="/libs/proj4/proj4.js"></script>
+    <script src="/libs/i18next/i18next.js"></script>
+    <script src="/libs/jstree/jstree.js"></script>
+    <script src="/build/potree/potree.js"></script>
+    <script src="/libs/plasio/js/laslaz.js"></script>
+
+    <div id="potree_container">
+        <div id="potree_render_area"></div>
+        <div id="potree_sidebar_container" style="display:none;"></div>
+
+        <!-- Floating Top HUD Controls -->
+        <div class="top-hud">
+            <button id="btnNav" class="hud-btn active" title="Orbit / Free Navigation">
+                <span>🧭</span> Navigate
+            </button>
+            <button id="btnPolygon" class="hud-btn" title="Click to draw polygon around trees (Double-click or Right-click to finish)">
+                <span>✏️</span> Polygon Select
+            </button>
+            <button id="btnBox" class="hud-btn" title="Drag to select 3D box region">
+                <span>📦</span> Box Select
+            </button>
+            <button id="btnInspect" class="hud-btn" title="Hover/Click point to pick attributes">
+                <span>🎯</span> Pick Point
+            </button>
+            <div class="hud-divider"></div>
+            <button id="btnClear" class="hud-btn btn-danger" title="Clear current selection">
+                <span>✕</span> Clear Selection
+            </button>
+        </div>
+
+        <!-- Toast Notification -->
+        <div id="toastMsg" class="toast-msg"></div>
+
+        <!-- Floating Selection Banner -->
+        <div id="selectionBanner" class="selection-banner">
+            <div class="selection-info-text">
+                <span id="selectionSummary">Selected: <strong>0</strong> points</span>
+            </div>
+            <div class="hud-divider"></div>
+            <button id="btnQuickNoise" class="hud-btn" style="background:#b91c1c; border-color:#ef4444;">Mark Noise (7)</button>
+        </div>
+
+        <!-- Inspection Readout Card -->
+        <div id="inspectCard" class="inspect-card">
+            <h4>
+                <span>Point Attributes</span>
+                <button id="closeInspect" style="background:transparent;border:none;color:#9ca3af;cursor:pointer;">✕</button>
+            </h4>
+            <table>
+                <tr><td>X:</td><td id="inspX">-</td></tr>
+                <tr><td>Y:</td><td id="inspY">-</td></tr>
+                <tr><td>Z:</td><td id="inspZ">-</td></tr>
+                <tr><td>Classification:</td><td id="inspClass">-</td></tr>
+                <tr><td>Intensity:</td><td id="inspInt">-</td></tr>
+                <tr><td>Tree / ITC ID:</td><td id="inspITC">-</td></tr>
+            </table>
+        </div>
+    </div>
+
+    <script type="module" src="/web/app.js"></script>
+</body>
+</html>
