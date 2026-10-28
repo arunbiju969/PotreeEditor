@@ -29,9 +29,14 @@ def main():
     web_dir = app_dir / "web"
 
     # Reference Potree project directory (contains build/, libs/, resources/, PotreeConverter2/)
-    potree_dir = app_dir.parent / "potree"
-    if not potree_dir.exists():
-        # Fallback to current directory or sibling
+    env_potree = os.environ.get("POTREE_DIR")
+    if env_potree and Path(env_potree).exists():
+        potree_dir = Path(env_potree)
+    elif (app_dir.parent / "potree").exists():
+        potree_dir = app_dir.parent / "potree"
+    elif (app_dir / "potree").exists():
+        potree_dir = app_dir / "potree"
+    else:
         potree_dir = Path(r"C:\Users\w0491597\Documents\Projects\potree")
 
     print("=================================================================")

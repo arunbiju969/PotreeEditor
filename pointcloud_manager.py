@@ -240,6 +240,15 @@ class PointCloudManager:
 
         os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
         print(f"[PointCloudManager] Writing updated LAS/LAZ to: {output_path}...")
+
+        # Strip COPC VLRs/EVLRs if present, since standard LAS writers cannot re-serialize COPC format
+        if hasattr(self.las_data.header, "vlrs") and self.las_data.header.vlrs:
+            self.las_data.header.vlrs = [v for v in self.las_data.header.vlrs if getattr(v, "user_id", "") != "copc"]
+        if hasattr(self.las_data.header, "evlrs") and self.las_data.header.evlrs:
+            self.las_data.header.evlrs = [v for v in self.las_data.header.evlrs if getattr(v, "user_id", "") != "copc"]
+        if hasattr(self.las_data, "evlrs") and self.las_data.evlrs:
+            self.las_data.evlrs = [v for v in self.las_data.evlrs if getattr(v, "user_id", "") != "copc"]
+
         self.las_data.write(output_path)
         self.has_unsaved_changes = False
         print("[PointCloudManager] Save complete.")

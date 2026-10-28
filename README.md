@@ -35,6 +35,7 @@ A desktop point cloud viewer and editing environment combining:
       │ - KD-Tree Point Picking   │      │ - REST API (/api/select)  │
       │ - ITC & Class Mutations   │      │ - Serves Potree Assets    │
       │ - laspy File Read & Write │      │                           │
+      │ - lazrs Compressed LAZ    │      │                           │
       └───────────────────────────┘      └───────────────────────────┘
 ```
 
@@ -57,10 +58,17 @@ A desktop point cloud viewer and editing environment combining:
 
 Double-click or run from command line:
 ```bat
-C:\Users\w0491597\Documents\Projects\PotreeEditor\run_potree_editor.bat
+D:\Projects\PotreeEditor\run_potree_editor.bat
 ```
 
-The launcher automatically detects and uses the existing Python virtual environment in `TreeAIBox\.venv` (which already includes PyQt6, PyQt6-WebEngine, laspy, NumPy, SciPy, and Matplotlib).
+Or activate the local virtual environment and launch directly:
+```powershell
+cd D:\Projects\PotreeEditor
+.\.venv\Scripts\activate
+python main.py
+```
+
+The launcher automatically activates the dedicated virtual environment in `.venv` (configured with PyQt6, PyQt6-WebEngine, laspy, lazrs, NumPy, SciPy, and Matplotlib).
 
 ---
 
@@ -68,11 +76,14 @@ The launcher automatically detects and uses the existing Python virtual environm
 
 ```
 PotreeEditor/
+├── .venv/                      # Dedicated Python virtual environment
 ├── run_potree_editor.bat       # One-click Windows launcher
+├── run_hybrid_viewer.bat       # Alternate launcher
 ├── main.py                     # Application entry point & lifecycle
 ├── server.py                   # Local HTTP server with Range request & REST support
 ├── app_window.py               # PyQt6 MainWindow with QWebEngineView & controls
 ├── pointcloud_manager.py       # laspy-based spatial querying and editing engine
+├── requirements.txt            # Python dependencies
 ├── README.md                   # System documentation
 └── web/
     ├── index.html              # Potree viewer page with floating HUD

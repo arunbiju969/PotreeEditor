@@ -8,13 +8,13 @@ echo =================================================================
 echo   Starting Potree Hybrid Point Cloud Editor (Experimental)
 echo =================================================================
 
-:: Check for existing TreeAIBox venv or local venv
-if exist "%~dp0..\TreeAIBox\.venv\Scripts\activate.bat" (
-    echo [INFO] Activating Python environment from TreeAIBox\.venv...
-    call "%~dp0..\TreeAIBox\.venv\Scripts\activate.bat"
-) else if exist "%~dp0.venv\Scripts\activate.bat" (
+:: Check for local venv first, then sibling TreeAIBox venv
+if exist "%~dp0.venv\Scripts\activate.bat" (
     echo [INFO] Activating local .venv...
     call "%~dp0.venv\Scripts\activate.bat"
+) else if exist "%~dp0..\TreeAIBox\.venv\Scripts\activate.bat" (
+    echo [INFO] Activating Python environment from TreeAIBox\.venv...
+    call "%~dp0..\TreeAIBox\.venv\Scripts\activate.bat"
 ) else (
     echo [WARNING] No virtual environment found. Using system Python...
 )
