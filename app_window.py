@@ -3,7 +3,7 @@ Main Application Window for Potree Hybrid Viewer.
 Combines:
 - QWebEngineView hosting the Potree WebGL streaming renderer.
 - Native PyQt6 sidebar with LAS/LAZ editing controls, ITC assignment, noise tagging, and point cloud export.
-- Dedicated Settings menu and sidebar controls for Point Type, Point Size, Splat Quality, and Eye-Dome Lighting (EDL).
+- Top Settings menu and in-viewport HUD controls for Point Type, Point Size, Splat Quality, and Eye-Dome Lighting (EDL).
 """
 
 import os
@@ -16,8 +16,8 @@ from typing import Optional
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QLabel, QFileDialog, QMessageBox, QProgressBar, QSplitter,
-    QFrame, QComboBox, QCheckBox, QSpinBox, QDoubleSpinBox, QSlider,
-    QGroupBox, QStatusBar, QScrollArea
+    QFrame, QComboBox, QCheckBox, QSpinBox, QGroupBox, QStatusBar,
+    QScrollArea
 )
 from PyQt6.QtCore import Qt, QUrl, pyqtSignal, QObject
 from PyQt6.QtGui import QFont, QIcon, QColor, QAction, QActionGroup
@@ -154,28 +154,12 @@ class MainWindow(QMainWindow):
             QPushButton#btnSecondary:hover {
                 background-color: #475569;
             }
-            QComboBox, QSpinBox, QDoubleSpinBox {
+            QComboBox, QSpinBox {
                 background-color: #0f172a;
                 color: #f8fafc;
                 border: 1px solid #334155;
                 border-radius: 4px;
                 padding: 5px 8px;
-            }
-            QSlider::groove:horizontal {
-                height: 6px;
-                background: #334155;
-                border-radius: 3px;
-            }
-            QSlider::sub-page:horizontal {
-                background: #2563eb;
-                border-radius: 3px;
-            }
-            QSlider::handle:horizontal {
-                background: #60a5fa;
-                width: 14px;
-                margin-top: -4px;
-                margin-bottom: -4px;
-                border-radius: 7px;
             }
             QLabel {
                 color: #cbd5e1;
@@ -205,15 +189,15 @@ class MainWindow(QMainWindow):
         self.web_view.load(QUrl(viewer_url))
         splitter.addWidget(self.web_view)
 
-        # Set initial splitter proportions: Sidebar 360px, Viewport remainder
-        splitter.setSizes([360, 1080])
+        # Proportions: Sidebar ~330px, Viewport remainder
+        splitter.setSizes([330, 1110])
 
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
         self.status_bar.showMessage("Ready. Load a point cloud to begin.")
 
     # -------------------------------------------------------------------------
-    # Menu Bar Setup
+    # Menu Bar Setup (Settings, File)
     # -------------------------------------------------------------------------
     def init_menu_bar(self):
         menubar = self.menuBar()
@@ -241,87 +225,127 @@ class MainWindow(QMainWindow):
         act_exit.triggered.connect(self.close)
         menu_file.addAction(act_exit)
 
-        # Settings Menu (Point Type, Size, Splat Quality, EDL)
+        # Settings Menu (Point Type, Size, Splat Quality, EDL, Budget, Colors)
         menu_settings = menubar.addMenu("&Settings")
 
-        # Submenu: Point Type (Shape)
+        # 1. Point Type (Shape)
         menu_point_type = menu_settings.addMenu("Point Type (Shape)")
         self.grp_menu_point_type = QActionGroup(self)
         self.grp_menu_point_type.setExclusive(True)
-
         for name, key in [("Square", "SQUARE"), ("Circle", "CIRCLE"), ("Paraboloid (Splat)", "PARABOLOID")]:
             act = QAction(name, self, checkable=True)
             if key == "SQUARE":
                 act.setChecked(True)
-            act.setData(key)
-            act.triggered.connect(lambda checked, k=key: self._on_menu_point_type_triggered(k))
+            act.triggered.connect(lambda checked, k=key: self.set_point_shape(k))
             self.grp_menu_point_type.addAction(act)
             menu_point_type.addAction(act)
 
-        # Submenu: Point Sizing
+        # 2. Point Sizing
         menu_point_sizing = menu_settings.addMenu("Point Sizing")
         self.grp_menu_point_sizing = QActionGroup(self)
         self.grp_menu_point_sizing.setExclusive(True)
-
         for name, key in [("Adaptive", "ADAPTIVE"), ("Fixed", "FIXED"), ("Attenuated", "ATTENUATED")]:
             act = QAction(name, self, checkable=True)
             if key == "ADAPTIVE":
                 act.setChecked(True)
-            act.setData(key)
-            act.triggered.connect(lambda checked, k=key: self._on_menu_size_type_triggered(k))
+            act.triggered.connect(lambda checked, k=key: self.set_point_size_type(k))
             self.grp_menu_point_sizing.addAction(act)
             menu_point_sizing.addAction(act)
 
-        # Submenu: Splat Quality
+        # 3. Point Size Presets
+        menu_point_size = menu_settings.addMenu("Point Size")
+        self.grp_menu_point_size = QActionGroup(self)
+        self.grp_menu_point_size.setExclusive(True)
+        for name, val in [("0.5x (Small)", 0.5), ("0.8x", 0.8), ("1.0x (Normal)", 1.0), ("1.5x", 1.5), ("2.0x (Large)", 2.0), ("3.0x (Extra Large)", 3.0)]:
+            act = QAction(name, self, checkable=True)
+            if val == 1.0:
+                act.setChecked(True)
+            act.triggered.connect(lambda checked, v=val: self.set_point_size(v))
+            self.grp_menu_point_size.addAction(act)
+            menu_point_size.addAction(act)
+
+        # 4. Splat Quality
         menu_splat_quality = menu_settings.addMenu("Splat Quality")
         self.grp_menu_splat = QActionGroup(self)
         self.grp_menu_splat.setExclusive(True)
-
         for name, key in [("Standard Quality", "standard"), ("High Quality (HQ Splats)", "hq")]:
             act = QAction(name, self, checkable=True)
             if key == "standard":
                 act.setChecked(True)
-            act.setData(key)
-            act.triggered.connect(lambda checked, k=key: self._on_menu_splat_triggered(k))
+            act.triggered.connect(lambda checked, k=key: self.set_splat_quality(k))
             self.grp_menu_splat.addAction(act)
             menu_splat_quality.addAction(act)
 
         menu_settings.addSeparator()
 
-        # Eye-Dome Lighting (EDL) Toggle
-        self.act_menu_edl = QAction("Enable Eye-Dome Lighting (EDL)", self, checkable=True)
+        # 5. Eye-Dome Lighting (EDL)
+        menu_edl = menu_settings.addMenu("Eye-Dome Lighting (EDL)")
+        self.act_menu_edl = QAction("Enable Eye-Dome Lighting", self, checkable=True)
         self.act_menu_edl.setChecked(True)
-        self.act_menu_edl.toggled.connect(self._on_menu_edl_toggled)
-        menu_settings.addAction(self.act_menu_edl)
+        self.act_menu_edl.toggled.connect(self.set_edl_enabled)
+        menu_edl.addAction(self.act_menu_edl)
+        menu_edl.addSeparator()
+
+        # EDL Radius Submenu
+        menu_edl_radius = menu_edl.addMenu("EDL Radius")
+        self.grp_menu_edl_radius = QActionGroup(self)
+        self.grp_menu_edl_radius.setExclusive(True)
+        for r_val in [0.8, 1.0, 1.4, 2.0, 3.0]:
+            act = QAction(f"{r_val:.1f} px", self, checkable=True)
+            if r_val == 1.4:
+                act.setChecked(True)
+            act.triggered.connect(lambda checked, v=r_val: self.set_edl_radius(v))
+            self.grp_menu_edl_radius.addAction(act)
+            menu_edl_radius.addAction(act)
+
+        # EDL Strength Submenu
+        menu_edl_str = menu_edl.addMenu("EDL Strength")
+        self.grp_menu_edl_str = QActionGroup(self)
+        self.grp_menu_edl_str.setExclusive(True)
+        for s_val in [0.4, 0.7, 1.0, 1.5, 2.5]:
+            act = QAction(f"{s_val:.1f}", self, checkable=True)
+            if s_val == 1.0:
+                act.setChecked(True)
+            act.triggered.connect(lambda checked, v=s_val: self.set_edl_strength(v))
+            self.grp_menu_edl_str.addAction(act)
+            menu_edl_str.addAction(act)
 
         menu_settings.addSeparator()
 
-        # Toggle In-Viewport Settings Menu
-        act_toggle_hud_settings = QAction("⚙️ Toggle In-Viewport Settings Panel", self)
+        # 6. Point Budget
+        menu_budget = menu_settings.addMenu("Point Budget")
+        self.grp_menu_budget = QActionGroup(self)
+        self.grp_menu_budget.setExclusive(True)
+        for name, budget in [("1 Million", 1000000), ("2.5 Million", 2500000), ("5 Million", 5000000), ("10 Million", 10000000), ("15 Million", 15000000)]:
+            act = QAction(name, self, checkable=True)
+            if budget == 2500000:
+                act.setChecked(True)
+            act.triggered.connect(lambda checked, b=budget: self.set_point_budget(b))
+            self.grp_menu_budget.addAction(act)
+            menu_budget.addAction(act)
+
+        # 7. Color By
+        menu_color = menu_settings.addMenu("Color By")
+        self.grp_menu_color = QActionGroup(self)
+        self.grp_menu_color.setExclusive(True)
+        for name, attr in [("RGB / True Color", "rgba"), ("Classification", "classification"), ("Elevation", "elevation"), ("Intensity", "intensity"), ("Tree / ITC", "itc")]:
+            act = QAction(name, self, checkable=True)
+            if attr == "rgba":
+                act.setChecked(True)
+            act.triggered.connect(lambda checked, a=attr: self.set_color_mode(a))
+            self.grp_menu_color.addAction(act)
+            menu_color.addAction(act)
+
+        menu_settings.addSeparator()
+
+        # 8. Open In-Viewport Settings Menu (HUD)
+        act_toggle_hud_settings = QAction("⚙️ Toggle In-Viewport Settings Panel (HUD)", self)
         act_toggle_hud_settings.setShortcut("Ctrl+S")
         act_toggle_hud_settings.triggered.connect(self.toggle_in_viewport_settings)
         menu_settings.addAction(act_toggle_hud_settings)
 
-    def _on_menu_point_type_triggered(self, key: str):
-        idx = self.combo_point_type.findData(key)
-        if idx >= 0:
-            self.combo_point_type.setCurrentIndex(idx)
-
-    def _on_menu_size_type_triggered(self, key: str):
-        idx = self.combo_size_type.findData(key)
-        if idx >= 0:
-            self.combo_size_type.setCurrentIndex(idx)
-
-    def _on_menu_splat_triggered(self, key: str):
-        idx = self.combo_splat_quality.findData(key)
-        if idx >= 0:
-            self.combo_splat_quality.setCurrentIndex(idx)
-
-    def _on_menu_edl_toggled(self, checked: bool):
-        self.chk_edl.setChecked(checked)
-
     # -------------------------------------------------------------------------
-    # Sidebar Construction
+    # Sidebar Construction (Data + Editing + Save only)
     # -------------------------------------------------------------------------
     def create_sidebar(self) -> QWidget:
         container = QWidget()
@@ -434,148 +458,6 @@ class MainWindow(QMainWindow):
         v_save.addWidget(btn_save)
 
         layout.addWidget(grp_save)
-
-        # 4. Render & Visual Settings (Point Type, Size, Splat Quality, EDL)
-        grp_settings = QGroupBox("⚙️ Render & Visual Settings")
-        v_settings = QVBoxLayout(grp_settings)
-
-        # Point Type (Shape)
-        h_ptype = QHBoxLayout()
-        h_ptype.addWidget(QLabel("Point Type:"))
-        self.combo_point_type = QComboBox()
-        self.combo_point_type.addItem("Square", "SQUARE")
-        self.combo_point_type.addItem("Circle", "CIRCLE")
-        self.combo_point_type.addItem("Paraboloid (Splat)", "PARABOLOID")
-        self.combo_point_type.currentIndexChanged.connect(self.on_point_type_changed)
-        h_ptype.addWidget(self.combo_point_type)
-        v_settings.addLayout(h_ptype)
-
-        # Point Sizing (Adaptive / Fixed / Attenuated)
-        h_stype = QHBoxLayout()
-        h_stype.addWidget(QLabel("Point Sizing:"))
-        self.combo_size_type = QComboBox()
-        self.combo_size_type.addItem("Adaptive", "ADAPTIVE")
-        self.combo_size_type.addItem("Fixed", "FIXED")
-        self.combo_size_type.addItem("Attenuated", "ATTENUATED")
-        self.combo_size_type.currentIndexChanged.connect(self.on_size_type_changed)
-        h_stype.addWidget(self.combo_size_type)
-        v_settings.addLayout(h_stype)
-
-        # Point Size (Slider + DoubleSpinBox)
-        v_psize = QVBoxLayout()
-        h_psize_hdr = QHBoxLayout()
-        h_psize_hdr.addWidget(QLabel("Point Size:"))
-        self.spin_point_size = QDoubleSpinBox()
-        self.spin_point_size.setRange(0.1, 5.0)
-        self.spin_point_size.setSingleStep(0.1)
-        self.spin_point_size.setValue(1.0)
-        self.spin_point_size.valueChanged.connect(self.on_point_size_spin_changed)
-        h_psize_hdr.addWidget(self.spin_point_size)
-        v_psize.addLayout(h_psize_hdr)
-
-        self.slider_point_size = QSlider(Qt.Orientation.Horizontal)
-        self.slider_point_size.setRange(1, 50)  # /10 => 0.1 to 5.0
-        self.slider_point_size.setValue(10)
-        self.slider_point_size.valueChanged.connect(self.on_point_size_slider_changed)
-        v_psize.addWidget(self.slider_point_size)
-        v_settings.addLayout(v_psize)
-
-        # Splat Quality Control
-        h_splat = QHBoxLayout()
-        h_splat.addWidget(QLabel("Splat Quality:"))
-        self.combo_splat_quality = QComboBox()
-        self.combo_splat_quality.addItem("Standard", "standard")
-        self.combo_splat_quality.addItem("High Quality (HQ)", "hq")
-        self.combo_splat_quality.currentIndexChanged.connect(self.on_splat_quality_changed)
-        h_splat.addWidget(self.combo_splat_quality)
-        v_settings.addLayout(h_splat)
-
-        # Eye-Dome Lighting (EDL) Group
-        self.chk_edl = QCheckBox("Enable Eye-Dome Lighting (EDL)")
-        self.chk_edl.setChecked(True)
-        self.chk_edl.toggled.connect(self.on_edl_toggled)
-        v_settings.addWidget(self.chk_edl)
-
-        self.edl_container = QWidget()
-        v_edl = QVBoxLayout(self.edl_container)
-        v_edl.setContentsMargins(6, 4, 6, 4)
-        v_edl.setSpacing(6)
-
-        # EDL Radius (0.5 to 5.0)
-        h_rad_hdr = QHBoxLayout()
-        h_rad_hdr.addWidget(QLabel("EDL Radius:"))
-        self.lbl_edl_radius = QLabel("1.4")
-        self.lbl_edl_radius.setStyleSheet("font-weight:bold; color:#38bdf8;")
-        h_rad_hdr.addWidget(self.lbl_edl_radius)
-        v_edl.addLayout(h_rad_hdr)
-        self.slider_edl_radius = QSlider(Qt.Orientation.Horizontal)
-        self.slider_edl_radius.setRange(5, 50)  # /10 => 0.5 to 5.0
-        self.slider_edl_radius.setValue(14)
-        self.slider_edl_radius.valueChanged.connect(self.on_edl_radius_changed)
-        v_edl.addWidget(self.slider_edl_radius)
-
-        # EDL Strength (0.1 to 5.0)
-        h_str_hdr = QHBoxLayout()
-        h_str_hdr.addWidget(QLabel("EDL Strength:"))
-        self.lbl_edl_strength = QLabel("1.0")
-        self.lbl_edl_strength.setStyleSheet("font-weight:bold; color:#38bdf8;")
-        h_str_hdr.addWidget(self.lbl_edl_strength)
-        v_edl.addLayout(h_str_hdr)
-        self.slider_edl_strength = QSlider(Qt.Orientation.Horizontal)
-        self.slider_edl_strength.setRange(1, 50)  # /10 => 0.1 to 5.0
-        self.slider_edl_strength.setValue(10)
-        self.slider_edl_strength.valueChanged.connect(self.on_edl_strength_changed)
-        v_edl.addWidget(self.slider_edl_strength)
-
-        # EDL Opacity (0.1 to 1.0)
-        h_op_hdr = QHBoxLayout()
-        h_op_hdr.addWidget(QLabel("EDL Opacity:"))
-        self.lbl_edl_opacity = QLabel("1.00")
-        self.lbl_edl_opacity.setStyleSheet("font-weight:bold; color:#38bdf8;")
-        h_op_hdr.addWidget(self.lbl_edl_opacity)
-        v_edl.addLayout(h_op_hdr)
-        self.slider_edl_opacity = QSlider(Qt.Orientation.Horizontal)
-        self.slider_edl_opacity.setRange(10, 100)  # /100 => 0.1 to 1.0
-        self.slider_edl_opacity.setValue(100)
-        self.slider_edl_opacity.valueChanged.connect(self.on_edl_opacity_changed)
-        v_edl.addWidget(self.slider_edl_opacity)
-
-        v_settings.addWidget(self.edl_container)
-
-        # Point Budget
-        h_budget = QHBoxLayout()
-        h_budget.addWidget(QLabel("Point Budget:"))
-        self.combo_budget = QComboBox()
-        self.combo_budget.addItem("1 Million", 1000000)
-        self.combo_budget.addItem("2.5 Million", 2500000)
-        self.combo_budget.addItem("5 Million", 5000000)
-        self.combo_budget.addItem("10 Million", 10000000)
-        self.combo_budget.addItem("15 Million", 15000000)
-        self.combo_budget.setCurrentIndex(1)
-        self.combo_budget.currentIndexChanged.connect(self.on_budget_changed)
-        h_budget.addWidget(self.combo_budget)
-        v_settings.addLayout(h_budget)
-
-        # Color By
-        h_color = QHBoxLayout()
-        h_color.addWidget(QLabel("Color By:"))
-        self.combo_color = QComboBox()
-        self.combo_color.addItem("RGB / True Color", "rgba")
-        self.combo_color.addItem("Classification", "classification")
-        self.combo_color.addItem("Elevation", "elevation")
-        self.combo_color.addItem("Intensity", "intensity")
-        self.combo_color.addItem("Tree / ITC", "itc")
-        self.combo_color.currentIndexChanged.connect(self.on_color_mode_changed)
-        h_color.addWidget(self.combo_color)
-        v_settings.addLayout(h_color)
-
-        # Button to toggle in-viewport floating menu
-        btn_toggle_hud = QPushButton("🎛️ Toggle In-Viewport Settings Menu")
-        btn_toggle_hud.setObjectName("btnSecondary")
-        btn_toggle_hud.clicked.connect(self.toggle_in_viewport_settings)
-        v_settings.addWidget(btn_toggle_hud)
-
-        layout.addWidget(grp_settings)
         layout.addStretch()
 
         scroll.setWidget(content)
@@ -803,76 +685,34 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Save Error", str(e))
 
     # -------------------------------------------------------------------------
-    # Render & Visual Settings Controls (Point Type, Size, Splat, EDL)
+    # Render & Visual Settings Actions (Invoked from top Settings Menu)
     # -------------------------------------------------------------------------
-    def on_point_type_changed(self):
-        shape = self.combo_point_type.currentData()
+    def set_point_shape(self, shape: str):
         self.web_view.page().runJavaScript(f"window.setPointShape('{shape}');")
-        # Sync menu action checkmark
-        for act in self.grp_menu_point_type.actions():
-            if act.data() == shape:
-                act.setChecked(True)
-                break
 
-    def on_size_type_changed(self):
-        stype = self.combo_size_type.currentData()
+    def set_point_size_type(self, stype: str):
         self.web_view.page().runJavaScript(f"window.setPointSizeType('{stype}');")
-        for act in self.grp_menu_point_sizing.actions():
-            if act.data() == stype:
-                act.setChecked(True)
-                break
 
-    def on_point_size_slider_changed(self, val: int):
-        fval = val / 10.0
-        self.spin_point_size.blockSignals(True)
-        self.spin_point_size.setValue(fval)
-        self.spin_point_size.blockSignals(False)
-        self.web_view.page().runJavaScript(f"window.setPointSize({fval:.2f});")
+    def set_point_size(self, size: float):
+        self.web_view.page().runJavaScript(f"window.setPointSize({size:.2f});")
 
-    def on_point_size_spin_changed(self, fval: float):
-        slider_val = int(round(fval * 10))
-        self.slider_point_size.blockSignals(True)
-        self.slider_point_size.setValue(slider_val)
-        self.slider_point_size.blockSignals(False)
-        self.web_view.page().runJavaScript(f"window.setPointSize({fval:.2f});")
-
-    def on_splat_quality_changed(self):
-        quality = self.combo_splat_quality.currentData()
+    def set_splat_quality(self, quality: str):
         self.web_view.page().runJavaScript(f"window.setSplatQuality('{quality}');")
-        for act in self.grp_menu_splat.actions():
-            if act.data() == quality:
-                act.setChecked(True)
-                break
 
-    def on_edl_toggled(self, checked: bool):
-        self.edl_container.setEnabled(checked)
-        self.act_menu_edl.blockSignals(True)
-        self.act_menu_edl.setChecked(checked)
-        self.act_menu_edl.blockSignals(False)
-        val = "true" if checked else "false"
+    def set_edl_enabled(self, enabled: bool):
+        val = "true" if enabled else "false"
         self.web_view.page().runJavaScript(f"window.setEDLEnabled({val});")
 
-    def on_edl_radius_changed(self, val: int):
-        radius = val / 10.0
-        self.lbl_edl_radius.setText(f"{radius:.1f}")
+    def set_edl_radius(self, radius: float):
         self.web_view.page().runJavaScript(f"window.setEDLRadius({radius:.1f});")
 
-    def on_edl_strength_changed(self, val: int):
-        strength = val / 10.0
-        self.lbl_edl_strength.setText(f"{strength:.1f}")
+    def set_edl_strength(self, strength: float):
         self.web_view.page().runJavaScript(f"window.setEDLStrength({strength:.1f});")
 
-    def on_edl_opacity_changed(self, val: int):
-        opacity = val / 100.0
-        self.lbl_edl_opacity.setText(f"{opacity:.2f}")
-        self.web_view.page().runJavaScript(f"window.setEDLOpacity({opacity:.2f});")
-
-    def on_budget_changed(self):
-        budget = self.combo_budget.currentData()
+    def set_point_budget(self, budget: int):
         self.web_view.page().runJavaScript(f"window.setPointBudget({budget});")
 
-    def on_color_mode_changed(self):
-        attr = self.combo_color.currentData()
+    def set_color_mode(self, attr: str):
         self.web_view.page().runJavaScript(f"window.setColorAttribute('{attr}');")
 
     def toggle_in_viewport_settings(self):
