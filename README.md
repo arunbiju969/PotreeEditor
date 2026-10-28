@@ -1,4 +1,4 @@
-# Potree Hybrid Point Cloud Editor (Experimental)
+# PotreeEditor
 
 A desktop point cloud viewer and editing environment combining:
 1. **Frontend:** **Potree (Three.js + WebGL)** running inside an embedded Chromium viewport (`QWebEngineView`) for smooth **Level of Detail (LOD) out-of-core streaming** of massive point clouds (millions to billions of points).
@@ -57,7 +57,7 @@ A desktop point cloud viewer and editing environment combining:
 
 Double-click or run from command line:
 ```bat
-C:\Users\w0491597\Documents\Projects\potree_hybrid_viewer\run_hybrid_viewer.bat
+C:\Users\w0491597\Documents\Projects\PotreeEditor\run_potree_editor.bat
 ```
 
 The launcher automatically detects and uses the existing Python virtual environment in `TreeAIBox\.venv` (which already includes PyQt6, PyQt6-WebEngine, laspy, NumPy, SciPy, and Matplotlib).
@@ -67,8 +67,8 @@ The launcher automatically detects and uses the existing Python virtual environm
 ## Directory Structure
 
 ```
-potree_hybrid_viewer/
-├── run_hybrid_viewer.bat       # One-click Windows launcher
+PotreeEditor/
+├── run_potree_editor.bat       # One-click Windows launcher
 ├── main.py                     # Application entry point & lifecycle
 ├── server.py                   # Local HTTP server with Range request & REST support
 ├── app_window.py               # PyQt6 MainWindow with QWebEngineView & controls
