@@ -4,7 +4,7 @@ Supports:
 - HTTP 206 Partial Content (Range requests) for Potree 2.0 octree chunks.
 - Serving Potree core assets from the main Potree project directory.
 - Serving converted point cloud directories from arbitrary user paths.
-- REST API for polygon selection, point picking, and LAS data mutations.
+- REST API for polygon selection, point picking, optimistic visual staging, and LAS data mutations.
 """
 
 import os
@@ -56,7 +56,9 @@ class HybridRequestHandler(BaseHTTPRequestHandler):
             status = {
                 "active_las": self.manager.las_path if self.manager else None,
                 "has_unsaved": self.manager.has_unsaved_changes if self.manager else False,
-                "selected_count": len(self.manager.selected_indices) if (self.manager and self.manager.selected_indices is not None) else 0
+                "selected_count": len(self.manager.selected_indices) if (self.manager and self.manager.selected_indices is not None) else 0,
+                "staged_count": len(self.manager.staged_edits) if self.manager else 0,
+                "staged_edits": self.manager.staged_edits if self.manager else []
             }
             self.wfile.write(json.dumps(status).encode("utf-8"))
             return
@@ -108,7 +110,13 @@ class HybridRequestHandler(BaseHTTPRequestHandler):
 
         if path == "/api/select_polygon":
             coords = data.get("coordinates", [])
+            points_3d = data.get("points_3d", [])
             if self.manager:
+                self.manager.current_selection = {
+                    "type": "polygon",
+                    "coords": coords,
+                    "points_3d": points_3d
+                }
                 result = self.manager.select_by_polygon_2d(coords)
                 if self.on_event_callback:
                     self.on_event_callback("selection_changed", result)
@@ -117,6 +125,11 @@ class HybridRequestHandler(BaseHTTPRequestHandler):
             min_pt = data.get("min", [0, 0, 0])
             max_pt = data.get("max", [0, 0, 0])
             if self.manager:
+                self.manager.current_selection = {
+                    "type": "box",
+                    "min": min_pt,
+                    "max": max_pt
+                }
                 result = self.manager.select_by_box_3d(min_pt, max_pt)
                 if self.on_event_callback:
                     self.on_event_callback("selection_changed", result)
@@ -130,6 +143,39 @@ class HybridRequestHandler(BaseHTTPRequestHandler):
                 result = {"picked": picked}
                 if self.on_event_callback and picked:
                     self.on_event_callback("point_picked", picked)
+
+        elif path == "/api/stage_edit":
+            if self.manager:
+                staged = self.manager.add_staged_edit(data)
+                result = {
+                    "success": True,
+                    "edit": staged,
+                    "staged_count": len(self.manager.staged_edits)
+                }
+                if self.on_event_callback:
+                    self.on_event_callback("edit_staged", result)
+
+        elif path == "/api/remove_staged_edit":
+            edit_id = data.get("id")
+            if self.manager and edit_id:
+                removed = self.manager.remove_staged_edit(edit_id)
+                result = {
+                    "success": removed,
+                    "id": edit_id,
+                    "staged_count": len(self.manager.staged_edits)
+                }
+                if self.on_event_callback:
+                    self.on_event_callback("edit_removed", result)
+
+        elif path == "/api/clear_staged_edits":
+            if self.manager:
+                self.manager.clear_staged_edits()
+                result = {
+                    "success": True,
+                    "staged_count": 0
+                }
+                if self.on_event_callback:
+                    self.on_event_callback("edits_cleared", result)
 
         elif path == "/api/edit":
             action = data.get("action")

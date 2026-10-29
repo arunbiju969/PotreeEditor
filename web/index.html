@@ -28,161 +28,28 @@
         <div id="potree_render_area"></div>
         <div id="potree_sidebar_container" style="display:none;"></div>
 
-        <!-- Floating Top HUD Controls -->
-        <div class="top-hud">
-            <button id="btnNav" class="hud-btn active" title="Orbit / Free Navigation">
-                <span>🧭</span> Navigate
-            </button>
-            <button id="btnPolygon" class="hud-btn" title="Click to draw polygon around trees (Double-click or Right-click to finish)">
-                <span>✏️</span> Polygon Select
-            </button>
-            <button id="btnBox" class="hud-btn" title="Drag to select 3D box region">
-                <span>📦</span> Box Select
-            </button>
-            <button id="btnInspect" class="hud-btn" title="Hover/Click point to pick attributes">
-                <span>🎯</span> Pick Point
-            </button>
-            <div class="hud-divider"></div>
-            <button id="btnSettings" class="hud-btn" title="Open Settings (Point Type, Size, Splat Quality, EDL)">
-                <span>⚙️</span> Settings
-            </button>
-            <div class="hud-divider"></div>
-            <button id="btnClear" class="hud-btn btn-danger" title="Clear current selection">
-                <span>✕</span> Clear Selection
-            </button>
-        </div>
-
         <!-- Toast Notification -->
         <div id="toastMsg" class="toast-msg"></div>
 
-        <!-- Floating Settings Menu Card -->
-        <div id="settingsCard" class="settings-card" style="display:none;">
-            <div class="settings-header">
-                <h4><span>⚙️</span> Render & Display Settings</h4>
-                <button id="closeSettings" class="close-btn" title="Close Settings">✕</button>
-            </div>
-            <div class="settings-body">
-                <!-- Group 1: Point Appearance -->
-                <div class="settings-section">
-                    <div class="settings-section-title">Point Appearance</div>
-                    <div class="setting-item">
-                        <label for="cfgPointType">Point Type (Shape):</label>
-                        <select id="cfgPointType" class="setting-control">
-                            <option value="SQUARE" selected>Square</option>
-                            <option value="CIRCLE">Circle</option>
-                            <option value="PARABOLOID">Paraboloid (Splat)</option>
-                        </select>
-                    </div>
-                    <div class="setting-item">
-                        <label for="cfgPointSizeType">Point Sizing:</label>
-                        <select id="cfgPointSizeType" class="setting-control">
-                            <option value="ADAPTIVE" selected>Adaptive</option>
-                            <option value="FIXED">Fixed</option>
-                            <option value="ATTENUATED">Attenuated</option>
-                        </select>
-                    </div>
-                    <div class="setting-item">
-                        <div class="setting-label-row">
-                            <label for="sldPointSize">Point Size:</label>
-                            <span id="lblPointSize" class="setting-val">1.00</span>
-                        </div>
-                        <input id="sldPointSize" type="range" min="0.1" max="4.0" step="0.05" value="1.0" class="setting-range" />
-                    </div>
-                </div>
-
-                <!-- Group 2: Splat Quality & Budget -->
-                <div class="settings-section">
-                    <div class="settings-section-title">Quality & Splat Controls</div>
-                    <div class="setting-item">
-                        <label for="cfgSplatQuality">Splat Quality:</label>
-                        <select id="cfgSplatQuality" class="setting-control">
-                            <option value="standard" selected>Standard Quality</option>
-                            <option value="hq">High Quality (HQ Splats)</option>
-                        </select>
-                    </div>
-                    <div class="setting-item">
-                        <label for="cfgPointBudget">Point Budget:</label>
-                        <select id="cfgPointBudget" class="setting-control">
-                            <option value="1000000">1 Million</option>
-                            <option value="2500000" selected>2.5 Million</option>
-                            <option value="5000000">5 Million</option>
-                            <option value="10000000">10 Million</option>
-                            <option value="15000000">15 Million</option>
-                        </select>
-                    </div>
-                    <div class="setting-item">
-                        <div class="setting-label-row">
-                            <label for="sldMinNodeSize">Min Node Size:</label>
-                            <span id="lblMinNodeSize" class="setting-val">10 px</span>
-                        </div>
-                        <input id="sldMinNodeSize" type="range" min="0" max="100" step="5" value="10" class="setting-range" />
-                    </div>
-                </div>
-
-                <!-- Group 3: Eye-Dome Lighting (EDL) -->
-                <div class="settings-section">
-                    <div class="settings-section-title">Eye-Dome Lighting (EDL) Effect</div>
-                    <div class="setting-item">
-                        <label class="setting-checkbox-label">
-                            <input id="chkEDLEnabled" type="checkbox" checked />
-                            <span>Enable Eye-Dome Lighting</span>
-                        </label>
-                    </div>
-                    <div id="edlControlsContainer">
-                        <div class="setting-item">
-                            <div class="setting-label-row">
-                                <label for="sldEDLRadius">EDL Radius:</label>
-                                <span id="lblEDLRadius" class="setting-val">1.4</span>
-                            </div>
-                            <input id="sldEDLRadius" type="range" min="0.5" max="5.0" step="0.1" value="1.4" class="setting-range" />
-                        </div>
-                        <div class="setting-item">
-                            <div class="setting-label-row">
-                                <label for="sldEDLStrength">EDL Strength:</label>
-                                <span id="lblEDLStrength" class="setting-val">1.0</span>
-                            </div>
-                            <input id="sldEDLStrength" type="range" min="0.1" max="5.0" step="0.1" value="1.0" class="setting-range" />
-                        </div>
-                        <div class="setting-item">
-                            <div class="setting-label-row">
-                                <label for="sldEDLOpacity">EDL Opacity:</label>
-                                <span id="lblEDLOpacity" class="setting-val">1.0</span>
-                            </div>
-                            <input id="sldEDLOpacity" type="range" min="0.1" max="1.0" step="0.05" value="1.0" class="setting-range" />
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Group 4: Background & Visuals -->
-                <div class="settings-section">
-                    <div class="settings-section-title">Display & Colors</div>
-                    <div class="setting-item">
-                        <label for="cfgBackground">Background:</label>
-                        <select id="cfgBackground" class="setting-control">
-                            <option value="black" selected>Black</option>
-                            <option value="gradient">Gradient</option>
-                            <option value="skybox">Skybox</option>
-                            <option value="white">White</option>
-                        </select>
-                    </div>
-                </div>
-            </div>
-        </div>
-
-        <!-- Floating Selection Banner -->
+        <!-- Floating Selection Banner & Staging Actions -->
         <div id="selectionBanner" class="selection-banner">
             <div class="selection-info-text">
                 <span id="selectionSummary">Selected: <strong>0</strong> points</span>
             </div>
-            <div class="hud-divider"></div>
-            <button id="btnQuickNoise" class="hud-btn" style="background:#b91c1c; border-color:#ef4444;">Mark Noise (7)</button>
+            <div id="stageControls" style="display:inline-flex; align-items:center; gap:8px;">
+                <div class="hud-divider"></div>
+                <label for="quickTreeIdInput" style="font-size:12px; color:#94a3b8; font-weight:500;">Tree ID:</label>
+                <input id="quickTreeIdInput" type="number" min="1" max="999999" value="1" style="width:60px; padding:3px 6px; border-radius:4px; border:1px solid #3b82f6; background:#0f172a; color:#fff; font-size:12px;" />
+                <button id="btnQuickAssignTree" class="hud-btn" style="background:#059669; border-color:#10b981;" title="Stage Tree ID visually">Stage Tree</button>
+                <button id="btnQuickNoise" class="hud-btn" style="background:#b91c1c; border-color:#ef4444;" title="Stage Noise classification (7)">Stage Noise (7)</button>
+            </div>
         </div>
 
         <!-- Inspection Readout Card -->
         <div id="inspectCard" class="inspect-card">
             <h4>
                 <span>Point Attributes</span>
-                <button id="closeInspect" style="background:transparent;border:none;color:#9ca3af;cursor:pointer;">✕</button>
+                <button id="closeInspect" style="background:transparent;border:none;color:#9ca3af;cursor:pointer;">X</button>
             </h4>
             <table>
                 <tr><td>X:</td><td id="inspX">-</td></tr>
