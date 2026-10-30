@@ -9,9 +9,9 @@
 
 url         = https://github.com/arunbiju969/potree.git
 branch      = develop
-commit      = 96bb504fd074d3e380ac1e393233fc4c38d04f64
-date        = 2026-10-23
-subject     = feat: categorical colours for custom attributes and an inspect point tool
+commit      = 57473258d220bc75f368377e99348d1306233e39
+date        = 2026-10-30
+subject     = fix: clamp the visibility texture upload so LOD overflow cannot crash rendering
 
 # Upstream lineage (informational — the editor does not read these)
 upstream_repo   = https://github.com/potree/potree.git
@@ -26,12 +26,12 @@ npm           = 11.19.1
 build_command = npm install   # or: npm run build  (gulp build pack)
 
 # Artifacts the editor requires, as produced by a clean clone + build at this pin
-required_1    = build/potree/potree.js      2429698 bytes
+required_1    = build/potree/potree.js     ~2429698 bytes (measured at the 2026-10-23 pin; the LOD-clamp build differs by a few bytes)
 required_2    = build/potree/potree.css       14629 bytes
 required_3    = libs/                          (37.6 MB, incl. PotreeConverter2/PotreeConverter.exe)
 required_4    = resources/                      (4.3 MB)
 
 # Previous revision the editor was developed against, in case the 2026-10-23
 # renderer change needs reverting:
-#   git -C potree checkout 6849daf37fd53c55338d2f27e5ee5402420e9bad && npm run build
-previous      = 6849daf37fd53c55338d2f27e5ee5402420e9bad (2026-07-24)
+#   git -C potree checkout 96bb504fd074d3e380ac1e393233fc4c38d04f64 && npm run build
+previous      = 96bb504fd074d3e380ac1e393233fc4c38d04f64 (2026-10-23)

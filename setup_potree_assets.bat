@@ -12,7 +12,7 @@ REM  Reads the pinned revision from  .\potree.version
 REM =====================================================================
 
 set "POTREE_URL=https://github.com/arunbiju969/potree.git"
-set "POTREE_SHA=96bb504fd074d3e380ac1e393233fc4c38d04f64"
+set "POTREE_SHA=57473258d220bc75f368377e99348d1306233e39"
 
 echo =================================================================
 echo   PotreeEditor :: vendored renderer setup
