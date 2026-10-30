@@ -19,10 +19,11 @@ from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QLabel, QFileDialog, QMessageBox, QProgressBar, QSplitter,
     QFrame, QComboBox, QCheckBox, QSpinBox, QDoubleSpinBox, QSlider, QGroupBox, QStatusBar,
+    QListWidget, QListWidgetItem,
     QScrollArea, QStackedWidget, QButtonGroup, QTableWidget, QTableWidgetItem,
     QHeaderView, QAbstractItemView, QProgressDialog, QSizePolicy, QTabWidget, QGridLayout
 )
-from PyQt6.QtCore import Qt, QUrl, pyqtSignal, QObject, QThread
+from PyQt6.QtCore import Qt, QUrl, pyqtSignal, QObject, QThread, QTimer
 from PyQt6.QtGui import QFont, QIcon, QColor, QAction, QActionGroup, QPixmap
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWebEngineCore import QWebEngineSettings
@@ -496,8 +497,21 @@ class MainWindow(QMainWindow):
         tab_dataset = self.create_dataset_tab()
 
         self.sidebar_tabs.addTab(tab_layers, "Layers")
-        self.sidebar_tabs.addTab(tab_edit, "Delineate & Edit")
+        self.sidebar_tabs.addTab(tab_edit, "Forestry")
         self.sidebar_tabs.addTab(tab_dataset, "Dataset")
+
+        # The staged-tree card is built with the layer overlays, because that is where
+        # the overlay table lives, but the work belongs with forestry -- so re-parent it
+        # into the Forestry tab once both tabs exist.  addWidget moves the widget rather
+        # than copying it, so the Layers tab simply stops holding it.  The tab is a
+        # QScrollArea, whose own layout() is None -- the cards live on its content
+        # widget -- which is why the first attempt at this silently did nothing.
+        forestry_tab = self.sidebar_tabs.widget(1)
+        forestry_content = (forestry_tab.widget() if isinstance(forestry_tab, QScrollArea)
+                            else forestry_tab)
+        forestry_layout = forestry_content.layout() if forestry_content is not None else None
+        if forestry_layout is not None and hasattr(self, "grp_staged_card"):
+            forestry_layout.addWidget(self.grp_staged_card)
 
         layout.addWidget(self.sidebar_tabs)
         return container
@@ -544,11 +558,30 @@ class MainWindow(QMainWindow):
         self.chk_layer_pc.toggled.connect(self.toggle_pointcloud_layer)
         h_pc_title.addWidget(self.chk_layer_pc)
         h_pc_title.addStretch()
-
-        lbl_pc_badge = QLabel("PCD")
-        lbl_pc_badge.setStyleSheet("background-color: #0c4a6e; color: #38bdf8; font-size: 10px; font-weight: bold; padding: 2px 5px; border-radius: 3px;")
-        h_pc_title.addWidget(lbl_pc_badge)
         v_pc.addLayout(h_pc_title)
+
+        # Layer list.  The clouds themselves are the layers (potree's scene list is the
+        # manager), so every loaded cloud gets a row: the checkbox is pc.visible, and the
+        # selected row is the layer the colour, size and edit controls drive.
+        self.layer_list = QListWidget()
+        self.layer_list.setMaximumHeight(112)
+        self.layer_list.itemSelectionChanged.connect(self._on_layer_row_selected)
+        self.layer_list.itemChanged.connect(self._on_layer_row_checked)
+        v_pc.addWidget(self.layer_list)
+
+        h_layer_buttons = QHBoxLayout()
+        btn_remove_layer = QPushButton("Remove Layer")
+        btn_remove_layer.clicked.connect(self._on_layer_remove_clicked)
+        btn_refresh_layers = QPushButton("Refresh Layers")
+        btn_refresh_layers.clicked.connect(lambda: self.refresh_layers(0))
+        h_layer_buttons.addWidget(btn_remove_layer)
+        h_layer_buttons.addWidget(btn_refresh_layers)
+        h_layer_buttons.addStretch()
+        v_pc.addLayout(h_layer_buttons)
+
+        # Guards the row rebuild: re-adding rows fires selection and check signals, and
+        # those must not bounce back into the viewer as user edits.
+        self._layer_sync_guard = False
 
         self.lbl_layer_cloud_name = QLabel("No point cloud loaded")
         self.lbl_layer_cloud_name.setStyleSheet("color: #94a3b8; font-size: 11px;")
@@ -591,6 +624,7 @@ class MainWindow(QMainWindow):
 
         # 3. Staged Delineations Layer Card
         grp_staged = QGroupBox("Staged Trees & Edits")
+        self.grp_staged_card = grp_staged
         v_staged = QVBoxLayout(grp_staged)
         v_staged.setSpacing(6)
 
@@ -660,10 +694,6 @@ class MainWindow(QMainWindow):
         self.chk_layer_pick.toggled.connect(self.toggle_pick_layer)
         h_pick_title.addWidget(self.chk_layer_pick)
         h_pick_title.addStretch()
-
-        lbl_pick_badge = QLabel("PICK")
-        lbl_pick_badge.setStyleSheet("background-color: #451a03; color: #f59e0b; font-size: 10px; font-weight: bold; padding: 2px 5px; border-radius: 3px;")
-        h_pick_title.addWidget(lbl_pick_badge)
         v_pick.addLayout(h_pick_title)
 
         self.lbl_layer_pick_coords = QLabel("Position: None")
@@ -954,12 +984,7 @@ class MainWindow(QMainWindow):
 
     def _on_layer_color_changed(self):
         mode = self.combo_layer_color.currentData()
-        if hasattr(self, "ribbon_combo_color"):
-            idx = self.ribbon_combo_color.findData(mode)
-            if idx >= 0:
-                self.ribbon_combo_color.blockSignals(True)
-                self.ribbon_combo_color.setCurrentIndex(idx)
-                self.ribbon_combo_color.blockSignals(False)
+        self._sync_color_combos(mode)
         self.set_color_mode(mode)
 
     def _on_layer_size_slider_changed(self, ival: int):
@@ -987,12 +1012,16 @@ class MainWindow(QMainWindow):
     # Dataset Loading & Fast Header-Only Inspection
     # -------------------------------------------------------------------------
     def open_potree_file(self):
-        """Open an existing Potree metadata.json or cloud.js file immediately without heavy RAM."""
+        """Open an existing Potree metadata.json / cloud.js, or a COPC (.copc.laz).
+
+        Potree dispatches on the entry file name: *.copc.laz goes to the COPC loader
+        and streams by byte range, so it opens without conversion.
+        """
         file_path, _ = QFileDialog.getOpenFileName(
             self,
-            "Select Potree Converted File",
+            "Select Potree Converted File or COPC",
             "",
-            "Potree Files (metadata.json cloud.js);;All Files (*)"
+            "Potree Files (metadata.json cloud.js *.copc.laz);;LAZ/LAS (*.laz *.las);;All Files (*)"
         )
         if not file_path:
             return
@@ -1004,7 +1033,12 @@ class MainWindow(QMainWindow):
         self.server.register_pointcloud_dir(alias, folder)
 
         url = f"http://127.0.0.1:{self.server.port}/clouds/{alias}/{entry_file}"
-        self.load_url_in_potree(url)
+        # Name the layer for what was opened: the folder for a converted cloud (its
+        # entry file is an implementation detail), the file name for COPC/LAS.
+        display_name = (os.path.basename(folder)
+                        if entry_file.lower() in ("metadata.json", "cloud.js")
+                        else entry_file)
+        self.load_url_in_potree(url, display_name)
 
         if hasattr(self, "lbl_layer_cloud_name"):
             self.lbl_layer_cloud_name.setText(entry_file)
@@ -1047,7 +1081,7 @@ class MainWindow(QMainWindow):
             alias = "cloud_" + str(abs(hash(converted_dir)) % 100000)
             self.server.register_pointcloud_dir(alias, converted_dir)
             url = f"http://127.0.0.1:{self.server.port}/clouds/{alias}/{entry_file}"
-            self.load_url_in_potree(url)
+            self.load_url_in_potree(url, os.path.basename(converted_dir))
         else:
             reply = QMessageBox.question(
                 self,
@@ -1117,7 +1151,7 @@ class MainWindow(QMainWindow):
                 self.server.register_pointcloud_dir(alias, out_dir)
                 entry_file = "metadata.json" if os.path.exists(os.path.join(out_dir, "metadata.json")) else "cloud.js"
                 url = f"http://127.0.0.1:{self.server.port}/clouds/{alias}/{entry_file}"
-                self.load_url_in_potree(url)
+                self.load_url_in_potree(url, os.path.basename(out_dir))
             else:
                 print("Conversion error:", proc.stderr)
 
@@ -1126,10 +1160,173 @@ class MainWindow(QMainWindow):
 
         threading.Thread(target=run, daemon=True).start()
 
-    def load_url_in_potree(self, url: str):
+    def _sync_style_widgets(self, info):
+        """Point the shape, sizing-mode and size controls at the active layer's style.
+
+        Each cloud now carries its own material style, so switching layers has to show
+        that layer's values instead of whatever the controls were last moved to.
+        """
+        for name, key in (("ribbon_combo_shape", "pointType"),
+                          ("ribbon_combo_sizing", "pointSizeType")):
+            combo = getattr(self, name, None)
+            value = info.get(key)
+            if combo is None or value is None:
+                continue
+            idx = combo.findData(str(value))
+            if idx >= 0:
+                combo.blockSignals(True)
+                combo.setCurrentIndex(idx)
+                combo.blockSignals(False)
+                combo.setEnabled(True)
+        size = info.get("pointSize")
+        if size is None:
+            return
+        fval = max(0.10, min(4.00, float(size)))
+        ival = int(round(fval * 10))
+        for name in ("ribbon_spin_size", "ribbon_slider_size", "slider_layer_size"):
+            widget = getattr(self, name, None)
+            if widget is None:
+                continue
+            widget.blockSignals(True)
+            widget.setValue(ival if isinstance(widget, QSlider) else fval)
+            widget.blockSignals(False)
+            widget.setEnabled(True)
+        if hasattr(self, "lbl_layer_size_val"):
+            self.lbl_layer_size_val.setText(f"{fval:.2f}")
+
+    def _sync_color_combos(self, attr):
+        """Point both Color By dropdowns at one attribute.
+
+        The ribbon combo and the sidebar's per-layer combo are two views of the same
+        value -- the active layer's material.activeAttributeName -- so they are set
+        together, with signals blocked so neither bounces a change back.  A cloud can
+        carry attributes the fixed lists never offered (treeID, itc); those are added
+        rather than leaving a dropdown showing a mode the cloud is not using.
+        """
+        if not attr:
+            return
+        for combo in (getattr(self, "combo_layer_color", None),
+                      getattr(self, "ribbon_combo_color", None)):
+            if combo is None:
+                continue
+            idx = combo.findData(str(attr))
+            if idx < 0:
+                combo.addItem(str(attr).replace("_", " ").title(), str(attr))
+                idx = combo.count() - 1
+            combo.blockSignals(True)
+            combo.setCurrentIndex(idx)
+            combo.blockSignals(False)
+            combo.setEnabled(True)
+
+    def refresh_layers(self, tries: int = 0):
+        """Ask the viewer for its clouds and rebuild the layer rows.
+
+        The list lives in JavaScript (viewer.scene.pointclouds is potree's own layer
+        manager), so the rows are pulled, not tracked twice.  Loading is asynchronous
+        and a big cloud takes a while to register, so an empty answer is retried rather
+        than leaving the panel showing nothing.
+        """
+        def handle(result):
+            if not isinstance(result, list):
+                return
+            if not result and tries < 12:
+                QTimer.singleShot(1500, lambda: self.refresh_layers(tries + 1))
+                return
+            self._render_layer_rows(result)
+
+        self.web_view.page().runJavaScript("window.listLayers ? window.listLayers() : [];", handle)
+
+    def _render_layer_rows(self, layers: list):
+        """Rebuild the rows, marking the active one bold and selecting it."""
+        self._layer_sync_guard = True
+        try:
+            self.layer_list.clear()
+            active_row = -1
+            active_info = None
+            for row, info in enumerate(layers):
+                name = str(info.get("name"))
+                item = QListWidgetItem(name)
+                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                item.setCheckState(Qt.CheckState.Checked if info.get("visible")
+                                   else Qt.CheckState.Unchecked)
+                item.setData(Qt.ItemDataRole.UserRole, name)
+                if info.get("active"):
+                    active_row, active_info = row, info
+                    font = item.font()
+                    font.setBold(True)
+                    item.setFont(font)
+                self.layer_list.addItem(item)
+            if active_row < 0 and layers:
+                active_row, active_info = 0, layers[0]
+                self.layer_list.item(0).setFont(self._bold_font(self.layer_list.item(0)))
+            if active_row >= 0:
+                self.layer_list.setCurrentRow(active_row)
+            if active_info:
+                self.lbl_layer_cloud_name.setText(f"Active layer: {active_info.get('name')}")
+                self.lbl_layer_cloud_pts.setText(f"{int(active_info.get('points') or 0):,} points")
+                self._sync_color_combos(active_info.get("colorAttribute"))
+                self._sync_style_widgets(active_info)
+            else:
+                self.lbl_layer_cloud_name.setText("No point cloud loaded")
+                self.lbl_layer_cloud_pts.setText("- points")
+                # Nothing to recolour: grey both dropdowns instead of pretending.
+                for combo in (getattr(self, "combo_layer_color", None),
+                              getattr(self, "ribbon_combo_color", None)):
+                    if combo is not None:
+                        combo.setEnabled(False)
+        finally:
+            self._layer_sync_guard = False
+
+    @staticmethod
+    def _bold_font(item):
+        font = item.font()
+        font.setBold(True)
+        return font
+
+    def _on_layer_row_selected(self):
+        """Clicking a row makes that cloud the active layer in the viewer."""
+        if self._layer_sync_guard:
+            return
+        item = self.layer_list.currentItem()
+        if not item:
+            return
+        name = item.data(Qt.ItemDataRole.UserRole)
+        self.web_view.page().runJavaScript(
+            f"window.setActiveLayer({json.dumps(name)});",
+            lambda res: self._render_layer_rows(res if isinstance(res, list) else []))
+
+    def _on_layer_row_checked(self, item):
+        """The row checkbox is pc.visible, potree's own per-layer visibility flag."""
+        if self._layer_sync_guard:
+            return
+        name = item.data(Qt.ItemDataRole.UserRole)
+        visible = item.checkState() == Qt.CheckState.Checked
+        self.web_view.page().runJavaScript(
+            f"window.setLayerVisible({json.dumps(name)}, {str(bool(visible)).lower()});")
+
+    def _on_layer_remove_clicked(self):
+        """Drop one cloud from the scene list and the graph, leaving the others alone."""
+        item = self.layer_list.currentItem()
+        if not item:
+            return
+        name = item.data(Qt.ItemDataRole.UserRole)
+        self.web_view.page().runJavaScript(
+            f"window.removeLayer({json.dumps(name)});",
+            lambda res: self._render_layer_rows(res if isinstance(res, list) else []))
+
+    def load_url_in_potree(self, url: str, display_name: str = ""):
+        """Load a cloud in the viewer as another layer.
+
+        display_name is what the layer row shows.  It has to be passed in: the server
+        mounts every cloud under a hashed alias (cloud_25662), so the URL carries
+        nothing a person could read, and the cloud's own metadata name is generic.
+        """
         self.current_potree_url = url
-        js = f"window.loadPointCloudUrl('{url}');"
+        js = f"window.loadPointCloudUrl({json.dumps(url)}, {json.dumps(display_name or '')});"
         self.web_view.page().runJavaScript(js)
+        # The load resolves on its own schedule; refresh_layers retries until the new
+        # cloud shows up, which is what makes it a layer instead of a replacement.
+        QTimer.singleShot(600, lambda: self.refresh_layers(0))
 
     # -------------------------------------------------------------------------
     # Selection & Optimistic Visual Staging
@@ -1869,6 +2066,37 @@ class MainWindow(QMainWindow):
         v_pt.addWidget(lbl_title_pt)
         h_layout.addWidget(grp_point)
 
+        # 1b. Color By -- the chooser that used to live only in the sidebar's Point
+        # Cloud Layer card (and, before this, on the Settings page of the ribbon).
+        grp_color = QFrame()
+        grp_color.setProperty("class", "ribbonGroup")
+        v_color = QVBoxLayout(grp_color)
+        v_color.setContentsMargins(8, 4, 8, 4)
+        v_color.setSpacing(3)
+        h_color_controls = QHBoxLayout()
+        h_color_controls.setSpacing(8)
+        v_mode = QVBoxLayout()
+        v_mode.setSpacing(1)
+        lbl_mode = QLabel("Color By:")
+        lbl_mode.setProperty("class", "ribbonLabel")
+        self.ribbon_combo_color = QComboBox()
+        self.ribbon_combo_color.setProperty("class", "ribbonCombo")
+        self.ribbon_combo_color.addItem("RGB / True Color", "rgba")
+        self.ribbon_combo_color.addItem("ASPRS Classification", "classification")
+        self.ribbon_combo_color.addItem("Elevation", "elevation")
+        self.ribbon_combo_color.addItem("Intensity", "intensity")
+        self.ribbon_combo_color.addItem("Tree / ITC", "itc")
+        self.ribbon_combo_color.currentIndexChanged.connect(self._on_ribbon_color_changed)
+        v_mode.addWidget(lbl_mode)
+        v_mode.addWidget(self.ribbon_combo_color)
+        h_color_controls.addLayout(v_mode)
+        v_color.addLayout(h_color_controls)
+        lbl_title_color = QLabel("COLOR BY")
+        lbl_title_color.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lbl_title_color.setProperty("class", "ribbonTitle")
+        v_color.addWidget(lbl_title_color)
+        h_layout.addWidget(grp_color)
+
         # 2. LOD & Quality Group
         grp_lod = QFrame()
         grp_lod.setProperty("class", "ribbonGroup")
@@ -2172,23 +2400,6 @@ class MainWindow(QMainWindow):
         h_disp_controls = QHBoxLayout()
         h_disp_controls.setSpacing(8)
 
-        # Color Mode
-        v_color = QVBoxLayout()
-        v_color.setSpacing(1)
-        lbl_color = QLabel("Color By:")
-        lbl_color.setProperty("class", "ribbonLabel")
-        self.ribbon_combo_color = QComboBox()
-        self.ribbon_combo_color.setProperty("class", "ribbonCombo")
-        self.ribbon_combo_color.addItem("RGB / True Color", "rgba")
-        self.ribbon_combo_color.addItem("Classification", "classification")
-        self.ribbon_combo_color.addItem("Elevation", "elevation")
-        self.ribbon_combo_color.addItem("Intensity", "intensity")
-        self.ribbon_combo_color.addItem("Tree / ITC", "itc")
-        self.ribbon_combo_color.currentIndexChanged.connect(self._on_ribbon_color_changed)
-        v_color.addWidget(lbl_color)
-        v_color.addWidget(self.ribbon_combo_color)
-        h_disp_controls.addLayout(v_color)
-
         # Background
         v_bg = QVBoxLayout()
         v_bg.setSpacing(1)
@@ -2203,6 +2414,25 @@ class MainWindow(QMainWindow):
         self.ribbon_combo_bg.currentIndexChanged.connect(self._on_ribbon_bg_changed)
         v_bg.addWidget(lbl_bg)
         v_bg.addWidget(self.ribbon_combo_bg)
+        # Render Mode: one switch for the whole scene's look.  Performance keeps the
+        # shipped point settings, Quality goes to round splats, smaller size, HQ splat
+        # and the top budget; Balanced sits between them.
+        v_render_mode = QVBoxLayout()
+        v_render_mode.setSpacing(1)
+        lbl_render_mode = QLabel("Render Mode:")
+        lbl_render_mode.setProperty("class", "ribbonLabel")
+        self.ribbon_combo_render_mode = QComboBox()
+        self.ribbon_combo_render_mode.setProperty("class", "ribbonCombo")
+        for label, value in (("Performance", "performance"),
+                             ("Balanced", "balanced"),
+                             ("Quality", "quality")):
+            self.ribbon_combo_render_mode.addItem(label, value)
+        self.ribbon_combo_render_mode.currentIndexChanged.connect(
+            self._on_ribbon_render_mode_changed)
+        v_render_mode.addWidget(lbl_render_mode)
+        v_render_mode.addWidget(self.ribbon_combo_render_mode)
+        h_disp_controls.addLayout(v_render_mode)
+
         h_disp_controls.addLayout(v_bg)
 
         v_display.addLayout(h_disp_controls)
@@ -2271,13 +2501,51 @@ class MainWindow(QMainWindow):
 
     def _on_ribbon_color_changed(self):
         attr = self.ribbon_combo_color.currentData()
-        if hasattr(self, "combo_layer_color"):
-            idx = self.combo_layer_color.findData(attr)
-            if idx >= 0:
-                self.combo_layer_color.blockSignals(True)
-                self.combo_layer_color.setCurrentIndex(idx)
-                self.combo_layer_color.blockSignals(False)
+        self._sync_color_combos(attr)
         self.set_color_mode(attr)
+
+    def _sync_viewer_render_widgets(self, info):
+        """Mirror the scene-wide half of a render mode into the Point tab.
+
+        Budget, minimum node size, splat quality and EDL belong to the viewer rather
+        than to a layer, so the per-layer sync cannot reach them.  Without this the
+        Settings combo says Quality while the Point tab still reads 2.5 M / 10 px.
+        """
+        for name, key in (("ribbon_combo_budget", "pointBudget"),
+                          ("ribbon_combo_node", "minNodeSize"),
+                          ("ribbon_combo_splat", "splatQuality")):
+            combo = getattr(self, name, None)
+            if combo is None or info.get(key) is None:
+                continue
+            idx = combo.findData(info[key])
+            if idx >= 0:
+                combo.blockSignals(True)
+                combo.setCurrentIndex(idx)
+                combo.blockSignals(False)
+        chk = getattr(self, "ribbon_chk_edl", None)
+        if chk is not None and info.get("edlEnabled") is not None:
+            chk.blockSignals(True)
+            chk.setChecked(bool(info["edlEnabled"]))
+            chk.blockSignals(False)
+
+    def _on_ribbon_render_mode_changed(self):
+        """Performance / Balanced / Quality, applied to every layer at once.
+
+        The viewer hands back the layer list, so the Point tab's shape, sizing and size
+        widgets land on the new mode's values; a second read pulls the scene-wide half
+        (budget, node size, splat quality, EDL) so nothing in the ribbon is left stale.
+        """
+        mode = self.ribbon_combo_render_mode.currentData()
+
+        def apply_layers(layers):
+            self._render_layer_rows(layers if isinstance(layers, list) else [])
+            self.web_view.page().runJavaScript(
+                "window.getRenderSettings ? window.getRenderSettings() : null;",
+                lambda settings: self._sync_viewer_render_widgets(
+                    settings if isinstance(settings, dict) else {}))
+
+        self.web_view.page().runJavaScript(
+            f"window.setRenderMode({json.dumps(mode)});", apply_layers)
 
     def _on_ribbon_bg_changed(self):
         bg = self.ribbon_combo_bg.currentData()

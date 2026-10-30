@@ -1,0 +1,37 @@
+# Vendored Potree renderer — version pin
+#
+# The editor renders from ./potree/build/potree/potree.js, which is NOT tracked by
+# git in the potree repository (its .gitignore line 1 is `/build`). A plain
+# `git clone` therefore produces a blank viewport until the assets are built:
+#     npm install        # postinstall runs: npm run build  ->  gulp build pack
+#
+# Run .\setup_potree_assets.bat to do clone + build + verify in one step.
+
+url         = https://github.com/arunbiju969/potree.git
+branch      = develop
+commit      = 96bb504fd074d3e380ac1e393233fc4c38d04f64
+date        = 2026-10-23
+subject     = feat: categorical colours for custom attributes and an inspect point tool
+
+# Upstream lineage (informational — the editor does not read these)
+upstream_repo   = https://github.com/potree/potree.git
+upstream_base   = c53cf7f7e692ee27bc4c2c623fe17bd678d25558
+upstream_date   = 2024-08-01
+contains_tag    = 1.8.2 (3013577379b5c8530ebca3cdc980f7585ae2320f, 2023-12-12)
+potree_version  = 1.8.0
+
+# Build toolchain verified against this pin
+node          = v24.22.0
+npm           = 11.19.1
+build_command = npm install   # or: npm run build  (gulp build pack)
+
+# Artifacts the editor requires, as produced by a clean clone + build at this pin
+required_1    = build/potree/potree.js      2429698 bytes
+required_2    = build/potree/potree.css       14629 bytes
+required_3    = libs/                          (37.6 MB, incl. PotreeConverter2/PotreeConverter.exe)
+required_4    = resources/                      (4.3 MB)
+
+# Previous revision the editor was developed against, in case the 2026-10-23
+# renderer change needs reverting:
+#   git -C potree checkout 6849daf37fd53c55338d2f27e5ee5402420e9bad && npm run build
+previous      = 6849daf37fd53c55338d2f27e5ee5402420e9bad (2026-07-24)

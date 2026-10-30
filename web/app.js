@@ -6,6 +6,123 @@ let activeTool = 'nav'; // 'nav', 'polygon', 'box', 'inspect'
 let activeSelectionMesh = null;
 let currentSelectionStats = null;
 
+// Layer registry.
+//
+// Potree has no separate layer manager: viewer.scene.pointclouds IS the list (Scene.js
+// addPointCloud pushes, sidebar.js walks it for one row per cloud, and deleting a cloud
+// is a splice plus a remove from the three.js graph).  Per-layer state lives on the
+// cloud itself -- pc.visible for the eye, pc.material.activeAttributeName and
+// pointSize for appearance -- so a layer is a cloud plus its own material, not a
+// parallel data structure.  Names are the key, the way LoadProject.js reuses clouds by
+// name, which means removing a layer can never shift another layer's identity.
+//
+// "Active" is the one thing potree never had: its picking code reaches for
+// scene.pointclouds[0] (viewer.js), while our edits, picks and saves go through the
+// layer the user selected.
+let activeLayerName = null;
+
+function uniqueLayerName(base) {
+    const taken = new Set(viewer.scene.pointclouds.map(pc => pc.name));
+    const stem = base || ('cloud_' + (viewer.scene.pointclouds.length + 1));
+    let name = stem;
+    for (let i = 2; taken.has(name); i++) name = stem + '_' + i;
+    return name;
+}
+
+// Name a layer after the thing the user actually opened.  Potree's own name comes from
+// the cloud's metadata, and the converter writes that generically, so the URL wins:
+// for a converted cloud it is the folder (the entry file is dropped), for COPC/LAS it is
+// the file name with its extension removed.  This is the key the layer rows carry, so it
+// stays put even when another layer is removed.
+function layerNameFromUrl(url) {
+    // Strip the query before decoding, then treat everything else as path: these URLs
+    // never carry a fragment, and the folder names do contain '#' (clipped_Area#1_...),
+    // so splitting on '#' before decoding would truncate the real name.
+    const decoded = decodeURIComponent(String(url || '').split('?')[0]);
+    const parts = decoded.split('/').filter(Boolean);
+    let base = parts.pop() || '';
+    if (/^(metadata\.json|cloud\.js)$/i.test(base)) base = parts.pop() || '';
+    return base.replace(/\.copc\.laz$/i, '')
+               .replace(/\.(laz|las|json|js|txt)$/i, '');
+}
+
+function layerByName(name) {
+    return viewer.scene.pointclouds.find(pc => pc.name === name) || null;
+}
+
+function layerInfo(pc) {
+    if (!pc) return null;
+    return {
+        name: pc.name,
+        visible: pc.visible !== false,
+        active: pc.name === activeLayerName,
+        colorAttribute: pc.material ? pc.material.activeAttributeName : null,
+        // The per-layer style object is the source of truth for what the widgets wrote,
+        // so size/shape/sizing round-trip through the layer list.
+        pointSize: layerStyle(pc).pointSize,
+        pointType: layerStyle(pc).pointType,
+        pointSizeType: layerStyle(pc).pointSizeType,
+        points: (pc.potree && pc.potree.numPoints) || pc.numPoints || 0,
+        attributes: pc.getAttributes ? pc.getAttributes().attributes.map(a => a.name) : []
+    };
+}
+
+function listLayers() {
+    return viewer.scene.pointclouds.map(layerInfo);
+}
+
+function removeLayer(name) {
+    const pc = layerByName(name);
+    if (!pc) return listLayers();
+    viewer.scene.scenePointCloud.remove(pc);
+    const idx = viewer.scene.pointclouds.indexOf(pc);
+    if (idx >= 0) viewer.scene.pointclouds.splice(idx, 1);
+    if (currentPointCloud === pc) currentPointCloud = null;
+    if (activeLayerName === name) {
+        const next = viewer.scene.pointclouds[0];
+        currentPointCloud = next || null;
+        activeLayerName = next ? next.name : null;
+    }
+    viewer.render();
+    return listLayers();
+}
+
+function setActiveLayer(name) {
+    const pc = layerByName(name);
+    if (!pc) return listLayers();
+    currentPointCloud = pc;
+    activeLayerName = pc.name;
+    if (pc.material) viewerSettings.colorMode = pc.material.activeAttributeName;
+    viewer.render();
+    return listLayers();
+}
+
+function setLayerVisible(name, visible) {
+    const pc = layerByName(name);
+    if (!pc) return listLayers();
+    pc.visible = !!visible;
+    viewer.render();
+    return listLayers();
+}
+
+function setLayerColorAttribute(name, attr) {
+    const pc = layerByName(name);
+    if (pc && pc.material) pc.material.activeAttributeName = attr;
+    if (pc && pc === currentPointCloud) viewerSettings.colorMode = attr;
+    viewer.render();
+    return listLayers();
+}
+
+function setLayerPointSize(name, size) {
+    const pc = layerByName(name);
+    if (pc) {
+        layerStyle(pc).pointSize = Number(size);
+        applyMaterialSettings(pc);
+    }
+    viewer.render();
+    return listLayers();
+}
+
 // Optimistic Visual Staging Storage (edit.id -> THREE.Group)
 const stagedVisuals = new Map();
 
@@ -108,12 +225,33 @@ function getPointSizeTypeEnum(name) {
     return Potree.PointSizeType.ADAPTIVE;
 }
 
+// Per-layer render style.  Size, shape and sizing mode are per-material properties in
+// potree, so each cloud carries its own; viewerSettings holds the style a newly opened
+// layer starts from.  Names (SQUARE / ADAPTIVE / ...) are stored rather than enum
+// values, so the Qt widgets read back exactly what they wrote -- potree's enums have no
+// reverse mapping.  potree 2.0 also keeps the size in material.size (the uniforms.size
+// value); it has accessors for pointSizeType but no material.pointSize, so writing
+// material.pointSize would silently do nothing.
+function layerStyle(pc) {
+    if (!pc) return viewerSettings;
+    if (!pc.userData) pc.userData = {};
+    if (!pc.userData.potreeEditorStyle) {
+        pc.userData.potreeEditorStyle = {
+            pointType: viewerSettings.pointType,
+            pointSizeType: viewerSettings.pointSizeType,
+            pointSize: viewerSettings.pointSize
+        };
+    }
+    return pc.userData.potreeEditorStyle;
+}
+
 function applyMaterialSettings(pc = currentPointCloud) {
     if (!pc || !pc.material) return;
     const mat = pc.material;
-    mat.shape = getPointShapeEnum(viewerSettings.pointType);
-    mat.pointSizeType = getPointSizeTypeEnum(viewerSettings.pointSizeType);
-    mat.size = Number(viewerSettings.pointSize);
+    const style = layerStyle(pc);
+    mat.shape = getPointShapeEnum(style.pointType);
+    mat.pointSizeType = getPointSizeTypeEnum(style.pointSizeType);
+    mat.size = Number(style.pointSize);
 }
 
 function updateAllPointClouds() {
@@ -125,7 +263,7 @@ function updateAllPointClouds() {
 // ---------------------------------------------------------------------------
 // Point Cloud Loading
 // ---------------------------------------------------------------------------
-window.loadPointCloudUrl = async function(url) {
+window.loadPointCloudUrl = async function(url, displayName) {
     console.log('[PotreeHybrid] Loading point cloud:', url);
     showToast('Loading point cloud: ' + url.split('/').pop());
 
@@ -133,12 +271,16 @@ window.loadPointCloudUrl = async function(url) {
         const e = await Potree.loadPointCloud(url);
         const pc = e.pointcloud;
 
-        // If a cloud is already loaded, remove it
-        if (currentPointCloud) {
-            viewer.scene.scenePointCloud.remove(currentPointCloud);
-        }
-
+        // Register as another layer rather than replacing whatever is open.  Potree's
+        // scene list is already the layer manager, so clouds coexist; the new one
+        // becomes active and keeps its own material, visibility and point size.
+        // Every cloud is mounted under a hashed alias (cloud_25662), so the URL alone
+        // carries nothing readable; Python passes the folder or file the user picked.
+        const wanted = String(displayName || '').replace(/^.*[\\/]/, '')
+                           .replace(/\.copc\.laz$/i, '').replace(/\.(laz|las|json|js|txt)$/i, '');
+        pc.name = uniqueLayerName(wanted || layerNameFromUrl(url) || pc.name);
         currentPointCloud = pc;
+        activeLayerName = pc.name;
 
         // Apply all configured material settings
         applyMaterialSettings(pc);
@@ -948,21 +1090,97 @@ if (btnQuickNoise) {
 // ---------------------------------------------------------------------------
 // Public API for Python/Qt Ribbon & Settings Controls
 // ---------------------------------------------------------------------------
+// Render modes.  Performance is what the app shipped with.  Quality trades speed for
+// looks: PARABOLOID is potree's round spherical-looking splat, the size drops, HQ splat
+// shading goes on and the budget goes to the top of what the ribbon offers.  Quality
+// also switches sizing to FIXED, because ADAPTIVE grows coarse nodes back to large
+// splats (the "huge points when zoomed out" complaint) and Fixed skips the visibility
+// texture path altogether.  Balanced sits in the middle.
+//
+// A mode is a scene-wide change: it restyles every layer and becomes the starting style
+// for the next cloud opened.  Mixing one layer in Quality with another in Performance
+// reads as a rendering glitch rather than a deliberate choice.
+const RENDER_MODES = {
+    performance: { pointType: 'SQUARE', pointSizeType: 'ADAPTIVE', pointSize: 1.0,
+                   splatQuality: 'standard', pointBudget: 2_500_000, minNodeSize: 10 },
+    balanced: { pointType: 'CIRCLE', pointSizeType: 'ADAPTIVE', pointSize: 0.8,
+                splatQuality: 'standard', pointBudget: 5_000_000, minNodeSize: 10 },
+    quality: { pointType: 'PARABOLOID', pointSizeType: 'FIXED', pointSize: 0.45,
+               splatQuality: 'hq', pointBudget: 15_000_000, minNodeSize: 5 }
+};
+
+window.setRenderMode = (mode) => {
+    const preset = RENDER_MODES[mode];
+    if (!preset) return listLayers();
+    viewerSettings.renderMode = mode;
+    viewerSettings.pointType = preset.pointType;
+    viewerSettings.pointSizeType = preset.pointSizeType;
+    viewerSettings.pointSize = preset.pointSize;
+    viewerSettings.splatQuality = preset.splatQuality;
+    viewerSettings.pointBudget = preset.pointBudget;
+    viewerSettings.minNodeSize = preset.minNodeSize;
+    for (const pc of viewer.scene.pointclouds) {
+        const style = layerStyle(pc);
+        style.pointType = preset.pointType;
+        style.pointSizeType = preset.pointSizeType;
+        style.pointSize = preset.pointSize;
+        applyMaterialSettings(pc);
+    }
+    // Reuse the app's own wrappers, since they know which potree calls actually take.
+    for (const call of [['setPointBudget', preset.pointBudget],
+                        ['setMinNodeSize', preset.minNodeSize],
+                        ['setSplatQuality', preset.splatQuality]]) {
+        if (typeof window[call[0]] === 'function') window[call[0]](call[1]);
+    }
+    viewer.render();
+    showToast('Render mode: ' + mode);
+    return listLayers();
+};
+
+window.getRenderMode = () => viewerSettings.renderMode || 'performance';
+
+// The scene-wide half of the look, for the widgets that are not per-layer: budget, node
+// size, splat quality and EDL all live on the viewer, so the ribbon reads them back from
+// here rather than keeping a second copy of the preset table in Python.
+window.getRenderSettings = () => ({
+    renderMode: viewerSettings.renderMode || 'performance',
+    pointBudget: viewerSettings.pointBudget,
+    minNodeSize: viewerSettings.minNodeSize,
+    splatQuality: viewerSettings.splatQuality,
+    edlEnabled: viewerSettings.edlEnabled
+});
+
+// Size, shape and sizing mode act on the active layer only -- each cloud keeps its own
+// style -- while viewerSettings keeps the value as the starting point for the next
+// cloud the user opens.  updateAllPointClouds() stays for the settings that really are
+// viewer-wide.
 window.setPointShape = (shape) => {
     viewerSettings.pointType = shape;
-    updateAllPointClouds();
+    if (currentPointCloud) {
+        layerStyle(currentPointCloud).pointType = shape;
+        applyMaterialSettings(currentPointCloud);
+    }
+    viewer.render();
     showToast(`Point Type: ${shape}`);
 };
 
 window.setPointSizeType = (type) => {
     viewerSettings.pointSizeType = type;
-    updateAllPointClouds();
+    if (currentPointCloud) {
+        layerStyle(currentPointCloud).pointSizeType = type;
+        applyMaterialSettings(currentPointCloud);
+    }
+    viewer.render();
     showToast(`Point Sizing: ${type}`);
 };
 
 window.setPointSize = (size) => {
     viewerSettings.pointSize = Number(size);
-    updateAllPointClouds();
+    if (currentPointCloud) {
+        layerStyle(currentPointCloud).pointSize = Number(size);
+        applyMaterialSettings(currentPointCloud);
+    }
+    viewer.render();
 };
 
 window.setSplatQuality = (quality) => {
@@ -1022,6 +1240,13 @@ window.setBackground = (bg) => {
 };
 
 window.getIntersectionAt = getIntersectionAt;
+window.listLayers = listLayers;
+window.setActiveLayer = (name) => setActiveLayer(name);
+window.setLayerVisible = (name, visible) => setLayerVisible(name, visible);
+window.setLayerColorAttribute = (name, attr) => setLayerColorAttribute(name, attr);
+window.setLayerPointSize = (name, size) => setLayerPointSize(name, size);
+window.removeLayer = (name) => removeLayer(name);
+window.activeLayerName = () => activeLayerName;
 window.clearSelection = clearSelection;
 window.highlightPickedPoint = highlightPickedPoint;
 window.clearPickedPointHighlight = clearPickedPointHighlight;

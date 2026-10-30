@@ -19,6 +19,9 @@
     <script src="/libs/tween/tween.min.js"></script>
     <script src="/libs/d3/d3.js"></script>
     <script src="/libs/proj4/proj4.js"></script>
+    <!-- COPC/EPT streaming: potree.js reads window.Copc (EptLoader.js:24). Without this
+         library a .copc.laz URL fails with "Cannot destructure property 'Copc'". -->
+    <script src="/libs/copc/index.js"></script>
     <script src="/libs/i18next/i18next.js"></script>
     <script src="/libs/jstree/jstree.js"></script>
     <script src="/build/potree/potree.js"></script>

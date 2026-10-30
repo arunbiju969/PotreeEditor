@@ -55,3 +55,13 @@ Thumbs.db
 *.log
 tmp/
 temp/
+
+# Vendored Potree renderer (own git clone; revision pinned in potree.version).
+# Created by setup_potree_assets.bat: git clone + `npm install` builds build/.
+# Note: the repo's own ignore rules for `build/` and `*.bin` above would also
+# swallow potree/build/** and octree/hierarchy .bin chunks if it were tracked.
+/potree/
+/potree.version.local
+
+# Session scratch (permission-recovery backups, repro scripts)
+.dsh-acl-repair/

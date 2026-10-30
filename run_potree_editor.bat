@@ -8,15 +8,30 @@ echo =================================================================
 echo   Starting Potree Hybrid Point Cloud Editor (Experimental)
 echo =================================================================
 
-:: Check for local venv first, then sibling TreeAIBox venv
-if exist "%~dp0.venv\Scripts\activate.bat" (
-    echo [INFO] Activating local .venv...
-    call "%~dp0.venv\Scripts\activate.bat"
-) else if exist "%~dp0..\TreeAIBox\.venv\Scripts\activate.bat" (
-    echo [INFO] Activating Python environment from TreeAIBox\.venv...
-    call "%~dp0..\TreeAIBox\.venv\Scripts\activate.bat"
-) else (
-    echo [WARNING] No virtual environment found. Using system Python...
+REM  Everything this app needs lives inside this folder:
+REM     .\.venv    Python environment (PyQt6, laspy, lazrs, NumPy, SciPy, Matplotlib)
+REM     .\potree   renderer, pinned in potree.version  (build/ must be built once)
+REM  No sibling projects and no environment variables are consulted.
+
+REM ---- 1. Python environment must be the local one ---------------------
+if not exist "%~dp0.venv\Scripts\activate.bat" (
+    echo [ERROR] No local virtual environment found at .\.venv
+    echo         Create it, from this folder:
+    echo             python -m venv .venv
+    echo             .venv\Scripts\activate ^&^& pip install -r requirements.txt
+    pause
+    exit /b 1
+)
+echo [INFO] Activating local .venv...
+call "%~dp0.venv\Scripts\activate.bat"
+
+REM ---- 2. Renderer assets must have been built -------------------------
+if not exist "%~dp0potree\build\potree\potree.js" (
+    echo [ERROR] Renderer not built: .\potree\build\potree\potree.js is missing.
+    echo         Run the one-time setup, which clones, runs npm install and verifies:
+    echo             setup_potree_assets.bat
+    pause
+    exit /b 1
 )
 
 echo [INFO] Launching Hybrid Editor...
