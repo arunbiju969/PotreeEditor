@@ -107,7 +107,11 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName("Potree Hybrid Editor")
 
-    window = MainWindow(server=server, manager=manager, potree_dir=str(potree_dir))
+    # Optional first arg: a LAS/LAZ file or a converted cloud folder to auto-load.
+    initial_path = sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("-") else None
+
+    window = MainWindow(server=server, manager=manager, potree_dir=str(potree_dir),
+                        initial_path=initial_path)
     window.show()
 
     exit_code = app.exec()

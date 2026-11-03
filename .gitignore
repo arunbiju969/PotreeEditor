@@ -65,3 +65,14 @@ temp/
 
 # Session scratch (permission-recovery backups, repro scripts)
 .dsh-acl-repair/
+
+# Local caches, artifacts and data
+.mplcache/
+.npm-cache/
+pip-cache/
+settings.db
+.tmp_exp_*.npz
+tree8793_ff3d.npz
+tree8793_merge_preview*.png
+itc_ramp_check.png
+tools/

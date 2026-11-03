@@ -34,6 +34,15 @@
         <!-- Toast Notification -->
         <div id="toastMsg" class="toast-msg"></div>
 
+        <!-- Indexing Status HUD Badge -->
+        <div id="indexingBadge" class="indexing-badge" style="display:none;" title="Automatic Background Indexing: Builds spatial & tree index sidecars without freezing UI. Streaming fallback is active.">
+            <span id="indexingBadgeIcon">⚡</span>
+            <span id="indexingBadgeText">Automatic Background Indexing...</span>
+            <div id="indexingBadgeBar" class="indexing-mini-bar" style="display:none;">
+                <div id="indexingBadgeProgress" class="indexing-mini-progress"></div>
+            </div>
+        </div>
+
         <!-- Floating Selection Banner & Staging Actions -->
         <div id="selectionBanner" class="selection-banner">
             <div class="selection-info-text">
@@ -54,14 +63,16 @@
                 <span>Point Attributes</span>
                 <button id="closeInspect" style="background:transparent;border:none;color:#9ca3af;cursor:pointer;">X</button>
             </h4>
-            <table>
+            <table id="inspTable">
                 <tr><td>X:</td><td id="inspX">-</td></tr>
                 <tr><td>Y:</td><td id="inspY">-</td></tr>
                 <tr><td>Z:</td><td id="inspZ">-</td></tr>
                 <tr><td>Classification:</td><td id="inspClass">-</td></tr>
                 <tr><td>Intensity:</td><td id="inspInt">-</td></tr>
                 <tr><td>Tree / ITC ID:</td><td id="inspITC">-</td></tr>
+                <tbody id="inspExtraAttrs"></tbody>
             </table>
+            <button id="btnInspectViewTree" style="display:none; margin-top:10px; width:100%; padding:7px 10px; background:#10b981; color:#ffffff; border:none; border-radius:6px; font-weight:600; cursor:pointer; font-size:12px; box-shadow: 0 2px 6px rgba(16,185,129,0.3);">View Tree (All Points)</button>
         </div>
     </div>
 

@@ -8,6 +8,7 @@ Combines:
 """
 
 import os
+import re
 import sys
 import json
 import subprocess
@@ -16,29 +17,38 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List
 
 from PyQt6.QtWidgets import (
-    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QLabel, QFileDialog, QMessageBox, QProgressBar, QSplitter,
     QFrame, QComboBox, QCheckBox, QSpinBox, QDoubleSpinBox, QSlider, QGroupBox, QStatusBar,
     QListWidget, QListWidgetItem,
     QScrollArea, QStackedWidget, QButtonGroup, QTableWidget, QTableWidgetItem,
-    QHeaderView, QAbstractItemView, QProgressDialog, QSizePolicy, QTabWidget, QGridLayout
+    QHeaderView, QAbstractItemView, QProgressDialog, QSizePolicy, QTabWidget, QGridLayout,
+    QDialog
 )
-from PyQt6.QtCore import Qt, QUrl, pyqtSignal, QObject, QThread, QTimer
+from PyQt6.QtCore import Qt, QUrl, QStandardPaths, QByteArray, pyqtSignal, QObject, QThread, QTimer
 from PyQt6.QtGui import QFont, QIcon, QColor, QAction, QActionGroup, QPixmap
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWebEngineCore import QWebEngineSettings
 
 from pointcloud_manager import PointCloudManager
 from server import HybridServer
+from settings_store import SettingsStore
+from conversion_dialog import ConversionDialog, find_potree_converter
 
 
 class BridgeSignaler(QObject):
     selection_changed = pyqtSignal(dict)
     point_picked = pyqtSignal(dict)
+    tree_view_requested = pyqtSignal(dict)
+    tree_loaded = pyqtSignal(dict)
+    tree_stand_loaded = pyqtSignal(dict)
+    tree_filter_selection_changed = pyqtSignal(dict)
+    tree_filter_mode_toggled = pyqtSignal(dict)
     edit_applied = pyqtSignal(dict)
     edit_staged = pyqtSignal(dict)
     edit_removed = pyqtSignal(dict)
     edits_cleared = pyqtSignal(dict)
+    indexing_event = pyqtSignal(dict)
 
 
 class CommitWorker(QThread):
@@ -69,7 +79,8 @@ class CommitWorker(QThread):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, server: HybridServer, manager: PointCloudManager, potree_dir: str):
+    def __init__(self, server: HybridServer, manager: PointCloudManager, potree_dir: str,
+                 initial_path: Optional[str] = None):
         super().__init__()
         self.server = server
         self.manager = manager
@@ -79,25 +90,88 @@ class MainWindow(QMainWindow):
         self.current_potree_url: Optional[str] = None
         self.commit_dialog: Optional[QProgressDialog] = None
         self.commit_worker: Optional[CommitWorker] = None
+        self.conversion_dialog: Optional[ConversionDialog] = None
+        self._active_tool = "nav"
+        self._tool_buttons: dict = {}
+
+        # Persisted settings (SQLite key/value in the project folder)
+        self.settings_store = SettingsStore(
+            os.path.join(os.path.dirname(os.path.abspath(potree_dir)), "settings.db"))
+        self._settings_applied = False
+        self._settings_timer = QTimer(self)
+        self._settings_timer.setSingleShot(True)
+        self._settings_timer.setInterval(450)
+        self._settings_timer.timeout.connect(self._save_settings)
 
         self.signaler = BridgeSignaler()
         self.signaler.selection_changed.connect(self.on_selection_changed)
         self.signaler.point_picked.connect(self.on_point_picked)
+        self.signaler.tree_view_requested.connect(self.on_tree_view_requested)
+        self.signaler.tree_loaded.connect(self.on_tree_loaded)
+        self.signaler.tree_stand_loaded.connect(self._on_tree_stand_loaded)
+        self.signaler.tree_filter_selection_changed.connect(self._on_tree_filter_selection_changed)
+        self.signaler.tree_filter_mode_toggled.connect(self._on_tree_filter_mode_toggled_from_hud)
         self.signaler.edit_applied.connect(self.on_edit_applied)
         self.signaler.edit_staged.connect(self.on_edit_staged)
         self.signaler.edit_removed.connect(self.on_edit_removed)
         self.signaler.edits_cleared.connect(self.on_edits_cleared)
+        self.signaler.indexing_event.connect(self.on_indexing_event)
 
         # Wire server events to Qt signals (thread-safe UI updates)
         self.server.on_event(self._on_server_event)
 
+        # Register manager background indexing callback
+        self.manager.add_indexing_callback(lambda data: self.signaler.indexing_event.emit(data))
+
         self.init_ui()
+        self._wire_settings_persistence()
+
+        # Auto-load a cloud given on the command line (runs after the viewer
+        # page exists; _run_js queues JS until loadFinished).
+        if initial_path:
+            QTimer.singleShot(500, lambda: self._load_initial_path(initial_path))
+
+    def _load_initial_path(self, path: str):
+        path = os.path.abspath(path)
+        if os.path.isdir(path):
+            for entry in ("metadata.json", "cloud.js"):
+                if os.path.exists(os.path.join(path, entry)):
+                    self.open_potree_path(os.path.join(path, entry))
+                    return
+            # Search immediate subdirectories for converted cloud
+            try:
+                for sub in sorted(os.listdir(path)):
+                    sub_path = os.path.join(path, sub)
+                    if os.path.isdir(sub_path):
+                        for entry in ("metadata.json", "cloud.js"):
+                            if os.path.exists(os.path.join(sub_path, entry)):
+                                self.open_potree_path(os.path.join(sub_path, entry))
+                                return
+                # Search for LAS/LAZ files in folder
+                for f in sorted(os.listdir(path)):
+                    if f.lower().endswith((".laz", ".las")):
+                        self.open_las_path(os.path.join(path, f), offer_conversion=False)
+                        return
+            except Exception as e:
+                print(f"[MainWindow] Error reading directory {path}: {e}")
+        elif os.path.isfile(path):
+            self.open_las_path(path, offer_conversion=False)
 
     def _on_server_event(self, event_name: str, data: dict):
         if event_name == "selection_changed":
             self.signaler.selection_changed.emit(data)
         elif event_name == "point_picked":
             self.signaler.point_picked.emit(data)
+        elif event_name in ("tree_view_requested", "view_tree_requested"):
+            self.signaler.tree_view_requested.emit(data)
+        elif event_name == "tree_loaded":
+            self.signaler.tree_loaded.emit(data)
+        elif event_name == "tree_stand_loaded":
+            self.signaler.tree_stand_loaded.emit(data)
+        elif event_name == "tree_filter_selection_changed":
+            self.signaler.tree_filter_selection_changed.emit(data)
+        elif event_name == "tree_filter_mode_toggled":
+            self.signaler.tree_filter_mode_toggled.emit(data)
         elif event_name == "edit_applied":
             self.signaler.edit_applied.emit(data)
         elif event_name == "edit_staged":
@@ -159,17 +233,22 @@ class MainWindow(QMainWindow):
             }
             QGroupBox {
                 border: 1px solid #334155;
-                border-radius: 8px;
-                margin-top: 14px;
-                padding-top: 12px;
-                font-weight: bold;
-                color: #93c5fd;
-                background-color: #161b22;
+                border-radius: 10px;
+                margin-top: 16px;
+                padding: 26px 10px 12px 10px;
+                font-weight: 700;
+                color: #60a5fa;
+                font-size: 10px;
+                letter-spacing: 1px;
+                background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #1a212e, stop:1 #161b22);
             }
             QGroupBox::title {
                 subcontrol-origin: margin;
                 left: 12px;
-                padding: 0 4px;
+                top: -3px;
+                padding: 0 6px;
+                background-color: transparent;
             }
             QPushButton {
                 background-color: #2563eb;
@@ -274,8 +353,8 @@ class MainWindow(QMainWindow):
             QStackedWidget#ribbonStack {
                 background-color: #131b26;
                 border-bottom: 1px solid #233147;
-                min-height: 68px;
-                max-height: 68px;
+                min-height: 92px;
+                max-height: 92px;
             }
             QFrame.ribbonGroup {
                 background-color: #182232;
@@ -328,6 +407,11 @@ class MainWindow(QMainWindow):
                 background-color: #2b3e5a;
                 border-color: #38bdf8;
             }
+            QPushButton.ribbonToolBtn:checked {
+                background-color: #155e75;
+                border-color: #38bdf8;
+                color: #ffffff;
+            }
             QCheckBox {
                 color: #e2e8f0;
                 font-size: 11px;
@@ -349,24 +433,33 @@ class MainWindow(QMainWindow):
             }
             /* Staged Edits Table */
             QTableWidget {
-                background-color: #0d1117;
-                border: 1px solid #30363d;
-                border-radius: 6px;
-                gridline-color: #21262d;
-                color: #c9d1d9;
+                background-color: #0f172a;
+                border: 1px solid #334155;
+                border-radius: 8px;
+                gridline-color: #1e293b;
+                color: #cbd5e1;
                 font-size: 12px;
+                padding: 2px;
+            }
+            QTableWidget::item {
+                padding: 3px 4px;
+                border-radius: 4px;
+            }
+            QTableWidget::item:hover {
+                background-color: #1e293b;
             }
             QTableWidget::item:selected {
-                background-color: #1f293d;
-                color: #58a6ff;
+                background-color: #1d4ed8;
+                color: #ffffff;
             }
             QHeaderView::section {
-                background-color: #161b22;
-                color: #8b949e;
-                font-size: 11px;
-                font-weight: 600;
+                background-color: transparent;
+                color: #64748b;
+                font-size: 10px;
+                font-weight: 700;
+                letter-spacing: 0.5px;
                 border: none;
-                border-bottom: 1px solid #30363d;
+                border-bottom: 1px solid #1e293b;
                 padding: 4px;
             }
             /* Sidebar TabWidget */
@@ -410,6 +503,7 @@ class MainWindow(QMainWindow):
 
         # 2. Splitter (Sidebar + Potree WebGL Viewport)
         splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.splitter = splitter
 
         sidebar = self.create_sidebar()
         sidebar.setMinimumWidth(340)
@@ -417,6 +511,8 @@ class MainWindow(QMainWindow):
 
         # QWebEngineView setup
         self.web_view = QWebEngineView()
+        self._page_ready = False
+        self._js_queue: list = []
         settings = self.web_view.settings()
         settings.setAttribute(QWebEngineSettings.WebAttribute.WebGLEnabled, True)
         settings.setAttribute(QWebEngineSettings.WebAttribute.Accelerated2dCanvasEnabled, True)
@@ -425,12 +521,16 @@ class MainWindow(QMainWindow):
 
         # Point WebEngine to the local hybrid server
         viewer_url = f"http://127.0.0.1:{self.server.port}/index.html"
+        self.web_view.loadFinished.connect(self._on_page_load_finished)
         self.web_view.load(QUrl(viewer_url))
 
         splitter.addWidget(sidebar)
         splitter.addWidget(self.web_view)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
+        # Open with the sidebar at its full width (persisted sizes take over
+        # after the first relaunch).
+        splitter.setSizes([450, 1200])
 
         central_layout.addWidget(splitter, 1)
         central_layout.setStretchFactor(ribbon_bar, 0)
@@ -441,6 +541,215 @@ class MainWindow(QMainWindow):
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
         self.status_bar.showMessage("Ready. Open a point cloud or Potree dataset to begin.")
+
+        # Permanent Indexing Indicator Pill
+        self._init_indexing_pill()
+
+    # -------------------------------------------------------------------------
+    # Background Indexing UI Notification & Status Indicator
+    # -------------------------------------------------------------------------
+    def _init_indexing_pill(self):
+        """Create permanent background indexing status badge in the status bar."""
+        self.indexing_pill = QFrame()
+        self.indexing_pill.setObjectName("indexingPill")
+        self.indexing_pill.setCursor(Qt.CursorShape.PointingHandCursor)
+        pill_layout = QHBoxLayout(self.indexing_pill)
+        pill_layout.setContentsMargins(10, 2, 10, 2)
+        pill_layout.setSpacing(6)
+
+        self.lbl_indexing_icon = QLabel("⚡")
+        self.lbl_indexing_icon.setStyleSheet("font-size: 13px; background: transparent;")
+
+        self.lbl_indexing_text = QLabel("Spatial Index: Ready")
+        self.lbl_indexing_text.setStyleSheet("font-size: 11px; font-weight: 600; background: transparent;")
+
+        self.indexing_progress_bar = QProgressBar()
+        self.indexing_progress_bar.setRange(0, 100)
+        self.indexing_progress_bar.setValue(0)
+        self.indexing_progress_bar.setFixedSize(70, 10)
+        self.indexing_progress_bar.setTextVisible(False)
+        self.indexing_progress_bar.setStyleSheet("""
+            QProgressBar {
+                background-color: #1e293b;
+                border: 1px solid #334155;
+                border-radius: 4px;
+            }
+            QProgressBar::chunk {
+                background-color: #38bdf8;
+                border-radius: 3px;
+            }
+        """)
+        self.indexing_progress_bar.setVisible(False)
+
+        pill_layout.addWidget(self.lbl_indexing_icon)
+        pill_layout.addWidget(self.lbl_indexing_text)
+        pill_layout.addWidget(self.indexing_progress_bar)
+
+        self.indexing_pill.mousePressEvent = lambda e: self.show_indexing_details_dialog()
+        self._set_indexing_pill_tooltip()
+        self.status_bar.addPermanentWidget(self.indexing_pill)
+        self._update_indexing_pill_style("idle", "Spatial Index: Ready")
+
+    def _set_indexing_pill_tooltip(self, extra_info: str = ""):
+        tip = (
+            "<b>Automatic Background Indexing:</b><br>"
+            "As soon as any LAS/LAZ file is opened or converted, spatial chunk bounding boxes "
+            "and tree index sidecars are automatically built in a background thread without freezing the UI.<br><br>"
+            "<b>Zero-Dependency Streaming Fallback:</b><br>"
+            "Even on a brand-new file before the background index finishes, get_tree_points streams "
+            "chunks directly using the target tree's spatial centroid. Neighbor queries always bring "
+            "in surrounding trees immediately on any file."
+        )
+        if extra_info:
+            tip += f"<br><br><b>Status:</b> {extra_info}"
+        tip += "<br><br><i>(Click to inspect indexing engine details)</i>"
+        self.indexing_pill.setToolTip(tip)
+
+    def _update_indexing_pill_style(self, state: str, text: str, percent: int = 0):
+        self.lbl_indexing_text.setText(text)
+        if state == "indexing":
+            self.lbl_indexing_icon.setText("⚡" if percent <= 50 else "🌲")
+            self.indexing_pill.setStyleSheet("""
+                QFrame#indexingPill {
+                    background-color: rgba(2, 132, 199, 0.20);
+                    border: 1px solid #0284c7;
+                    border-radius: 6px;
+                }
+            """)
+            self.lbl_indexing_text.setStyleSheet("color: #38bdf8; font-size: 11px; font-weight: 600; background: transparent;")
+            self.indexing_progress_bar.setValue(percent)
+            self.indexing_progress_bar.setVisible(True)
+        elif state == "ready":
+            self.lbl_indexing_icon.setText("✓")
+            self.indexing_pill.setStyleSheet("""
+                QFrame#indexingPill {
+                    background-color: rgba(16, 185, 129, 0.18);
+                    border: 1px solid #059669;
+                    border-radius: 6px;
+                }
+            """)
+            self.lbl_indexing_text.setStyleSheet("color: #34d399; font-size: 11px; font-weight: 600; background: transparent;")
+            self.indexing_progress_bar.setVisible(False)
+        elif state == "error":
+            self.lbl_indexing_icon.setText("⚠")
+            self.indexing_pill.setStyleSheet("""
+                QFrame#indexingPill {
+                    background-color: rgba(239, 68, 68, 0.18);
+                    border: 1px solid #dc2626;
+                    border-radius: 6px;
+                }
+            """)
+            self.lbl_indexing_text.setStyleSheet("color: #f87171; font-size: 11px; font-weight: 600; background: transparent;")
+            self.indexing_progress_bar.setVisible(False)
+        else:  # idle
+            self.lbl_indexing_icon.setText("⚡")
+            self.indexing_pill.setStyleSheet("""
+                QFrame#indexingPill {
+                    background-color: #1e293b;
+                    border: 1px solid #334155;
+                    border-radius: 6px;
+                }
+            """)
+            self.lbl_indexing_text.setStyleSheet("color: #94a3b8; font-size: 11px; font-weight: 600; background: transparent;")
+            self.indexing_progress_bar.setVisible(False)
+
+    def on_indexing_event(self, data: dict):
+        """Handle background indexing lifecycle events dispatched from PointCloudManager."""
+        if not hasattr(self, "indexing_pill"):
+            return
+        ev_type = data.get("type")
+        stage = data.get("stage")
+        msg = data.get("msg", "")
+
+        # Forward status to Potree 3D WebGL HUD
+        try:
+            self._run_js(f"window.updateIndexingStatus({json.dumps(data)});")
+        except Exception:
+            pass
+
+        if ev_type == "started":
+            if stage == "chunks":
+                self._update_indexing_pill_style("indexing", "⚡ Indexing Spatial Layout (0%)...", 0)
+                self.status_bar.showMessage(
+                    "⚡ Automatic Background Indexing started: scanning spatial chunks (streaming fallback active)...",
+                    6000
+                )
+                self._run_js(
+                    "window.showToast('⚡ Automatic Background Indexing: Building spatial & tree index sidecars in background (streaming fallback active)...', 4500);"
+                )
+            elif stage == "trees":
+                self._update_indexing_pill_style("indexing", "🌲 Indexing Tree Layout...", 0)
+            self._set_indexing_pill_tooltip(msg)
+
+        elif ev_type == "progress":
+            pct = data.get("percent", 0)
+            curr = data.get("current", 0)
+            tot = data.get("total", 1)
+            if stage == "chunks":
+                self._update_indexing_pill_style("indexing", f"⚡ Chunks {curr}/{tot} ({pct}%)", pct)
+            elif stage == "trees":
+                trees_cnt = data.get("trees_found", 0)
+                self._update_indexing_pill_style("indexing", f"🌲 Trees in Chunk {curr}/{tot} ({trees_cnt:,} trees)", pct)
+            self._set_indexing_pill_tooltip(msg)
+
+        elif ev_type in ("completed", "ready"):
+            trees = data.get("trees", 0)
+            chunks = data.get("chunks", 0)
+            ready_text = (
+                f"✓ Tree Spatial Index Ready ({trees:,} trees)"
+                if trees > 0 else f"✓ Spatial Index Ready ({chunks} chunks)"
+            )
+            self._update_indexing_pill_style("ready", ready_text)
+            self._set_indexing_pill_tooltip(msg)
+            if ev_type == "completed":
+                self.status_bar.showMessage(
+                    f"✓ Automatic Background Indexing complete — {trees:,} trees indexed for instant stand queries.",
+                    7000
+                )
+                self._run_js(
+                    f"window.showToast('✓ Automatic Background Indexing complete ({trees:,} trees) — stand queries are now instant!', 4500);"
+                )
+
+        elif ev_type == "error":
+            err = data.get("error", "Unknown")
+            self._update_indexing_pill_style("error", "⚠ Streaming Fallback Active")
+            self._set_indexing_pill_tooltip(f"Indexing Warning: {err}\nStand queries continue using zero-dependency streaming fallback.")
+
+    def show_indexing_details_dialog(self):
+        """Show information dialog explaining Automatic Background Indexing and streaming fallback."""
+        status = self.manager.get_indexing_status()
+        active_las = self.manager.las_path or (self.current_las_path or "No file loaded")
+        is_indexing = status.get("is_indexing", False)
+        chunk_cnt = status.get("chunk_count", 0)
+        tree_cnt = status.get("tree_count", 0)
+
+        status_str = (
+            "<span style='color:#38bdf8; font-weight:bold;'>Active (Building in Background)</span>"
+            if is_indexing else
+            "<span style='color:#34d399; font-weight:bold;'>Ready (Precomputed Sidecar Available)</span>"
+            if (chunk_cnt > 0 or tree_cnt > 0) else
+            "<span style='color:#94a3b8;'>Idle</span>"
+        )
+
+        body = (
+            f"<h3>Automatic Background Indexing & Stand Acceleration</h3>"
+            f"<p><b>Active Cloud:</b> {os.path.basename(active_las)}</p>"
+            f"<p><b>Indexing Engine Status:</b> {status_str}</p>"
+            f"<p><b>Indexed Spatial Chunks:</b> {chunk_cnt}</p>"
+            f"<p><b>Indexed Individual Trees:</b> {tree_cnt:,}</p>"
+            f"<hr>"
+            f"<p><b>Engine Architecture:</b></p>"
+            f"<ul>"
+            f"<li><b>Automatic Background Indexing:</b> As soon as any LAS/LAZ file is opened or converted, "
+            f"<code>_build_chunk_index_in_background</code> automatically builds spatial chunk and tree index "
+            f"sidecars in a background thread without freezing the UI.</li>"
+            f"<li><b>Zero-Dependency Streaming Fallback:</b> Even on a brand-new file before the background "
+            f"index finishes, <code>get_tree_points</code> streams the chunks directly using the target tree's "
+            f"spatial centroid (t_cx, t_cy). Neighbor queries will always bring in the surrounding trees immediately "
+            f"on any file.</li>"
+            f"</ul>"
+        )
+        QMessageBox.information(self, "Indexing Engine Architecture & Status", body)
 
     # -------------------------------------------------------------------------
     # Application Menu Bar (Fallback)
@@ -460,6 +769,15 @@ class MainWindow(QMainWindow):
         act_open_las.setShortcut("Ctrl+Shift+O")
         act_open_las.triggered.connect(self.open_las_file)
         menu_file.addAction(act_open_las)
+
+        act_convert_las = QAction("Convert LAS / LAZ to Potree...", self)
+        act_convert_las.setShortcut("Ctrl+Alt+C")
+        act_convert_las.triggered.connect(self.convert_las_action)
+        menu_file.addAction(act_convert_las)
+
+        act_open_folder = QAction("Open Point Cloud Folder...", self)
+        act_open_folder.triggered.connect(self.open_folder_dialog)
+        menu_file.addAction(act_open_folder)
 
         menu_file.addSeparator()
 
@@ -499,22 +817,52 @@ class MainWindow(QMainWindow):
         self.sidebar_tabs.addTab(tab_layers, "Layers")
         self.sidebar_tabs.addTab(tab_edit, "Forestry")
         self.sidebar_tabs.addTab(tab_dataset, "Dataset")
-
-        # The staged-tree card is built with the layer overlays, because that is where
-        # the overlay table lives, but the work belongs with forestry -- so re-parent it
-        # into the Forestry tab once both tabs exist.  addWidget moves the widget rather
-        # than copying it, so the Layers tab simply stops holding it.  The tab is a
-        # QScrollArea, whose own layout() is None -- the cards live on its content
-        # widget -- which is why the first attempt at this silently did nothing.
-        forestry_tab = self.sidebar_tabs.widget(1)
-        forestry_content = (forestry_tab.widget() if isinstance(forestry_tab, QScrollArea)
-                            else forestry_tab)
-        forestry_layout = forestry_content.layout() if forestry_content is not None else None
-        if forestry_layout is not None and hasattr(self, "grp_staged_card"):
-            forestry_layout.addWidget(self.grp_staged_card)
+        self.sidebar_tabs.currentChanged.connect(self._on_sidebar_tab_changed)
 
         layout.addWidget(self.sidebar_tabs)
         return container
+
+    def _on_sidebar_tab_changed(self, index: int):
+        # Ribbon "Filter" menu is only visible while the Forestry tab is open
+        if hasattr(self, "btn_tab_filter"):
+            self.btn_tab_filter.setVisible(index == 1)
+            # Keep the ribbon page in sync with the hidden Filter tab
+            if index != 1 and self.ribbon_stack.currentIndex() == 4:
+                self.ribbon_stack.setCurrentIndex(2)  # Layers page
+                self.btn_tab_layers.setChecked(True)
+
+        if index == 0:  # Returned to Layers tab
+            # Restore the full point cloud context on the main layer and hide individual tree overlay
+            self._run_js("if (window.showMainCloudContext) window.showMainCloudContext();")
+            self._disable_tree_filter_mode()
+        elif index == 1:  # Switched to Forestry tab
+            # Re-show the individual tree overlay and hide the main cloud context & inspect highlights
+            self._run_js("if (window.showTreeOverlayContext) window.showTreeOverlayContext(); else { if (document.getElementById('inspectCard')) document.getElementById('inspectCard').style.display = 'none'; }")
+        else:
+            self._disable_tree_filter_mode()
+
+    def _set_stand_filter_buttons_enabled(self, enabled: bool):
+        """Enable/disable the ribbon Stand Filter buttons (not just show/hide them)."""
+        for name in ("btn_tree_filter_mode", "btn_top_filter", "btn_top_reset"):
+            btn = getattr(self, name, None)
+            if btn is not None:
+                btn.setEnabled(enabled)
+
+    def _disable_tree_filter_mode(self):
+        if hasattr(self, "btn_tree_filter_mode") and self.btn_tree_filter_mode.isChecked():
+            self.btn_tree_filter_mode.blockSignals(True)
+            self.btn_tree_filter_mode.setChecked(False)
+            self.btn_tree_filter_mode.setText("Filter Mode")
+            self.btn_tree_filter_mode.blockSignals(False)
+        self._run_js("if (window.setTreeFilterMode) window.setTreeFilterMode(false);")
+
+    def _layer_size_slider_row(self) -> QHBoxLayout:
+        """Slider + live value badge for the Point Size quick-styling row."""
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        row.addWidget(self.slider_layer_size, 1)
+        row.addWidget(self.lbl_layer_size_val, 0, Qt.AlignmentFlag.AlignVCenter)
+        return row
 
     def create_layer_manager_tab(self) -> QWidget:
         scroll = QScrollArea()
@@ -523,7 +871,7 @@ class MainWindow(QMainWindow):
 
         content = QWidget()
         v_main = QVBoxLayout(content)
-        v_main.setSpacing(10)
+        v_main.setSpacing(28)
         v_main.setContentsMargins(10, 10, 10, 10)
 
         # 1. Global Toolbar Header
@@ -547,207 +895,136 @@ class MainWindow(QMainWindow):
         v_main.addLayout(h_header)
 
         # 2. Point Cloud Layer Card
-        grp_pc = QGroupBox("Point Cloud Layer")
+        grp_pc = QGroupBox("POINT CLOUD LAYER")
         v_pc = QVBoxLayout(grp_pc)
-        v_pc.setSpacing(6)
+        v_pc.setSpacing(8)
 
+        # Header row: master visibility toggle
         h_pc_title = QHBoxLayout()
-        self.chk_layer_pc = QCheckBox("Active Point Cloud")
+        self.chk_layer_pc = QCheckBox("Visible")
         self.chk_layer_pc.setChecked(True)
-        self.chk_layer_pc.setStyleSheet("font-weight: 600; color: #e2e8f0;")
+        self.chk_layer_pc.setStyleSheet("font-weight: 600; color: #e2e8f0; font-size: 12px;")
         self.chk_layer_pc.toggled.connect(self.toggle_pointcloud_layer)
         h_pc_title.addWidget(self.chk_layer_pc)
         h_pc_title.addStretch()
         v_pc.addLayout(h_pc_title)
 
+        # Active cloud identity: name (prominent) + point count (monospace badge line)
+        self.lbl_layer_cloud_name = QLabel("No point cloud loaded")
+        self.lbl_layer_cloud_name.setStyleSheet(
+            "color: #f1f5f9; font-size: 12px; font-weight: 600; padding: 2px 4px;")
+        self.lbl_layer_cloud_name.setWordWrap(True)
+        v_pc.addWidget(self.lbl_layer_cloud_name)
+
+        self.lbl_layer_cloud_pts = QLabel("- points")
+        self.lbl_layer_cloud_pts.setStyleSheet(
+            "color: #38bdf8; font-size: 11px; font-family: monospace; padding: 0 4px 2px 4px;")
+        v_pc.addWidget(self.lbl_layer_cloud_pts)
+
         # Layer list.  The clouds themselves are the layers (potree's scene list is the
         # manager), so every loaded cloud gets a row: the checkbox is pc.visible, and the
         # selected row is the layer the colour, size and edit controls drive.
         self.layer_list = QListWidget()
-        self.layer_list.setMaximumHeight(112)
+        self.layer_list.setMaximumHeight(120)
+        self.layer_list.setStyleSheet("""
+            QListWidget {
+                background-color: #0f172a;
+                border: 1px solid #334155;
+                border-radius: 8px;
+                padding: 3px;
+                outline: none;
+            }
+            QListWidget::item {
+                padding: 5px 7px;
+                margin: 1px 1px;
+                border-radius: 5px;
+                color: #cbd5e1;
+                font-size: 12px;
+            }
+            QListWidget::item:hover {
+                background-color: #1e293b;
+            }
+            QListWidget::item:selected {
+                background-color: #1d4ed8;
+                color: #ffffff;
+            }
+        """)
         self.layer_list.itemSelectionChanged.connect(self._on_layer_row_selected)
         self.layer_list.itemChanged.connect(self._on_layer_row_checked)
         v_pc.addWidget(self.layer_list)
 
         h_layer_buttons = QHBoxLayout()
+        h_layer_buttons.setSpacing(6)
         btn_remove_layer = QPushButton("Remove Layer")
+        btn_remove_layer.setObjectName("btnSecondary")
+        btn_remove_layer.setStyleSheet("padding: 4px 10px; font-size: 11px;")
+        btn_remove_layer.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_remove_layer.clicked.connect(self._on_layer_remove_clicked)
-        btn_refresh_layers = QPushButton("Refresh Layers")
+        btn_refresh_layers = QPushButton("Refresh")
+        btn_refresh_layers.setObjectName("btnSecondary")
+        btn_refresh_layers.setStyleSheet("padding: 4px 10px; font-size: 11px;")
+        btn_refresh_layers.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_refresh_layers.clicked.connect(lambda: self.refresh_layers(0))
         h_layer_buttons.addWidget(btn_remove_layer)
         h_layer_buttons.addWidget(btn_refresh_layers)
         h_layer_buttons.addStretch()
         v_pc.addLayout(h_layer_buttons)
 
+        # Divider into the per-layer styling controls
+        h_quick = QHBoxLayout()
+        h_quick.setSpacing(8)
+        lbl_quick = QLabel("QUICK STYLING")
+        lbl_quick.setStyleSheet("color: #64748b; font-size: 9px; font-weight: 700; letter-spacing: 1px;")
+        line_quick = QFrame()
+        line_quick.setFrameShape(QFrame.Shape.HLine)
+        line_quick.setStyleSheet("color: #1e293b; background-color: #1e293b; max-height: 1px; border: none;")
+        h_quick.addWidget(lbl_quick)
+        h_quick.addWidget(line_quick, 1)
+        v_pc.addSpacing(2)
+        v_pc.addLayout(h_quick)
+
         # Guards the row rebuild: re-adding rows fires selection and check signals, and
         # those must not bounce back into the viewer as user edits.
         self._layer_sync_guard = False
 
-        self.lbl_layer_cloud_name = QLabel("No point cloud loaded")
-        self.lbl_layer_cloud_name.setStyleSheet("color: #94a3b8; font-size: 11px;")
-        self.lbl_layer_cloud_name.setWordWrap(True)
-        v_pc.addWidget(self.lbl_layer_cloud_name)
-
-        self.lbl_layer_cloud_pts = QLabel("- points")
-        self.lbl_layer_cloud_pts.setStyleSheet("color: #64748b; font-size: 11px;")
-        v_pc.addWidget(self.lbl_layer_cloud_pts)
-
         # Quick Controls inside Point Cloud card
-        h_color = QHBoxLayout()
-        lbl_c = QLabel("Color Mode:")
+        g_quick = QGridLayout()
+        g_quick.setHorizontalSpacing(10)
+        g_quick.setVerticalSpacing(6)
+        g_quick.setColumnMinimumWidth(0, 72)
+        g_quick.setColumnStretch(1, 1)
+
+        lbl_c = QLabel("Color:")
         lbl_c.setStyleSheet("color: #94a3b8; font-size: 11px;")
         self.combo_layer_color = QComboBox()
+        self.combo_layer_color.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.combo_layer_color.setStyleSheet("font-size: 11px; padding: 3px 6px;")
         self.combo_layer_color.addItem("RGBA (True Color)", "rgba")
         self.combo_layer_color.addItem("ASPRS Classification", "classification")
         self.combo_layer_color.addItem("Intensity", "intensity")
         self.combo_layer_color.addItem("Elevation", "elevation")
         self.combo_layer_color.currentIndexChanged.connect(self._on_layer_color_changed)
-        h_color.addWidget(lbl_c)
-        h_color.addWidget(self.combo_layer_color)
-        v_pc.addLayout(h_color)
+        g_quick.addWidget(lbl_c, 0, 0)
+        g_quick.addWidget(self.combo_layer_color, 0, 1)
 
-        h_size = QHBoxLayout()
         lbl_s = QLabel("Point Size:")
         lbl_s.setStyleSheet("color: #94a3b8; font-size: 11px;")
         self.slider_layer_size = QSlider(Qt.Orientation.Horizontal)
         self.slider_layer_size.setRange(1, 40)
         self.slider_layer_size.setValue(10)
+        self.slider_layer_size.setCursor(Qt.CursorShape.PointingHandCursor)
         self.lbl_layer_size_val = QLabel("1.00")
-        self.lbl_layer_size_val.setStyleSheet("color: #38bdf8; font-size: 11px; min-width: 28px;")
+        self.lbl_layer_size_val.setStyleSheet(
+            "color: #38bdf8; font-size: 11px; font-family: monospace;"
+            "background-color: #0f172a; border: 1px solid #334155;"
+            "border-radius: 4px; padding: 1px 5px; min-width: 30px;")
+        self.lbl_layer_size_val.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.slider_layer_size.valueChanged.connect(self._on_layer_size_slider_changed)
-        h_size.addWidget(lbl_s)
-        h_size.addWidget(self.slider_layer_size)
-        h_size.addWidget(self.lbl_layer_size_val)
-        v_pc.addLayout(h_size)
+        g_quick.addWidget(lbl_s, 1, 0)
+        g_quick.addLayout(self._layer_size_slider_row(), 1, 1)
+        v_pc.addLayout(g_quick)
 
         v_main.addWidget(grp_pc)
-
-        # 3. Staged Delineations Layer Card
-        grp_staged = QGroupBox("Staged Trees & Edits")
-        self.grp_staged_card = grp_staged
-        v_staged = QVBoxLayout(grp_staged)
-        v_staged.setSpacing(6)
-
-        h_staged_title = QHBoxLayout()
-        self.chk_layer_staged = QCheckBox("Staged Overlays (3D)")
-        self.chk_layer_staged.setChecked(True)
-        self.chk_layer_staged.setStyleSheet("font-weight: 600; color: #e2e8f0;")
-        self.chk_layer_staged.toggled.connect(self.toggle_staged_layer)
-        h_staged_title.addWidget(self.chk_layer_staged)
-        h_staged_title.addStretch()
-
-        lbl_staged_badge = QLabel("STAGED")
-        lbl_staged_badge.setStyleSheet("background-color: #064e3b; color: #10b981; font-size: 10px; font-weight: bold; padding: 2px 5px; border-radius: 3px;")
-        h_staged_title.addWidget(lbl_staged_badge)
-        v_staged.addLayout(h_staged_title)
-
-        self.lbl_layer_staged_count = QLabel("0 staged edits (ready to commit)")
-        self.lbl_layer_staged_count.setStyleSheet("color: #10b981; font-weight: 500; font-size: 11px;")
-        v_staged.addWidget(self.lbl_layer_staged_count)
-
-        # Staged items table with individual visibility, swatches, labels, delete, and double-click zoom
-        self.table_layer_staged = QTableWidget()
-        self.table_layer_staged.setColumnCount(4)
-        self.table_layer_staged.setHorizontalHeaderLabels(["Vis", "Item", "Action", ""])
-        self.table_layer_staged.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
-        self.table_layer_staged.setColumnWidth(0, 32)
-        self.table_layer_staged.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self.table_layer_staged.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        self.table_layer_staged.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
-        self.table_layer_staged.setColumnWidth(3, 30)
-        self.table_layer_staged.setMaximumHeight(180)
-        self.table_layer_staged.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table_layer_staged.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.table_layer_staged.cellDoubleClicked.connect(self._on_layer_staged_double_clicked)
-        v_staged.addWidget(self.table_layer_staged)
-
-        lbl_hint = QLabel("Double-click row to zoom camera to tree.")
-        lbl_hint.setStyleSheet("color: #64748b; font-size: 10px; font-style: italic;")
-        v_staged.addWidget(lbl_hint)
-
-        h_staged_actions = QHBoxLayout()
-        btn_commit_staged = QPushButton("Commit to LAS/LAZ...")
-        btn_commit_staged.setObjectName("btnSuccess")
-        btn_commit_staged.setStyleSheet("padding: 4px 8px; font-size: 11px;")
-        btn_commit_staged.clicked.connect(self.commit_staged_edits_action)
-
-        btn_clear_staged = QPushButton("Clear All")
-        btn_clear_staged.setObjectName("btnDanger")
-        btn_clear_staged.setStyleSheet("padding: 4px 8px; font-size: 11px;")
-        btn_clear_staged.clicked.connect(self.clear_all_staged_edits)
-
-        h_staged_actions.addWidget(btn_commit_staged)
-        h_staged_actions.addWidget(btn_clear_staged)
-        v_staged.addLayout(h_staged_actions)
-
-        v_main.addWidget(grp_staged)
-
-        # 4. Picked Point Highlight Layer Card
-        grp_pick = QGroupBox("Picked Point Highlight")
-        v_pick = QVBoxLayout(grp_pick)
-        v_pick.setSpacing(6)
-
-        h_pick_title = QHBoxLayout()
-        self.chk_layer_pick = QCheckBox("Point Reticle & Badge")
-        self.chk_layer_pick.setChecked(True)
-        self.chk_layer_pick.setStyleSheet("font-weight: 600; color: #e2e8f0;")
-        self.chk_layer_pick.toggled.connect(self.toggle_pick_layer)
-        h_pick_title.addWidget(self.chk_layer_pick)
-        h_pick_title.addStretch()
-        v_pick.addLayout(h_pick_title)
-
-        self.lbl_layer_pick_coords = QLabel("Position: None")
-        self.lbl_layer_pick_coords.setStyleSheet("color: #94a3b8; font-size: 11px; font-family: monospace;")
-        v_pick.addWidget(self.lbl_layer_pick_coords)
-
-        self.lbl_layer_pick_attr = QLabel("Class: - | Tree ID: - | Intensity: -")
-        self.lbl_layer_pick_attr.setStyleSheet("color: #94a3b8; font-size: 11px;")
-        v_pick.addWidget(self.lbl_layer_pick_attr)
-
-        btn_clear_pick = QPushButton("Clear Pick Highlight")
-        btn_clear_pick.setObjectName("btnSecondary")
-        btn_clear_pick.setStyleSheet("padding: 3px 8px; font-size: 11px;")
-        btn_clear_pick.clicked.connect(self.clear_picked_highlight)
-        v_pick.addWidget(btn_clear_pick)
-
-        v_main.addWidget(grp_pick)
-
-        # 5. Active Delineation Boundary Layer Card
-        grp_sel = QGroupBox("Active Delineation Boundary")
-        v_sel = QVBoxLayout(grp_sel)
-        v_sel.setSpacing(6)
-
-        h_sel_title = QHBoxLayout()
-        self.chk_layer_sel = QCheckBox("Active Selection Boundary")
-        self.chk_layer_sel.setChecked(True)
-        self.chk_layer_sel.setStyleSheet("font-weight: 600; color: #e2e8f0;")
-        self.chk_layer_sel.toggled.connect(self.toggle_sel_layer)
-        h_sel_title.addWidget(self.chk_layer_sel)
-        h_sel_title.addStretch()
-
-        lbl_sel_badge = QLabel("SELECTION")
-        lbl_sel_badge.setStyleSheet("background-color: #172554; color: #60a5fa; font-size: 10px; font-weight: bold; padding: 2px 5px; border-radius: 3px;")
-        h_sel_title.addWidget(lbl_sel_badge)
-        v_sel.addLayout(h_sel_title)
-
-        self.lbl_layer_sel_info = QLabel("Selection: None")
-        self.lbl_layer_sel_info.setStyleSheet("color: #94a3b8; font-size: 11px;")
-        v_sel.addWidget(self.lbl_layer_sel_info)
-
-        h_sel_btns = QHBoxLayout()
-        btn_clear_boundary = QPushButton("Clear Boundary")
-        btn_clear_boundary.setObjectName("btnSecondary")
-        btn_clear_boundary.setStyleSheet("padding: 3px 8px; font-size: 11px;")
-        btn_clear_boundary.clicked.connect(self.clear_selection)
-        h_sel_btns.addWidget(btn_clear_boundary)
-
-        btn_go_stage = QPushButton("Stage Tree ID...")
-        btn_go_stage.setStyleSheet("padding: 3px 8px; font-size: 11px;")
-        btn_go_stage.clicked.connect(lambda: self.sidebar_tabs.setCurrentIndex(1))
-        h_sel_btns.addWidget(btn_go_stage)
-
-        v_sel.addLayout(h_sel_btns)
-        v_main.addWidget(grp_sel)
 
         v_main.addStretch()
         scroll.setWidget(content)
@@ -760,46 +1037,332 @@ class MainWindow(QMainWindow):
 
         content = QWidget()
         layout = QVBoxLayout(content)
-        layout.setSpacing(12)
+        layout.setSpacing(28)
         layout.setContentsMargins(12, 12, 12, 12)
 
+        # 1. Full-Density Tree View — queries every point of one ITC id from the
+        # LAS master. Opening it isolates the tree and hides the octree context;
+        # returning to Layers restores the full point cloud context.
+        grp_tree = QGroupBox("VIEW TREE (FULL DENSITY)")
+        v_tree = QVBoxLayout(grp_tree)
+        v_tree.setSpacing(8)
+
+        self.lbl_tree_view_status = QLabel("Ctrl+Click a tree point or enter Tree ID to view in full density.")
+        self.lbl_tree_view_status.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        self.lbl_tree_view_status.setWordWrap(True)
+        v_tree.addWidget(self.lbl_tree_view_status)
+
+        h_tree = QHBoxLayout()
+        lbl_tvid = QLabel("Tree ID:")
+        lbl_tvid.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        h_tree.addWidget(lbl_tvid)
+        self.spin_tree_view = QSpinBox()
+        self.spin_tree_view.setRange(1, 999999)
+        self.spin_tree_view.setValue(1)
+        self.spin_tree_view.setStyleSheet("font-size: 11px; padding: 3px 6px;")
+        self.spin_tree_view.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.spin_tree_view.valueChanged.connect(self._on_tree_spin_changed)
+        h_tree.addWidget(self.spin_tree_view)
+        h_tree.addStretch()
+        v_tree.addLayout(h_tree)
+
+        # Tree-specific Color By Option
+        h_tree_color = QHBoxLayout()
+        lbl_tree_color = QLabel("Color by:")
+        lbl_tree_color.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        h_tree_color.addWidget(lbl_tree_color)
+        self.combo_tree_color = QComboBox()
+        self.combo_tree_color.setStyleSheet("font-size: 11px; padding: 3px 6px;")
+        self.combo_tree_color.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.combo_tree_color.addItem("Match Main Layer (Auto)", "auto")
+        self.combo_tree_color.addItem("RGB / True Color", "rgba")
+        self.combo_tree_color.addItem("ASPRS Classification", "classification")
+        self.combo_tree_color.addItem("Elevation Gradient", "elevation")
+        self.combo_tree_color.addItem("Intensity", "intensity")
+        self.combo_tree_color.addItem("Tree / ITC (Segmented Stand)", "itc")
+        self.combo_tree_color.addItem("Natural Foliage Green", "green")
+        self.combo_tree_color.addItem("Viridis Heatmap", "viridis")
+        self.combo_tree_color.currentIndexChanged.connect(self._on_tree_color_changed)
+        h_tree_color.addWidget(self.combo_tree_color)
+        v_tree.addLayout(h_tree_color)
+
+        # Tree-specific Point Size Option
+        h_tree_size = QHBoxLayout()
+        lbl_tsize = QLabel("Point Size:")
+        lbl_tsize.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        h_tree_size.addWidget(lbl_tsize)
+        self.slider_tree_size = QSlider(Qt.Orientation.Horizontal)
+        self.slider_tree_size.setRange(1, 40)
+        self.slider_tree_size.setValue(10)
+        self.slider_tree_size.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.lbl_tree_size_val = QLabel("1.00")
+        self.lbl_tree_size_val.setStyleSheet(
+            "color: #38bdf8; font-size: 11px; font-family: monospace;"
+            "background-color: #0f172a; border: 1px solid #334155;"
+            "border-radius: 4px; padding: 1px 5px; min-width: 30px;")
+        self.lbl_tree_size_val.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.slider_tree_size.valueChanged.connect(self._on_tree_size_changed)
+        h_tree_size.addWidget(self.slider_tree_size)
+        h_tree_size.addWidget(self.lbl_tree_size_val)
+        v_tree.addLayout(h_tree_size)
+
+        # Tree Neighbor Options
+        h_neighbors = QHBoxLayout()
+        self.chk_tree_neighbors = QCheckBox("Include Neighbors")
+        self.chk_tree_neighbors.setStyleSheet("color: #e2e8f0; font-size: 11px; font-weight: 600;")
+        self.chk_tree_neighbors.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.chk_tree_neighbors.toggled.connect(self._on_tree_neighbors_toggled)
+        h_neighbors.addWidget(self.chk_tree_neighbors)
+
+        lbl_radius = QLabel("Radius:")
+        lbl_radius.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        h_neighbors.addWidget(lbl_radius)
+
+        self.spin_tree_radius = QDoubleSpinBox()
+        self.spin_tree_radius.setRange(2.0, 100.0)
+        self.spin_tree_radius.setValue(5.0)
+        self.spin_tree_radius.setSingleStep(5.0)
+        self.spin_tree_radius.setSuffix(" m")
+        self.spin_tree_radius.setStyleSheet("font-size: 11px; padding: 2px 4px; max-width: 65px;")
+        self.spin_tree_radius.setEnabled(False)
+        h_neighbors.addWidget(self.spin_tree_radius)
+        h_neighbors.addStretch()
+        v_tree.addLayout(h_neighbors)
+
+        h_nmode = QHBoxLayout()
+        lbl_nmode = QLabel("Stand Mode:")
+        lbl_nmode.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        h_nmode.addWidget(lbl_nmode)
+
+        self.combo_neighbor_mode = QComboBox()
+        self.combo_neighbor_mode.setStyleSheet("font-size: 11px; padding: 3px 6px;")
+        self.combo_neighbor_mode.addItem("Neighbor Trees & Canopy (Recommended)", "canopy")
+        self.combo_neighbor_mode.addItem("Segmented Trees Only (ITC > 0)", "trees_only")
+        self.combo_neighbor_mode.addItem("All Stand Points (Canopy + Ground)", "all")
+        self.combo_neighbor_mode.setEnabled(False)
+        h_nmode.addWidget(self.combo_neighbor_mode)
+        v_tree.addLayout(h_nmode)
+
+        # Ground under the tree: ASPRS class 2 points within a radius of the tree
+        h_ground = QHBoxLayout()
+        self.chk_tree_ground = QCheckBox("Show Ground")
+        self.chk_tree_ground.setChecked(False)
+        self.chk_tree_ground.setStyleSheet("color: #e2e8f0; font-size: 11px; font-weight: 600;")
+        self.chk_tree_ground.setCursor(Qt.CursorShape.PointingHandCursor)
+        h_ground.addWidget(self.chk_tree_ground)
+
+        lbl_grad = QLabel("Radius:")
+        lbl_grad.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        h_ground.addWidget(lbl_grad)
+
+        self.spin_tree_ground = QDoubleSpinBox()
+        self.spin_tree_ground.setRange(2.0, 100.0)
+        self.spin_tree_ground.setValue(10.0)
+        self.spin_tree_ground.setSingleStep(5.0)
+        self.spin_tree_ground.setSuffix(" m")
+        self.spin_tree_ground.setStyleSheet("font-size: 11px; padding: 2px 4px; max-width: 65px;")
+        self.spin_tree_ground.setEnabled(False)  # matches the unchecked default
+        h_ground.addWidget(self.spin_tree_ground)
+        h_ground.addStretch()
+        v_tree.addLayout(h_ground)
+        self.chk_tree_ground.toggled.connect(
+            lambda on: (self.spin_tree_ground.setEnabled(on), self.view_tree_action()))
+        self.spin_tree_ground.editingFinished.connect(self.view_tree_action)
+
+        # Bounding box (visible by default, with tree height label). Measure
+        # lives on the ribbon Point tab (chk_ribbon_measure).
+        h_tools = QHBoxLayout()
+        self.chk_tree_bbox = QCheckBox("Bounding Box")
+        self.chk_tree_bbox.setChecked(True)
+        self.chk_tree_bbox.setStyleSheet("color: #e2e8f0; font-size: 11px; font-weight: 600;")
+        self.chk_tree_bbox.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.chk_tree_bbox.toggled.connect(
+            lambda on: self._run_js(f"if (window.setTreeBBox) window.setTreeBBox({'true' if on else 'false'});"))
+        h_tools.addWidget(self.chk_tree_bbox)
+        h_tools.addStretch()
+        v_tree.addLayout(h_tools)
+
+        btn_view_tree = QPushButton("View Tree (All Points)")
+        btn_view_tree.setObjectName("btnSuccess")
+        btn_view_tree.setStyleSheet("padding: 5px 10px; font-size: 11px; font-weight: 600;")
+        btn_view_tree.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_view_tree.clicked.connect(self.view_tree_action)
+        v_tree.addWidget(btn_view_tree)
+
+        # Export the currently displayed full-density tree/stand back to LAS/LAZ
+        # (extracted straight from the master file, honoring the stand filter)
+        self.btn_extract_tree = QPushButton("Extract View as COPC / LAS / LAZ...")
+        self.btn_extract_tree.setObjectName("btnSecondary")
+        self.btn_extract_tree.setStyleSheet("padding: 5px 10px; font-size: 11px;")
+        self.btn_extract_tree.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_extract_tree.setEnabled(False)
+        self.btn_extract_tree.clicked.connect(self.extract_tree_view_action)
+        v_tree.addWidget(self.btn_extract_tree)
+
+        # ForestFormer3D instance segmentation on the displayed tree/stand:
+        # overlay recolours per detected tree (splits merged ITC trees).
+        self.btn_segment_tree = QPushButton("Segment (ForestFormer3D)")
+        self.btn_segment_tree.setObjectName("btnSecondary")
+        self.btn_segment_tree.setStyleSheet("padding: 5px 10px; font-size: 11px; font-weight: 600;")
+        self.btn_segment_tree.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_segment_tree.clicked.connect(self.segment_tree_action)
+        v_tree.addWidget(self.btn_segment_tree)
+
+        btn_close_tree = QPushButton("Close Tree View & Back to Layers")
+        btn_close_tree.setObjectName("btnSecondary")
+        btn_close_tree.setStyleSheet("padding: 5px 10px; font-size: 11px;")
+        btn_close_tree.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_close_tree.clicked.connect(self.close_tree_view_action)
+        v_tree.addWidget(btn_close_tree)
+
+        v_tree.addSpacing(14)
+
+        # Stand Trees Filter Group (Only shown in Forestry tab when viewing a tree with neighbors)
+        self.grp_stand_filter = QGroupBox("FILTER NEIGHBOR TREES")
+        self.grp_stand_filter.setStyleSheet("""
+            QGroupBox {
+                border: 1px solid #0284c7;
+                border-radius: 8px;
+                margin-top: 26px;
+                padding-top: 34px;
+                font-weight: 700;
+                color: #38bdf8;
+                font-size: 11px;
+                background-color: rgba(2, 132, 199, 0.04);
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                subcontrol-position: top left;
+                left: 14px;
+                top: 6px;
+                padding: 1px 8px;
+                background-color: #141c28;
+                border: 1px solid #0284c7;
+                border-radius: 4px;
+                color: #38bdf8;
+                font-weight: 700;
+            }
+        """)
+        v_filter = QVBoxLayout(self.grp_stand_filter)
+        v_filter.setSpacing(6)
+        v_filter.setContentsMargins(8, 12, 8, 8)
+
+        self.lbl_stand_filter_info = QLabel("Filter Mode ON: click trees in 3D, or use checkboxes:")
+        self.lbl_stand_filter_info.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        self.lbl_stand_filter_info.setWordWrap(True)
+        v_filter.addWidget(self.lbl_stand_filter_info)
+
+        # Quick Select buttons
+        h_fquick = QHBoxLayout()
+        btn_sel_all = QPushButton("Select All")
+        btn_sel_all.setStyleSheet("font-size: 10px; padding: 2px 6px;")
+        btn_sel_all.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_sel_all.clicked.connect(self._on_filter_select_all)
+        h_fquick.addWidget(btn_sel_all)
+
+        btn_sel_target = QPushButton("Target Tree Only")
+        btn_sel_target.setStyleSheet("font-size: 10px; padding: 2px 6px;")
+        btn_sel_target.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_sel_target.clicked.connect(self._on_filter_select_target_only)
+        h_fquick.addWidget(btn_sel_target)
+        v_filter.addLayout(h_fquick)
+
+        # Multi-select tree list with checkboxes
+        self.list_stand_trees = QListWidget()
+        self.list_stand_trees.setMaximumHeight(130)
+        self.list_stand_trees.setStyleSheet("""
+            QListWidget {
+                background-color: #0f172a;
+                border: 1px solid #334155;
+                border-radius: 4px;
+                color: #e2e8f0;
+                font-size: 11px;
+            }
+            QListWidget::item {
+                padding: 2px 4px;
+            }
+            QListWidget::item:hover {
+                background-color: #1e293b;
+            }
+        """)
+        self.list_stand_trees.itemChanged.connect(self._on_stand_tree_item_changed)
+        v_filter.addWidget(self.list_stand_trees)
+
+        # Filter and Reset buttons
+        h_factions = QHBoxLayout()
+        self.btn_apply_tree_filter = QPushButton("Filter")
+        self.btn_apply_tree_filter.setObjectName("btnSuccess")
+        self.btn_apply_tree_filter.setStyleSheet("padding: 4px 10px; font-size: 11px; font-weight: 700;")
+        self.btn_apply_tree_filter.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_apply_tree_filter.clicked.connect(self._apply_tree_filter)
+        h_factions.addWidget(self.btn_apply_tree_filter)
+
+        self.btn_reset_tree_filter = QPushButton("Reset")
+        self.btn_reset_tree_filter.setObjectName("btnSecondary")
+        self.btn_reset_tree_filter.setStyleSheet("padding: 4px 8px; font-size: 11px;")
+        self.btn_reset_tree_filter.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_reset_tree_filter.clicked.connect(self._reset_tree_filter)
+        h_factions.addWidget(self.btn_reset_tree_filter)
+        v_filter.addLayout(h_factions)
+
+        self.grp_stand_filter.setVisible(False)
+        v_tree.addWidget(self.grp_stand_filter)
+
+        layout.addWidget(grp_tree)
+
         # 1. Active Selection Group
-        grp_edit = QGroupBox("Active Delineation / Selection")
+        grp_edit = QGroupBox("ACTIVE DELINEATION / SELECTION")
         v_edit = QVBoxLayout(grp_edit)
+        v_edit.setSpacing(8)
 
         self.lbl_sel_count = QLabel("Selection: None")
-        self.lbl_sel_count.setStyleSheet("font-weight: bold; color: #60a5fa;")
+        self.lbl_sel_count.setStyleSheet("font-weight: 600; color: #60a5fa; font-size: 12px;")
         v_edit.addWidget(self.lbl_sel_count)
 
         self.lbl_sel_classes = QLabel("Classes: -")
+        self.lbl_sel_classes.setStyleSheet("color: #94a3b8; font-size: 11px;")
         v_edit.addWidget(self.lbl_sel_classes)
 
         self.lbl_sel_itc = QLabel("ITC IDs: -")
+        self.lbl_sel_itc.setStyleSheet("color: #94a3b8; font-size: 11px;")
         v_edit.addWidget(self.lbl_sel_itc)
 
         # Action: Assign Tree ID (ITC)
         h_itc = QHBoxLayout()
-        h_itc.addWidget(QLabel("Tree ID:"))
+        lbl_itc = QLabel("Tree ID:")
+        lbl_itc.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        h_itc.addWidget(lbl_itc)
         self.spin_itc = QSpinBox()
         self.spin_itc.setRange(1, 999999)
         self.spin_itc.setValue(1)
+        self.spin_itc.setStyleSheet("font-size: 11px; padding: 3px 6px;")
+        self.spin_itc.setCursor(Qt.CursorShape.PointingHandCursor)
         h_itc.addWidget(self.spin_itc)
+        h_itc.addStretch()
         v_edit.addLayout(h_itc)
 
         btn_assign_itc = QPushButton("Stage Tree ID to Polygon")
+        btn_assign_itc.setStyleSheet("padding: 5px 10px; font-size: 11px;")
+        btn_assign_itc.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_assign_itc.clicked.connect(self.apply_assign_itc)
         v_edit.addWidget(btn_assign_itc)
 
         # Action: Mark as Noise
         btn_noise = QPushButton("Stage Selection as Noise (Class 7)")
         btn_noise.setObjectName("btnDanger")
+        btn_noise.setStyleSheet("padding: 5px 10px; font-size: 11px;")
+        btn_noise.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_noise.clicked.connect(self.apply_mark_noise)
         v_edit.addWidget(btn_noise)
 
         # Action: Set Classification
         h_cls = QHBoxLayout()
-        h_cls.addWidget(QLabel("ASPRS Class:"))
+        lbl_cls = QLabel("ASPRS Class:")
+        lbl_cls.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        h_cls.addWidget(lbl_cls)
         self.combo_class = QComboBox()
+        self.combo_class.setStyleSheet("font-size: 11px; padding: 3px 6px;")
+        self.combo_class.setCursor(Qt.CursorShape.PointingHandCursor)
         self.combo_class.addItem("0: Unclassified", 0)
         self.combo_class.addItem("1: Unassigned", 1)
         self.combo_class.addItem("2: Ground", 2)
@@ -808,26 +1371,32 @@ class MainWindow(QMainWindow):
         self.combo_class.addItem("5: High Vegetation", 5)
         self.combo_class.addItem("7: Noise", 7)
         h_cls.addWidget(self.combo_class)
+        h_cls.addStretch()
         v_edit.addLayout(h_cls)
 
         btn_set_class = QPushButton("Stage Classification")
         btn_set_class.setObjectName("btnSecondary")
+        btn_set_class.setStyleSheet("padding: 5px 10px; font-size: 11px;")
+        btn_set_class.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_set_class.clicked.connect(self.apply_set_classification)
         v_edit.addWidget(btn_set_class)
 
         btn_clear = QPushButton("Clear Current Delineation")
         btn_clear.setObjectName("btnSecondary")
+        btn_clear.setStyleSheet("padding: 5px 10px; font-size: 11px;")
+        btn_clear.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_clear.clicked.connect(self.clear_selection)
         v_edit.addWidget(btn_clear)
 
         layout.addWidget(grp_edit)
 
         # 2. Optimistic Visual Staging & Deferred Commit Group
-        grp_staged = QGroupBox("Staged Edits (Pending Commit)")
+        grp_staged = QGroupBox("STAGED EDITS (PENDING COMMIT)")
         v_staged = QVBoxLayout(grp_staged)
+        v_staged.setSpacing(8)
 
         self.lbl_staged_count = QLabel("Staged Edits: 0 (Ready to Commit)")
-        self.lbl_staged_count.setStyleSheet("font-weight: bold; color: #10b981;")
+        self.lbl_staged_count.setStyleSheet("font-weight: 600; color: #10b981;")
         v_staged.addWidget(self.lbl_staged_count)
 
         self.table_staged = QTableWidget()
@@ -847,11 +1416,15 @@ class MainWindow(QMainWindow):
         # Commit and Save to LAS/LAZ Button
         btn_commit = QPushButton("Commit & Save to LAS/LAZ...")
         btn_commit.setObjectName("btnSuccess")
+        btn_commit.setStyleSheet("padding: 5px 10px; font-size: 11px;")
+        btn_commit.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_commit.clicked.connect(self.commit_staged_edits_action)
         v_staged.addWidget(btn_commit)
 
         btn_clear_staged = QPushButton("Clear All Staged Edits")
         btn_clear_staged.setObjectName("btnDanger")
+        btn_clear_staged.setStyleSheet("padding: 5px 10px; font-size: 11px;")
+        btn_clear_staged.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_clear_staged.clicked.connect(self.clear_all_staged_edits)
         v_staged.addWidget(btn_clear_staged)
 
@@ -868,23 +1441,29 @@ class MainWindow(QMainWindow):
 
         content = QWidget()
         layout = QVBoxLayout(content)
-        layout.setSpacing(12)
+        layout.setSpacing(28)
         layout.setContentsMargins(12, 12, 12, 12)
 
         # 1. Dataset Management Group
-        grp_data = QGroupBox("Point Cloud Dataset")
+        grp_data = QGroupBox("POINT CLOUD DATASET")
         v_data = QVBoxLayout(grp_data)
+        v_data.setSpacing(8)
 
         self.lbl_cloud_info = QLabel("No point cloud loaded.")
         self.lbl_cloud_info.setWordWrap(True)
+        self.lbl_cloud_info.setStyleSheet("color: #cbd5e1; font-size: 11px;")
         v_data.addWidget(self.lbl_cloud_info)
 
         btn_open_potree = QPushButton("Open Potree Converted...")
+        btn_open_potree.setStyleSheet("padding: 5px 10px; font-size: 11px;")
+        btn_open_potree.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_open_potree.clicked.connect(self.open_potree_file)
         v_data.addWidget(btn_open_potree)
 
         btn_open_las = QPushButton("Open LAS / LAZ (Header Only)...")
         btn_open_las.setObjectName("btnSecondary")
+        btn_open_las.setStyleSheet("padding: 5px 10px; font-size: 11px;")
+        btn_open_las.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_open_las.clicked.connect(self.open_las_file)
         v_data.addWidget(btn_open_las)
 
@@ -895,10 +1474,12 @@ class MainWindow(QMainWindow):
         layout.addWidget(grp_data)
 
         # 2. Save Status & Export
-        grp_save = QGroupBox("Export & Status")
+        grp_save = QGroupBox("EXPORT & STATUS")
         v_save = QVBoxLayout(grp_save)
+        v_save.setSpacing(8)
 
         self.lbl_save_status = QLabel("Status: <span style='color:#10b981;'>Ready</span>")
+        self.lbl_save_status.setStyleSheet("font-size: 11px;")
         v_save.addWidget(self.lbl_save_status)
 
         layout.addWidget(grp_save)
@@ -919,7 +1500,7 @@ class MainWindow(QMainWindow):
             self.ribbon_chk_pc.blockSignals(True)
             self.ribbon_chk_pc.setChecked(visible)
             self.ribbon_chk_pc.blockSignals(False)
-        self.web_view.page().runJavaScript(f"window.setPointCloudVisibility({str(visible).lower()});")
+        self._run_js(f"window.setPointCloudVisibility({str(visible).lower()});")
 
     def toggle_staged_layer(self, visible: bool):
         if hasattr(self, "chk_layer_staged"):
@@ -930,7 +1511,7 @@ class MainWindow(QMainWindow):
             self.ribbon_chk_staged.blockSignals(True)
             self.ribbon_chk_staged.setChecked(visible)
             self.ribbon_chk_staged.blockSignals(False)
-        self.web_view.page().runJavaScript(f"window.setStagedAllVisibility({str(visible).lower()});")
+        self._run_js(f"window.setStagedAllVisibility({str(visible).lower()});")
 
     def toggle_pick_layer(self, visible: bool):
         if hasattr(self, "chk_layer_pick"):
@@ -941,7 +1522,7 @@ class MainWindow(QMainWindow):
             self.ribbon_chk_pick.blockSignals(True)
             self.ribbon_chk_pick.setChecked(visible)
             self.ribbon_chk_pick.blockSignals(False)
-        self.web_view.page().runJavaScript(f"window.setHighlightVisibility({str(visible).lower()});")
+        self._run_js(f"window.setHighlightVisibility({str(visible).lower()});")
 
     def toggle_sel_layer(self, visible: bool):
         if hasattr(self, "chk_layer_sel"):
@@ -952,35 +1533,37 @@ class MainWindow(QMainWindow):
             self.ribbon_chk_sel.blockSignals(True)
             self.ribbon_chk_sel.setChecked(visible)
             self.ribbon_chk_sel.blockSignals(False)
-        self.web_view.page().runJavaScript(f"window.setSelectionVisibility({str(visible).lower()});")
+        self._run_js(f"window.setSelectionVisibility({str(visible).lower()});")
 
     def show_all_layers(self):
         self.toggle_pointcloud_layer(True)
         self.toggle_staged_layer(True)
         self.toggle_pick_layer(True)
         self.toggle_sel_layer(True)
-        self.web_view.page().runJavaScript("window.setAllLayersVisibility(true);")
+        self._run_js("window.setAllLayersVisibility(true);")
 
     def hide_all_layers(self):
         self.toggle_pointcloud_layer(False)
         self.toggle_staged_layer(False)
         self.toggle_pick_layer(False)
         self.toggle_sel_layer(False)
-        self.web_view.page().runJavaScript("window.setAllLayersVisibility(false);")
+        self._run_js("window.setAllLayersVisibility(false);")
 
     def clear_picked_highlight(self):
-        self.web_view.page().runJavaScript("window.clearPickedPointHighlight();")
+        self._run_js("window.clearPickedPointHighlight();")
         if hasattr(self, "lbl_layer_pick_coords"):
-            self.lbl_layer_pick_coords.setText("Position: None")
+            self.lbl_layer_pick_coords.setText("Position: Click a point to inspect")
         if hasattr(self, "lbl_layer_pick_attr"):
             self.lbl_layer_pick_attr.setText("Class: - | Tree ID: - | Intensity: -")
+        if hasattr(self, "btn_layer_view_tree"):
+            self.btn_layer_view_tree.setVisible(False)
 
     def _on_layer_staged_double_clicked(self, row: int, col: int):
         staged = self.manager.get_staged_edits()
         if 0 <= row < len(staged):
             edit_id = staged[row].get("id")
             if edit_id:
-                self.web_view.page().runJavaScript(f"window.zoomToStagedEdit('{edit_id}');")
+                self._run_js(f"window.zoomToStagedEdit('{edit_id}');")
 
     def _on_layer_color_changed(self):
         mode = self.combo_layer_color.currentData()
@@ -1006,26 +1589,74 @@ class MainWindow(QMainWindow):
             if edit.get("id") == edit_id:
                 edit["visible"] = visible
                 break
-        self.web_view.page().runJavaScript(f"window.setStagedItemVisibility('{edit_id}', {str(visible).lower()});")
+        self._run_js(f"window.setStagedItemVisibility('{edit_id}', {str(visible).lower()});")
 
     # -------------------------------------------------------------------------
     # Dataset Loading & Fast Header-Only Inspection
     # -------------------------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # File Dialogs (with a useful sidebar)
+    # -------------------------------------------------------------------------
+    def _default_sidebar_urls(self):
+        """Sidebar locations shared by every file dialog.
+
+        The Qt file dialog keeps its own bookmark list and does not read
+        Dolphin's Places, so seed it with the folders used most in this app.
+        """
+        home = os.path.expanduser("~")
+        cands = [
+            home,
+            QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DocumentsLocation),
+            QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation),
+            "/mnt/omen/Data",
+            os.path.dirname(os.path.abspath(self.potree_dir)),
+        ]
+        seen, urls = set(), []
+        for p in cands:
+            if p and os.path.isdir(p) and p not in seen:
+                seen.add(p)
+                urls.append(QUrl.fromLocalFile(p))
+        return urls
+
+    def _pick_file(self, caption: str, start_dir: str = "", filter_str: str = "All Files (*)") -> str:
+        dlg = QFileDialog(self, caption, start_dir, filter_str)
+        dlg.setAcceptMode(QFileDialog.AcceptMode.AcceptOpen)
+        urls = self._default_sidebar_urls()
+        if urls:
+            dlg.setSidebarUrls(urls)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            files = dlg.selectedFiles()
+            return files[0] if files else ""
+        return ""
+
+    def _save_file(self, caption: str, start_file: str, filter_str: str = "") -> str:
+        dlg = QFileDialog(self, caption, start_file, filter_str)
+        dlg.setAcceptMode(QFileDialog.AcceptMode.AcceptSave)
+        urls = self._default_sidebar_urls()
+        if urls:
+            dlg.setSidebarUrls(urls)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            files = dlg.selectedFiles()
+            return files[0] if files else ""
+        return ""
+
     def open_potree_file(self):
         """Open an existing Potree metadata.json / cloud.js, or a COPC (.copc.laz).
 
         Potree dispatches on the entry file name: *.copc.laz goes to the COPC loader
         and streams by byte range, so it opens without conversion.
         """
-        file_path, _ = QFileDialog.getOpenFileName(
-            self,
+        file_path = self._pick_file(
             "Select Potree Converted File or COPC",
             "",
             "Potree Files (metadata.json cloud.js *.copc.laz);;LAZ/LAS (*.laz *.las);;All Files (*)"
         )
         if not file_path:
             return
+        self.open_potree_path(file_path)
 
+    def open_potree_path(self, file_path: str):
+        """Programmatic half of open_potree_file — usable from CLI auto-load too."""
         folder = os.path.dirname(os.path.abspath(file_path))
         entry_file = os.path.basename(file_path)
 
@@ -1045,26 +1676,79 @@ class MainWindow(QMainWindow):
         if hasattr(self, "lbl_layer_cloud_pts"):
             self.lbl_layer_cloud_pts.setText("Streaming LOD")
 
-        # Look for sibling or original LAS/LAZ file
-        base_name = os.path.basename(folder).replace("_converted", "")
+        # Bind the master LAS/LAZ this converted folder was built from, so tree
+        # queries hit the same z-system the viewer shows. Order: the user's
+        # remembered pick for this folder, the source recorded by the converter
+        # in metadata.json ("name" = master stem), folder-name conventions
+        # (_converted, octree-depth tags like _d10), any LAS in the parent
+        # directory; ask and remember the pick if none of those exist.
         parent_dir = os.path.dirname(folder)
-        for ext in [".laz", ".las"]:
-            candidate = os.path.join(parent_dir, base_name + ext)
-            if os.path.exists(candidate):
-                self.load_las_header_only(candidate)
+        found_las = False
+        candidates = []
+        saved_pick = self.settings_store.get(f"master_las::{folder}")
+        if saved_pick:
+            candidates.append(saved_pick)
+        meta_path = os.path.join(folder, "metadata.json")
+        if os.path.isfile(meta_path):
+            try:
+                with open(meta_path, "r", encoding="utf-8") as f:
+                    src_name = json.load(f).get("name", "")
+                if src_name:
+                    candidates.append(os.path.join(parent_dir, src_name + ".laz"))
+                    candidates.append(os.path.join(parent_dir, src_name + ".las"))
+            except Exception:
+                pass
+        base_name = os.path.basename(folder).replace("_converted", "")
+        base_name = re.sub(r"_d\d+$", "", base_name)   # octree-depth suffix, e.g. _d10
+        candidates += [os.path.join(parent_dir, base_name + ext) for ext in (".laz", ".las")]
+        for cand in candidates:
+            if cand and os.path.exists(cand):
+                self.load_las_header_only(cand)
+                found_las = True
                 break
+        if not found_las:
+            # No explicit pairing: ask the user and remember the pick for this
+            # folder, so the binding survives restarts and folder renames of
+            # the master.
+            picked = self._pick_file(
+                f"Select the master LAS/LAZ for {os.path.basename(folder)}",
+                parent_dir,
+                "LAS/LAZ Files (*.las *.laz);;All Files (*)")
+            if picked:
+                self.settings_store.set(f"master_las::{folder}", picked)
+                self.load_las_header_only(picked)
+                self.status_bar.showMessage(f"Master file bound: {os.path.basename(picked)}")
+                found_las = True
+        if not found_las and os.path.isdir(parent_dir):
+            for ext in (".laz", ".las"):
+                for fname in sorted(os.listdir(parent_dir)):
+                    if fname.lower().endswith(ext):
+                        cand = os.path.join(parent_dir, fname)
+                        self.load_las_header_only(cand)
+                        found_las = True
+                        break
+                if found_las:
+                    break
+
+    def open_folder_dialog(self):
+        """Open a directory containing point cloud data (either converted or LAS/LAZ)."""
+        folder = QFileDialog.getExistingDirectory(self, "Select Point Cloud Folder")
+        if folder:
+            self._load_initial_path(folder)
 
     def open_las_file(self):
         """Open a raw LAS/LAZ file, load header immediately, and offer streaming view."""
-        las_path, _ = QFileDialog.getOpenFileName(
-            self,
+        las_path = self._pick_file(
             "Select LAS / LAZ Point Cloud",
             "",
             "LAS/LAZ Files (*.las *.laz);;All Files (*)"
         )
         if not las_path:
             return
+        self.open_las_path(las_path)
 
+    def open_las_path(self, las_path: str, offer_conversion: bool = True):
+        """Programmatic half of open_las_file — usable from CLI auto-load too."""
         # 1. Read header metadata instantly without memory allocation
         self.load_las_header_only(las_path)
 
@@ -1082,7 +1766,7 @@ class MainWindow(QMainWindow):
             self.server.register_pointcloud_dir(alias, converted_dir)
             url = f"http://127.0.0.1:{self.server.port}/clouds/{alias}/{entry_file}"
             self.load_url_in_potree(url, os.path.basename(converted_dir))
-        else:
+        elif offer_conversion:
             reply = QMessageBox.question(
                 self,
                 "Convert Point Cloud for Potree?",
@@ -1110,6 +1794,9 @@ class MainWindow(QMainWindow):
                 self.lbl_layer_cloud_name.setText(info['filename'])
             if hasattr(self, "lbl_layer_cloud_pts"):
                 self.lbl_layer_cloud_pts.setText(f"{info['total_points']:,} points (Streaming LOD)")
+            dims = info.get("dimensions") or info.get("extra_dimensions") or []
+            if dims:
+                self._sync_color_combos(None, available_attrs=dims)
             self.status_bar.showMessage(f"Dataset '{info['filename']}' ({info['total_points']:,} points) ready for visual staging.")
         except Exception as e:
             print(f"[MainWindow] Error loading LAS header: {e}")
@@ -1129,36 +1816,103 @@ class MainWindow(QMainWindow):
                 self.lbl_layer_cloud_name.setText(info['filename'])
             if hasattr(self, "lbl_layer_cloud_pts"):
                 self.lbl_layer_cloud_pts.setText(f"{info['total_points']:,} points (In-Memory)")
+            dims = info.get("dimensions") or info.get("extra_dimensions") or []
+            if dims:
+                self._sync_color_combos(None, available_attrs=dims)
             self.status_bar.showMessage(f"Loaded '{info['filename']}' ({info['total_points']:,} points) in memory.")
         except Exception as e:
             QMessageBox.critical(self, "Error Loading LAS", str(e))
 
-    def start_conversion(self, input_las: str, out_dir: str):
-        converter_exe = os.path.join(self.potree_dir, "libs", "PotreeConverter2", "PotreeConverter.exe")
-        if not os.path.exists(converter_exe):
-            QMessageBox.critical(self, "Converter Not Found", f"Could not find PotreeConverter at:\n{converter_exe}")
+    def convert_las_action(self):
+        """Prompt user to select a LAS/LAZ file and convert it into a Potree LOD octree."""
+        las_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select LAS / LAZ Point Cloud to Convert",
+            "",
+            "LAS/LAZ Files (*.las *.laz);;All Files (*)"
+        )
+        if not las_path:
             return
 
-        self.progress_bar.setVisible(True)
-        self.progress_bar.setRange(0, 0)
-        self.status_bar.showMessage("Converting point cloud with PotreeConverter...")
+        parent_dir = os.path.dirname(las_path)
+        base_name = os.path.splitext(os.path.basename(las_path))[0]
+        default_out = os.path.join(parent_dir, base_name + "_converted")
 
-        def run():
-            cmd = [converter_exe, input_las, "-o", out_dir]
-            proc = subprocess.run(cmd, capture_output=True, text=True)
-            if proc.returncode == 0:
-                alias = "cloud_" + str(abs(hash(out_dir)) % 100000)
-                self.server.register_pointcloud_dir(alias, out_dir)
-                entry_file = "metadata.json" if os.path.exists(os.path.join(out_dir, "metadata.json")) else "cloud.js"
-                url = f"http://127.0.0.1:{self.server.port}/clouds/{alias}/{entry_file}"
-                self.load_url_in_potree(url, os.path.basename(out_dir))
+        out_dir = QFileDialog.getExistingDirectory(
+            self,
+            "Select Destination Directory for Converted Potree Dataset",
+            default_out
+        )
+        if not out_dir:
+            return
+
+        # If user picked a directory that already contains metadata.json, warn them
+        if os.path.exists(os.path.join(out_dir, "metadata.json")) or os.path.exists(os.path.join(out_dir, "cloud.js")):
+            reply = QMessageBox.question(
+                self,
+                "Overwrite Existing Potree Dataset?",
+                f"Directory '{os.path.basename(out_dir)}' already contains a Potree dataset.\n\n"
+                f"Are you sure you want to re-convert and overwrite it?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+        self.start_conversion(las_path, out_dir)
+
+    def start_conversion(self, input_las: str, out_dir: str):
+        """Launch the Potree LOD octree converter with live log streaming and statistics."""
+        converter_bin = find_potree_converter(self.potree_dir)
+        if not converter_bin:
+            QMessageBox.critical(
+                self,
+                "PotreeConverter Not Found",
+                "Could not find the PotreeConverter executable.\n\n"
+                "Please verify that PotreeConverter is built in 'tools/PC-2.1.5/build/PotreeConverter' "
+                "or installed in your system PATH."
+            )
+            return
+
+        # Pre-load header and initiate automatic background indexing for input LAS immediately
+        try:
+            self.load_las_header_only(input_las)
+        except Exception as e:
+            print(f"[MainWindow] Pre-conversion header read note: {e}")
+
+        self.status_bar.showMessage(f"Converting '{os.path.basename(input_las)}' with PotreeConverter...")
+
+        self.conversion_dialog = ConversionDialog(
+            converter_bin=converter_bin,
+            input_las=input_las,
+            out_dir=out_dir,
+            parent=self,
+            auto_start=True
+        )
+        self.conversion_dialog.conversion_completed.connect(self._on_conversion_completed)
+        self.conversion_dialog.show()
+
+    def _on_conversion_completed(self, out_dir: str, stats: dict):
+        """Handle successful conversion: register HTTP route and stream in Potree."""
+        try:
+            # Ensure the source LAS is set as current_las_path and indexing is active/ready
+            if self.conversion_dialog and self.conversion_dialog.input_las:
+                input_las = self.conversion_dialog.input_las
+                if self.current_las_path != input_las:
+                    self.load_las_header_only(input_las)
+
+            alias = "cloud_" + str(abs(hash(out_dir)) % 100000)
+            self.server.register_pointcloud_dir(alias, out_dir)
+            entry_file = "metadata.json" if os.path.exists(os.path.join(out_dir, "metadata.json")) else "cloud.js"
+            url = f"http://127.0.0.1:{self.server.port}/clouds/{alias}/{entry_file}"
+            self.load_url_in_potree(url, os.path.basename(out_dir))
+
+            pts_str = stats.get("#points", "")
+            if pts_str:
+                self.status_bar.showMessage(f"Successfully converted and loaded '{os.path.basename(out_dir)}' ({pts_str} points).", 8000)
             else:
-                print("Conversion error:", proc.stderr)
-
-            self.progress_bar.setVisible(False)
-            self.status_bar.showMessage("Conversion finished.")
-
-        threading.Thread(target=run, daemon=True).start()
+                self.status_bar.showMessage(f"Successfully converted and loaded '{os.path.basename(out_dir)}'.", 8000)
+        except Exception as e:
+            print(f"[MainWindow] Error loading converted cloud: {e}")
 
     def _sync_style_widgets(self, info):
         """Point the shape, sizing-mode and size controls at the active layer's style.
@@ -1194,29 +1948,120 @@ class MainWindow(QMainWindow):
         if hasattr(self, "lbl_layer_size_val"):
             self.lbl_layer_size_val.setText(f"{fval:.2f}")
 
-    def _sync_color_combos(self, attr):
-        """Point both Color By dropdowns at one attribute.
+    @staticmethod
+    def _format_attribute_label(attr: str) -> str:
+        mapping = {
+            "rgba": "RGB / True Color",
+            "rgb": "RGB / True Color",
+            "color": "RGB / True Color",
+            "classification": "ASPRS Classification",
+            "elevation": "Elevation Gradient",
+            "intensity": "Intensity",
+            "intensity gradient": "Intensity Gradient",
+            "itc": "ITC (Tree ID)",
+            "tree_id": "Tree ID",
+            "treeID": "Tree ID",
+            "tree_score": "Tree Score",
+            "semantic_pred": "Semantic Prediction",
+            "return number": "Return Number",
+            "number of returns": "Number of Returns",
+            "point source id": "Point Source ID",
+            "source id": "Point Source ID",
+            "gps-time": "GPS Time",
+            "gps_time": "GPS Time",
+            "scan angle": "Scan Angle",
+            "user data": "User Data",
+            "classification flags": "Classification Flags",
+        }
+        return mapping.get(str(attr), str(attr).replace("_", " ").replace("-", " ").title())
 
-        The ribbon combo and the sidebar's per-layer combo are two views of the same
-        value -- the active layer's material.activeAttributeName -- so they are set
-        together, with signals blocked so neither bounces a change back.  A cloud can
-        carry attributes the fixed lists never offered (treeID, itc); those are added
-        rather than leaving a dropdown showing a mode the cloud is not using.
-        """
-        if not attr:
+    def _sync_color_combos(self, attr: Optional[str], available_attrs: Optional[list] = None):
+        """Point both Color By dropdowns at one attribute and populate with all available scalar fields."""
+        if not attr and not available_attrs:
             return
-        for combo in (getattr(self, "combo_layer_color", None),
-                      getattr(self, "ribbon_combo_color", None)):
-            if combo is None:
-                continue
-            idx = combo.findData(str(attr))
-            if idx < 0:
-                combo.addItem(str(attr).replace("_", " ").title(), str(attr))
-                idx = combo.count() - 1
-            combo.blockSignals(True)
-            combo.setCurrentIndex(idx)
-            combo.blockSignals(False)
-            combo.setEnabled(True)
+
+        PRIORITY_ORDER = [
+            "rgba", "color", "rgb",
+            "classification",
+            "elevation",
+            "intensity",
+            "intensity gradient",
+            "itc", "tree_id", "treeID",
+            "tree_score",
+            "semantic_pred",
+            "return number",
+            "number of returns",
+            "point source id",
+            "source id",
+            "gps-time",
+            "scan angle",
+            "user data",
+            "classification flags",
+        ]
+
+        if available_attrs:
+            def attr_sort_key(name):
+                try:
+                    return (0, PRIORITY_ORDER.index(name))
+                except ValueError:
+                    return (1, str(name))
+
+            sorted_attrs = sorted(set(available_attrs), key=attr_sort_key)
+
+            # 1. Update Layers tab & Ribbon combos
+            for combo in (getattr(self, "combo_layer_color", None),
+                          getattr(self, "ribbon_combo_color", None)):
+                if combo is None:
+                    continue
+                combo.blockSignals(True)
+                current_selected = attr or combo.currentData() or "rgba"
+                combo.clear()
+                for a in sorted_attrs:
+                    combo.addItem(self._format_attribute_label(str(a)), str(a))
+                idx = combo.findData(str(current_selected))
+                if idx >= 0:
+                    combo.setCurrentIndex(idx)
+                elif combo.count() > 0:
+                    combo.setCurrentIndex(0)
+                combo.blockSignals(False)
+                combo.setEnabled(True)
+
+            # 2. Update Forestry tab (individual tree view) combo with discovered scalar fields
+            combo_tree = getattr(self, "combo_tree_color", None)
+            if combo_tree is not None:
+                combo_tree.blockSignals(True)
+                cur_tree_sel = combo_tree.currentData() or "auto"
+                combo_tree.clear()
+                combo_tree.addItem("Match Main Layer (Auto)", "auto")
+                combo_tree.addItem("Tree / ITC (Segmented Stand)", "itc")
+                combo_tree.addItem("Natural Foliage Green", "green")
+                combo_tree.addItem("Viridis Heatmap", "viridis")
+                for a in sorted_attrs:
+                    if str(a) == "itc":
+                        continue
+                    combo_tree.addItem(self._format_attribute_label(str(a)), str(a))
+                t_idx = combo_tree.findData(str(cur_tree_sel))
+                if t_idx >= 0:
+                    combo_tree.setCurrentIndex(t_idx)
+                else:
+                    combo_tree.setCurrentIndex(0)
+                combo_tree.blockSignals(False)
+                combo_tree.setEnabled(True)
+        elif attr:
+            for combo in (getattr(self, "combo_layer_color", None),
+                          getattr(self, "ribbon_combo_color", None),
+                          getattr(self, "combo_tree_color", None)):
+                if combo is None:
+                    continue
+                idx = combo.findData(str(attr))
+                if idx < 0:
+                    combo.addItem(self._format_attribute_label(str(attr)), str(attr))
+                    idx = combo.count() - 1
+                if combo is not getattr(self, "combo_tree_color", None):
+                    combo.blockSignals(True)
+                    combo.setCurrentIndex(idx)
+                    combo.blockSignals(False)
+                combo.setEnabled(True)
 
     def refresh_layers(self, tries: int = 0):
         """Ask the viewer for its clouds and rebuild the layer rows.
@@ -1234,7 +2079,7 @@ class MainWindow(QMainWindow):
                 return
             self._render_layer_rows(result)
 
-        self.web_view.page().runJavaScript("window.listLayers ? window.listLayers() : [];", handle)
+        self._run_js("window.listLayers ? window.listLayers() : [];", handle)
 
     def _render_layer_rows(self, layers: list):
         """Rebuild the rows, marking the active one bold and selecting it."""
@@ -1264,7 +2109,7 @@ class MainWindow(QMainWindow):
             if active_info:
                 self.lbl_layer_cloud_name.setText(f"Active layer: {active_info.get('name')}")
                 self.lbl_layer_cloud_pts.setText(f"{int(active_info.get('points') or 0):,} points")
-                self._sync_color_combos(active_info.get("colorAttribute"))
+                self._sync_color_combos(active_info.get("colorAttribute"), available_attrs=active_info.get("attributes"))
                 self._sync_style_widgets(active_info)
             else:
                 self.lbl_layer_cloud_name.setText("No point cloud loaded")
@@ -1291,7 +2136,7 @@ class MainWindow(QMainWindow):
         if not item:
             return
         name = item.data(Qt.ItemDataRole.UserRole)
-        self.web_view.page().runJavaScript(
+        self._run_js(
             f"window.setActiveLayer({json.dumps(name)});",
             lambda res: self._render_layer_rows(res if isinstance(res, list) else []))
 
@@ -1301,7 +2146,7 @@ class MainWindow(QMainWindow):
             return
         name = item.data(Qt.ItemDataRole.UserRole)
         visible = item.checkState() == Qt.CheckState.Checked
-        self.web_view.page().runJavaScript(
+        self._run_js(
             f"window.setLayerVisible({json.dumps(name)}, {str(bool(visible)).lower()});")
 
     def _on_layer_remove_clicked(self):
@@ -1310,7 +2155,7 @@ class MainWindow(QMainWindow):
         if not item:
             return
         name = item.data(Qt.ItemDataRole.UserRole)
-        self.web_view.page().runJavaScript(
+        self._run_js(
             f"window.removeLayer({json.dumps(name)});",
             lambda res: self._render_layer_rows(res if isinstance(res, list) else []))
 
@@ -1323,7 +2168,7 @@ class MainWindow(QMainWindow):
         """
         self.current_potree_url = url
         js = f"window.loadPointCloudUrl({json.dumps(url)}, {json.dumps(display_name or '')});"
-        self.web_view.page().runJavaScript(js)
+        self._run_js(js)
         # The load resolves on its own schedule; refresh_layers retries until the new
         # cloud shows up, which is what makes it a layer instead of a replacement.
         QTimer.singleShot(600, lambda: self.refresh_layers(0))
@@ -1332,6 +2177,11 @@ class MainWindow(QMainWindow):
     # Selection & Optimistic Visual Staging
     # -------------------------------------------------------------------------
     def on_selection_changed(self, data: dict):
+        # Polygon/box tools finish in JS (activeTool back to 'nav'); mirror that
+        # in the ribbon button states. Pick Point stays active until toggled.
+        if self._active_tool in ("polygon", "box"):
+            self._active_tool = "nav"
+            self._sync_tool_buttons()
         if data.get("mode") == "staged":
             vcount = data.get("vertex_count", 0)
             self.lbl_sel_count.setText(f"Selection: Polygon ({vcount} vertices)")
@@ -1395,7 +2245,16 @@ class MainWindow(QMainWindow):
             cls_str = f"Class: {cls_val}" if cls_val is not None else "Class: -"
             tree_str = f"Tree ID: {itc_val}" if itc_val is not None else (f"Inside: {staged_hit.get('label')}" if staged_hit else "Tree ID: -")
             int_str = f"Int: {intensity_val}" if intensity_val is not None else "Int: -"
-            self.lbl_layer_pick_attr.setText(f"{cls_str} | {tree_str} | {int_str}")
+            parts = [cls_str, tree_str, int_str]
+            extra_attrs = data.get("attributes", {})
+            if isinstance(extra_attrs, dict):
+                for k, v in extra_attrs.items():
+                    if k in ("classification", "intensity", "itc", "tree_id", "treeID", "x", "y", "z"):
+                        continue
+                    v_str = f"{v:.3f}" if isinstance(v, float) else str(v)
+                    k_label = self._format_attribute_label(k)
+                    parts.append(f"{k_label}: {v_str}")
+            self.lbl_layer_pick_attr.setText(" | ".join(parts[:5]))
         if hasattr(self, "chk_layer_pick"):
             self.chk_layer_pick.blockSignals(True)
             self.chk_layer_pick.setChecked(True)
@@ -1404,6 +2263,442 @@ class MainWindow(QMainWindow):
             self.ribbon_chk_pick.blockSignals(True)
             self.ribbon_chk_pick.setChecked(True)
             self.ribbon_chk_pick.blockSignals(False)
+
+        # Feed the picked tree into the Tree View card (Forestry tab) and quick action in Layers tab
+        if itc_val is not None and int(itc_val) > 0:
+            itc_int = int(itc_val)
+            self._last_picked_itc = itc_int
+            self._last_picked_x = float(x)
+            self._last_picked_y = float(y)
+            if hasattr(self, "btn_layer_view_tree"):
+                self.btn_layer_view_tree.setText(f"View Tree #{itc_int} in Forestry Tab ->")
+                self.btn_layer_view_tree.setVisible(True)
+            if hasattr(self, "spin_tree_view"):
+                self.spin_tree_view.blockSignals(True)
+                self.spin_tree_view.setValue(itc_int)
+                self.spin_tree_view.blockSignals(False)
+            if hasattr(self, "lbl_tree_view_status"):
+                self.lbl_tree_view_status.setText(
+                    f"Tree #{itc_int} picked — click View to render every point of this tree."
+                )
+        else:
+            if hasattr(self, "btn_layer_view_tree"):
+                self.btn_layer_view_tree.setVisible(False)
+            if staged_hit and hasattr(self, "lbl_tree_view_status"):
+                self.lbl_tree_view_status.setText(
+                    f"Picked point is inside staged region “{staged_hit.get('label')}” (not committed yet)."
+                )
+
+    def on_tree_view_requested(self, data: dict):
+        """Triggered when user clicks 'View Tree' from the WebGL HUD inspector or API."""
+        self._run_js("if (document.getElementById('inspectCard')) document.getElementById('inspectCard').style.display = 'none';")
+        itc = data.get("itc")
+        if itc is not None:
+            try:
+                itc_int = int(itc)
+                self._last_picked_itc = itc_int
+                if data.get("x") is not None:
+                    self._last_picked_x = float(data["x"])
+                if data.get("y") is not None:
+                    self._last_picked_y = float(data["y"])
+                # HUD "View Tree" uses the JS defaults: single tree, no stand radius
+                self._tree_view_state = {
+                    "itc": itc_int, "radius": float(data.get("radius", 0.0) or 0.0),
+                    "mode": str(data.get("neighbor_mode", "trees_only") or "trees_only"),
+                    "ground": 0.0,
+                    "x": getattr(self, "_last_picked_x", None),
+                    "y": getattr(self, "_last_picked_y", None),
+                }
+                if hasattr(self, "spin_tree_view"):
+                    self.spin_tree_view.blockSignals(True)
+                    self.spin_tree_view.setValue(itc_int)
+                    self.spin_tree_view.blockSignals(False)
+                if hasattr(self, "lbl_tree_view_status"):
+                    self.lbl_tree_view_status.setText(f"Viewing Tree #{itc_int} (full density)...")
+                self.status_bar.showMessage(f"Viewing Tree #{itc_int} in Forestry tab.")
+            except (TypeError, ValueError):
+                pass
+        if hasattr(self, "sidebar_tabs"):
+            self.sidebar_tabs.setCurrentIndex(1)
+
+    def close_tree_view_action(self):
+        """Close full-density tree overlay and return to the Layers tab."""
+        self._run_js("if (window.closeTreeOverlay) window.closeTreeOverlay(); else if (window.hideTreeOverlay) window.hideTreeOverlay();")
+        self._tree_view_state = None
+        if hasattr(self, "btn_extract_tree"):
+            self.btn_extract_tree.setEnabled(False)
+        if hasattr(self, "grp_stand_filter"):
+            self.grp_stand_filter.setVisible(False)
+            self.list_stand_trees.clear()
+        if hasattr(self, "bar_stand_filter"):
+            self.bar_stand_filter.setVisible(True)
+            self._set_stand_filter_buttons_enabled(False)
+        if hasattr(self, "btn_tree_filter_mode"):
+            self.btn_tree_filter_mode.blockSignals(True)
+            self.btn_tree_filter_mode.setChecked(False)
+            self.btn_tree_filter_mode.setText("Filter Mode")
+            self.btn_tree_filter_mode.setStyleSheet("font-size: 11px; padding: 4px; font-weight: 600;")
+            self.btn_tree_filter_mode.blockSignals(False)
+        if hasattr(self, "sidebar_tabs"):
+            self.sidebar_tabs.setCurrentIndex(0)
+
+    def _on_tree_color_changed(self):
+        if hasattr(self, "combo_tree_color"):
+            mode = self.combo_tree_color.currentData()
+            self._run_js(f"if (window.setTreeColorMode) window.setTreeColorMode('{mode}');")
+
+    def _on_tree_size_changed(self, ival: int):
+        fval = round(ival / 10.0, 2)
+        if hasattr(self, "lbl_tree_size_val"):
+            self.lbl_tree_size_val.setText(f"{fval:.2f}")
+        self._run_js(f"if (window.setTreePointSize) window.setTreePointSize({fval:.2f});")
+
+    def _on_tree_spin_changed(self, val: int):
+        if val > 0 and hasattr(self, "manager"):
+            if not hasattr(self, "_tree_prefetch_timer"):
+                self._tree_prefetch_timer = QTimer(self)
+                self._tree_prefetch_timer.setSingleShot(True)
+                self._tree_prefetch_timer.setInterval(200)
+                self._tree_prefetch_timer.timeout.connect(self._do_prefetch_tree)
+            self._pending_prefetch_itc = val
+            self._tree_prefetch_timer.start()
+
+    def _do_prefetch_tree(self):
+        itc = getattr(self, "_pending_prefetch_itc", None)
+        if itc and itc > 0 and hasattr(self, "manager"):
+            self.manager.prefetch_tree(itc)
+
+    def _on_tree_neighbors_toggled(self, checked: bool):
+        if hasattr(self, "spin_tree_radius"):
+            self.spin_tree_radius.setEnabled(checked)
+        if hasattr(self, "combo_neighbor_mode"):
+            self.combo_neighbor_mode.setEnabled(checked)
+
+    def _toggle_tree_measure(self, on: bool):
+        """Ribbon Point-tab Measure toggle: click-to-click distances on the tree."""
+        self._run_js(f"if (window.setTreeMeasure) window.setTreeMeasure({'true' if on else 'false'});")
+        self.status_bar.showMessage(
+            "Measure: click points on the tree (double-click to clear)" if on else "Measure: off")
+
+    def view_tree_action(self):
+        """Render the full point set of one tree (queried from the LAS master)
+        as an isolated cloud and switch to the Forestry tab."""
+        itc = int(self.spin_tree_view.value())
+        if itc <= 0:
+            self.status_bar.showMessage("Set a Tree ID (ITC) first, or Ctrl+Click a tree point.")
+            return
+        if not self.manager.las_path and self.manager.las_data is None:
+            self.status_bar.showMessage("No LAS/LAZ source file is bound to query full tree points from.")
+            self.lbl_tree_view_status.setText("No LAS/LAZ source file bound. Open a LAS/LAZ or converted dataset with sibling LAS.")
+            return
+
+        # Automatically switch to Forestry tab
+        if hasattr(self, "sidebar_tabs"):
+            self.sidebar_tabs.setCurrentIndex(1)
+
+        radius = float(self.spin_tree_radius.value()) if (hasattr(self, "chk_tree_neighbors") and self.chk_tree_neighbors.isChecked()) else 0.0
+        n_mode = self.combo_neighbor_mode.currentData() if hasattr(self, "combo_neighbor_mode") else "canopy"
+        g_rad = float(self.spin_tree_ground.value()) if (hasattr(self, "chk_tree_ground") and self.chk_tree_ground.isChecked()) else 0.0
+
+        hint_x = f"{self._last_picked_x}" if (hasattr(self, "_last_picked_itc") and self._last_picked_itc == itc and hasattr(self, "_last_picked_x")) else "null"
+        hint_y = f"{self._last_picked_y}" if (hasattr(self, "_last_picked_itc") and self._last_picked_itc == itc and hasattr(self, "_last_picked_y")) else "null"
+
+        # Remember exactly what is being displayed so "Extract View as LAS/LAZ"
+        # re-queries the identical full-density point set from the master file
+        self._tree_view_state = {
+            "itc": itc, "radius": radius, "mode": n_mode, "ground": g_rad,
+            "x": float(self._last_picked_x) if hint_x != "null" else None,
+            "y": float(self._last_picked_y) if hint_y != "null" else None,
+        }
+
+        is_indexing = getattr(self.manager, "_is_indexing", False)
+        fallback_str = " via streaming fallback (background indexing in progress)" if is_indexing else ""
+
+        if radius > 0:
+            self.lbl_tree_view_status.setText(f"Querying Tree #{itc} and neighbors ({radius:.0f}m stand){fallback_str}...")
+            self.status_bar.showMessage(f"Viewing Tree #{itc} + neighbors within {radius:.0f}m stand{fallback_str}...", 6000)
+        else:
+            self.lbl_tree_view_status.setText(f"Querying all points of Tree #{itc}{fallback_str}...")
+            self.status_bar.showMessage(f"Viewing Tree #{itc} — querying full-density points{fallback_str}...", 6000)
+
+        self._run_js(f"window.viewTreeById({itc}, {hint_x}, {hint_y}, {radius:.1f}, '{n_mode}', {g_rad:.1f});")
+
+    def segment_tree_action(self):
+        """Segment the displayed tree/stand with ForestFormer3D (separate
+        torch-env subprocess) and rebuild the overlay coloured per detected
+        tree instance — e.g. split a merged two-stem ITC tree for inspection."""
+        itc = int(self.spin_tree_view.value())
+        if itc <= 0:
+            self.status_bar.showMessage("Set a Tree ID (ITC) first, or Ctrl+Click a tree point.")
+            return
+        if not self.manager.las_path and self.manager.las_data is None:
+            self.status_bar.showMessage("No LAS/LAZ source file is bound to query full tree points from.")
+            return
+        if hasattr(self, "sidebar_tabs"):
+            self.sidebar_tabs.setCurrentIndex(1)
+
+        radius = float(self.spin_tree_radius.value()) if (hasattr(self, "chk_tree_neighbors") and self.chk_tree_neighbors.isChecked()) else 0.0
+        n_mode = self.combo_neighbor_mode.currentData() if hasattr(self, "combo_neighbor_mode") else "canopy"
+        g_rad = float(self.spin_tree_ground.value()) if (hasattr(self, "chk_tree_ground") and self.chk_tree_ground.isChecked()) else 0.0
+        hint_x = f"{self._last_picked_x}" if (hasattr(self, "_last_picked_itc") and self._last_picked_itc == itc and hasattr(self, "_last_picked_x")) else "null"
+        hint_y = f"{self._last_picked_y}" if (hasattr(self, "_last_picked_itc") and self._last_picked_itc == itc and hasattr(self, "_last_picked_y")) else "null"
+
+        self._tree_view_state = {
+            "itc": itc, "radius": radius, "mode": n_mode, "ground": g_rad,
+            "x": float(self._last_picked_x) if hint_x != "null" else None,
+            "y": float(self._last_picked_y) if hint_y != "null" else None,
+        }
+        self.lbl_tree_view_status.setText(f"ForestFormer3D segmenting Tree #{itc}... (first run loads the model, ~15 s)")
+        self.status_bar.showMessage("ForestFormer3D segmentation running (~10 s)...", 15000)
+        self._run_js(f"window.segmentTreeById({itc}, {hint_x}, {hint_y}, {radius:.1f}, '{n_mode}', {g_rad:.1f});")
+
+    def extract_tree_view_action(self):
+        """Write the full-density tree/stand currently displayed in the Forestry tab
+        to a new LAS/LAZ file. Points are extracted straight from the master
+        LAS/LAZ, and an active Neighbor Stand Filter (checked trees) restricts output."""
+        state = getattr(self, "_tree_view_state", None)
+        if not state:
+            self.status_bar.showMessage("Open a tree in full density first (View Tree / Ctrl+Click).")
+            return
+        if not self.manager.las_path and self.manager.las_data is None:
+            self.status_bar.showMessage("No LAS/LAZ master file bound for extraction.")
+            return
+
+        # Restrict to the stand filter selection when trees are listed
+        keep_ids = None
+        if hasattr(self, "list_stand_trees") and self.list_stand_trees.count() > 0:
+            checked = [self.list_stand_trees.item(i).data(Qt.ItemDataRole.UserRole)
+                       for i in range(self.list_stand_trees.count())
+                       if self.list_stand_trees.item(i).checkState() == Qt.CheckState.Checked]
+            keep_ids = checked or None
+
+        itc = int(state.get("itc", 0))
+        radius = float(state.get("radius", 0.0))
+        suggested = os.path.join(os.path.expanduser("~"),
+                                 f"tree_{itc}_stand_{radius:.0f}m.copc.laz" if radius > 0 else f"tree_{itc}.copc.laz")
+        path, selected_filter = QFileDialog.getSaveFileName(
+            self, "Extract Displayed Points as COPC / LAS / LAZ", suggested,
+            "COPC LAZ Files (*.copc.laz);;LAZ Files (*.laz);;LAS Files (*.las)")
+        if not path:
+            return
+        if not os.path.splitext(path)[1]:
+            path += ".copc.laz" if selected_filter.startswith("COPC") else (
+                ".las" if selected_filter.startswith("LAS") else ".laz")
+
+        self.status_bar.showMessage(f"Extracting Tree #{itc} full-density points from master...")
+        QApplication.processEvents()
+        try:
+            count = self.manager.export_tree_points(
+                path, itc,
+                x=state.get("x"), y=state.get("y"),
+                radius=radius, neighbor_mode=state.get("mode", "canopy"),
+                keep_tree_ids=keep_ids,
+                ground_radius=float(state.get("ground", 0.0) or 0.0))
+        except Exception as exc:
+            QMessageBox.warning(self, "Extract Tree Stand", f"Extraction failed: {exc}")
+            self.status_bar.showMessage(f"Extraction failed: {exc}", 6000)
+            return
+        if count > 0:
+            self.status_bar.showMessage(f"Extracted {count:,} points to {path}", 8000)
+        else:
+            QMessageBox.information(self, "Extract Tree Stand",
+                                    "No points found for the current tree view / filter.")
+
+    def on_tree_loaded(self, data: dict):
+        itc = data.get("itc")
+        t_cnt = data.get("target_count", 0)
+        n_cnt = data.get("neighbor_count", 0)
+        rad = data.get("radius", 0.0)
+        is_indexing = getattr(self.manager, "_is_indexing", False)
+        fallback_notice = " via streaming fallback (indexing in background)" if is_indexing else ""
+
+        # A full-density tree/stand is on screen: the Extract action can re-query it
+        if itc is not None:
+            self._tree_view_state = {
+                "itc": int(itc), "radius": float(rad or 0.0),
+                "mode": getattr(self, "_tree_view_state", {}).get("mode", "canopy"),
+                "ground": float(getattr(self, "_tree_view_state", {}).get("ground", 0.0) or 0.0),
+                "x": getattr(self, "_last_picked_x", None) if getattr(self, "_last_picked_itc", None) == int(itc) else None,
+                "y": getattr(self, "_last_picked_y", None) if getattr(self, "_last_picked_itc", None) == int(itc) else None,
+            }
+        if hasattr(self, "btn_extract_tree"):
+            self.btn_extract_tree.setEnabled(True)
+
+        if hasattr(self, "lbl_tree_view_status"):
+            if n_cnt > 0:
+                self.lbl_tree_view_status.setText(
+                    f"Tree #{itc}: {t_cnt:,} target pts + {n_cnt:,} neighbor pts ({rad:.0f}m stand){fallback_notice}"
+                )
+                self.status_bar.showMessage(
+                    f"Viewing Tree #{itc} ({t_cnt:,} pts) + {n_cnt:,} neighbor pts within {rad:.0f}m stand{fallback_notice}.", 6000
+                )
+            else:
+                self.lbl_tree_view_status.setText(
+                    f"Tree #{itc}: {t_cnt:,} target points{fallback_notice}"
+                )
+                self.status_bar.showMessage(
+                    f"Viewing Tree #{itc} ({t_cnt:,} full-density points){fallback_notice}.", 6000
+                )
+        if hasattr(self, "grp_stand_filter") and n_cnt <= 0:
+            self.grp_stand_filter.setVisible(False)
+            self.list_stand_trees.clear()
+        if hasattr(self, "bar_stand_filter") and n_cnt <= 0:
+            # Keep the Stand Filter buttons present on the Filter page, just not highlighted
+            self.bar_stand_filter.setVisible(True)
+            self._set_stand_filter_buttons_enabled(False)
+
+    def _on_tree_stand_loaded(self, data: dict):
+        target_itc = data.get("target_itc")
+        n_cnt = data.get("neighbor_count", 0)
+        t_cnt = data.get("target_count", 0)
+        rad = data.get("radius", 0.0)
+        trees = data.get("trees", [])
+
+        if not hasattr(self, "grp_stand_filter"):
+            return
+
+        if n_cnt <= 0 or not trees:
+            self.grp_stand_filter.setVisible(False)
+            self.list_stand_trees.clear()
+            if hasattr(self, "bar_stand_filter"):
+                # Buttons stay visible on the Filter page, dimmed until neighbors exist
+                self.bar_stand_filter.setVisible(True)
+                self._set_stand_filter_buttons_enabled(False)
+            return
+
+        num_neighbor_trees = len([t for t in trees if not t.get("isTarget") and t.get("id", 0) > 0])
+        if hasattr(self, "bar_stand_filter"):
+            self.lbl_top_stand_info.setText(f"🌲 Stand: Tree #{target_itc} ({num_neighbor_trees} neighbors, {rad:.0f}m)")
+            self.bar_stand_filter.setVisible(True)
+            self._set_stand_filter_buttons_enabled(True)
+
+        self.grp_stand_filter.setVisible(True)
+        self.lbl_stand_filter_info.setText(
+            f"Stand: {num_neighbor_trees} neighbor trees ({rad:.0f}m radius). Check trees to keep:"
+        )
+
+        self.list_stand_trees.blockSignals(True)
+        self.list_stand_trees.clear()
+        for t in trees:
+            tid = t.get("id", 0)
+            cnt = t.get("count", 0)
+            is_target = t.get("isTarget", False)
+            if is_target:
+                label = f"★ Target Tree #{tid} ({cnt:,} pts)"
+            elif tid > 0:
+                label = f"Tree #{tid} ({cnt:,} pts)"
+            else:
+                label = f"Canopy / Ground ({cnt:,} pts)"
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, tid)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Unchecked)
+            self.list_stand_trees.addItem(item)
+        self.list_stand_trees.blockSignals(False)
+
+        if hasattr(self, "btn_tree_filter_mode"):
+            self.btn_tree_filter_mode.blockSignals(True)
+            self.btn_tree_filter_mode.setChecked(False)
+            self.btn_tree_filter_mode.setText("Filter Mode")
+            self.btn_tree_filter_mode.blockSignals(False)
+
+    def _on_tree_filter_mode_toggled(self, checked: bool):
+        if hasattr(self, "btn_tree_filter_mode"):
+            if checked:
+                self.btn_tree_filter_mode.setText("Filter Mode ON")
+                self.status_bar.showMessage("Filter mode active: Ctrl+Click or click neighbor trees in the 3D viewport to toggle selection.", 4000)
+            else:
+                self.btn_tree_filter_mode.setText("Filter Mode")
+                self.status_bar.showMessage("Filter mode deactivated (Ctrl+Click picks single points).", 3000)
+        self._run_js(f"if (window.setTreeFilterMode) window.setTreeFilterMode({'true' if checked else 'false'});")
+
+    def _on_tree_filter_mode_toggled_from_hud(self, data: dict):
+        mode = bool(data.get("filter_mode", False))
+        if hasattr(self, "btn_tree_filter_mode"):
+            self.btn_tree_filter_mode.blockSignals(True)
+            self.btn_tree_filter_mode.setChecked(mode)
+            self.btn_tree_filter_mode.setText("Filter Mode ON" if mode else "Filter Mode")
+            self.btn_tree_filter_mode.blockSignals(False)
+
+    def _on_tree_filter_selection_changed(self, data: dict):
+        selected_ids = set(data.get("selected_ids", []))
+        if hasattr(self, "list_stand_trees"):
+            self.list_stand_trees.blockSignals(True)
+            for i in range(self.list_stand_trees.count()):
+                item = self.list_stand_trees.item(i)
+                tid = item.data(Qt.ItemDataRole.UserRole)
+                item.setCheckState(Qt.CheckState.Checked if tid in selected_ids else Qt.CheckState.Unchecked)
+            self.list_stand_trees.blockSignals(False)
+        t_id = data.get("toggled_id")
+        is_sel = data.get("is_selected")
+        if t_id is not None:
+            lbl = "Canopy / Ground" if t_id == 0 else f"Tree #{t_id}"
+            state_str = "selected" if is_sel else "deselected"
+            self.status_bar.showMessage(f"{lbl} {state_str} for filter ({len(selected_ids)} total selected).", 3000)
+
+    def _on_stand_tree_item_changed(self, item: QListWidgetItem):
+        if not hasattr(self, "list_stand_trees"):
+            return
+        checked_ids = []
+        for i in range(self.list_stand_trees.count()):
+            it = self.list_stand_trees.item(i)
+            if it.checkState() == Qt.CheckState.Checked:
+                checked_ids.append(it.data(Qt.ItemDataRole.UserRole))
+        self._run_js(f"if (window.setTreeFilterSelection) window.setTreeFilterSelection({json.dumps(checked_ids)});")
+
+    def _on_filter_select_all(self):
+        if not hasattr(self, "list_stand_trees"):
+            return
+        self.list_stand_trees.blockSignals(True)
+        all_ids = []
+        for i in range(self.list_stand_trees.count()):
+            it = self.list_stand_trees.item(i)
+            it.setCheckState(Qt.CheckState.Checked)
+            all_ids.append(it.data(Qt.ItemDataRole.UserRole))
+        self.list_stand_trees.blockSignals(False)
+        self._run_js(f"if (window.setTreeFilterSelection) window.setTreeFilterSelection({json.dumps(all_ids)});")
+        self.status_bar.showMessage("All stand trees selected for filter.", 2500)
+
+    def _on_filter_select_target_only(self):
+        if not hasattr(self, "list_stand_trees"):
+            return
+        target_itc = int(self.spin_tree_view.value()) if hasattr(self, "spin_tree_view") else 1
+        self.list_stand_trees.blockSignals(True)
+        target_ids = []
+        for i in range(self.list_stand_trees.count()):
+            it = self.list_stand_trees.item(i)
+            tid = it.data(Qt.ItemDataRole.UserRole)
+            if tid == target_itc:
+                it.setCheckState(Qt.CheckState.Checked)
+                target_ids.append(tid)
+            else:
+                it.setCheckState(Qt.CheckState.Unchecked)
+        self.list_stand_trees.blockSignals(False)
+        self._run_js(f"if (window.setTreeFilterSelection) window.setTreeFilterSelection({json.dumps(target_ids)});")
+        self.status_bar.showMessage(f"Only Target Tree #{target_itc} selected for filter.", 2500)
+
+    def _apply_tree_filter(self):
+        if not hasattr(self, "list_stand_trees"):
+            return
+        checked_ids = []
+        for i in range(self.list_stand_trees.count()):
+            it = self.list_stand_trees.item(i)
+            if it.checkState() == Qt.CheckState.Checked:
+                checked_ids.append(it.data(Qt.ItemDataRole.UserRole))
+        if not checked_ids:
+            QMessageBox.information(self, "Stand Filter", "Please select at least one tree to keep.")
+            return
+        self._run_js(f"if (window.applyTreeFilter) window.applyTreeFilter({json.dumps(checked_ids)});")
+        self.status_bar.showMessage(f"Applied stand filter: keeping {len(checked_ids)} tree(s).", 4000)
+
+    def _reset_tree_filter(self):
+        self._run_js("if (window.resetTreeFilter) window.resetTreeFilter();")
+        if hasattr(self, "list_stand_trees"):
+            self.list_stand_trees.blockSignals(True)
+            for i in range(self.list_stand_trees.count()):
+                self.list_stand_trees.item(i).setCheckState(Qt.CheckState.Checked)
+            self.list_stand_trees.blockSignals(False)
+        self.status_bar.showMessage("Stand filter reset — all stand trees restored.", 4000)
 
     def on_edit_applied(self, data: dict):
         count = data.get("modified_count", 0)
@@ -1437,8 +2732,8 @@ class MainWindow(QMainWindow):
                 "color": "#10b981"
             }
             staged = self.manager.add_staged_edit(edit)
-            self.web_view.page().runJavaScript(f"window.addStagedVisualPolygon({json.dumps(staged)});")
-            self.web_view.page().runJavaScript("window.clearSelection(false);")
+            self._run_js(f"window.addStagedVisualPolygon({json.dumps(staged)});")
+            self._run_js("window.clearSelection(false);")
             self.spin_itc.setValue(itc_val + 1)
             self.refresh_staged_edits_table()
             self.status_bar.showMessage(f"Staged Tree #{itc_val} ({len(coords)} vertices).")
@@ -1471,8 +2766,8 @@ class MainWindow(QMainWindow):
                 "color": "#ef4444"
             }
             staged = self.manager.add_staged_edit(edit)
-            self.web_view.page().runJavaScript(f"window.addStagedVisualPolygon({json.dumps(staged)});")
-            self.web_view.page().runJavaScript("window.clearSelection(false);")
+            self._run_js(f"window.addStagedVisualPolygon({json.dumps(staged)});")
+            self._run_js("window.clearSelection(false);")
             self.refresh_staged_edits_table()
             self.status_bar.showMessage(f"Staged Noise region ({len(coords)} vertices).")
             return
@@ -1507,8 +2802,8 @@ class MainWindow(QMainWindow):
                 "color": "#3b82f6"
             }
             staged = self.manager.add_staged_edit(edit)
-            self.web_view.page().runJavaScript(f"window.addStagedVisualPolygon({json.dumps(staged)});")
-            self.web_view.page().runJavaScript("window.clearSelection(false);")
+            self._run_js(f"window.addStagedVisualPolygon({json.dumps(staged)});")
+            self._run_js("window.clearSelection(false);")
             self.refresh_staged_edits_table()
             self.status_bar.showMessage(f"Staged Class {class_val} ({class_name}) for {len(coords)} vertices.")
             return
@@ -1540,11 +2835,11 @@ class MainWindow(QMainWindow):
             count = self.manager.delete_selected_points()
             self.on_edit_applied({"action": "delete_points", "modified_count": count})
             self.lbl_sel_count.setText("Selection: None")
-            self.web_view.page().runJavaScript("window.clearSelection(false);")
+            self._run_js("window.clearSelection(false);")
 
     def clear_selection(self):
         self.manager.current_selection = None
-        self.web_view.page().runJavaScript("window.clearSelection(true);")
+        self._run_js("window.clearSelection(true);")
         self.lbl_sel_count.setText("Selection: None")
         self.lbl_sel_classes.setText("Classes: -")
         self.lbl_sel_itc.setText("ITC IDs: -")
@@ -1653,13 +2948,13 @@ class MainWindow(QMainWindow):
 
     def remove_single_staged_edit(self, edit_id: str):
         self.manager.remove_staged_edit(edit_id)
-        self.web_view.page().runJavaScript(f"window.removeStagedVisualPolygon('{edit_id}');")
+        self._run_js(f"window.removeStagedVisualPolygon('{edit_id}');")
         self.refresh_staged_edits_table()
         self.status_bar.showMessage(f"Removed staged edit: {edit_id}")
 
     def clear_all_staged_edits(self):
         self.manager.clear_staged_edits()
-        self.web_view.page().runJavaScript("window.clearAllStagedVisuals();")
+        self._run_js("window.clearAllStagedVisuals();")
         self.refresh_staged_edits_table()
         self.status_bar.showMessage("Cleared all staged edits.")
 
@@ -1679,8 +2974,7 @@ class MainWindow(QMainWindow):
             return
 
         if not self.current_las_path or not os.path.exists(self.current_las_path):
-            file_path, _ = QFileDialog.getOpenFileName(
-                self,
+            file_path = self._pick_file(
                 "Select Source LAS/LAZ File to Commit Edits Into",
                 "",
                 "LAS/LAZ Files (*.las *.laz);;All Files (*)"
@@ -1691,8 +2985,7 @@ class MainWindow(QMainWindow):
 
         base, ext = os.path.splitext(self.current_las_path)
         default_out = f"{base}_edited{ext}"
-        save_path, _ = QFileDialog.getSaveFileName(
-            self,
+        save_path = self._save_file(
             "Save Committed Point Cloud",
             default_out,
             "LAZ Files (*.laz);;LAS Files (*.las);;All Files (*)"
@@ -1764,8 +3057,7 @@ class MainWindow(QMainWindow):
             return
 
         default_name = os.path.splitext(self.current_las_path or "edited_cloud.las")[0] + "_edited.las"
-        save_path, _ = QFileDialog.getSaveFileName(
-            self,
+        save_path = self._save_file(
             "Save Modified Point Cloud",
             default_name,
             "LAS Files (*.las);;LAZ Files (*.laz)"
@@ -1783,45 +3075,201 @@ class MainWindow(QMainWindow):
     # -------------------------------------------------------------------------
     # Render & Visual Settings Actions
     # -------------------------------------------------------------------------
+    # Viewer JS Bridge (queued until the page is live)
+    # -------------------------------------------------------------------------
+    def _on_page_load_finished(self, ok: bool):
+        self._page_ready = bool(ok)
+        if ok and self._js_queue:
+            for script, callback in self._js_queue:
+                if callback is None:
+                    self.web_view.page().runJavaScript(script)
+                else:
+                    self.web_view.page().runJavaScript(script, callback)
+            self._js_queue = []
+        if ok and not self._settings_applied:
+            self._settings_applied = True
+            self._apply_loaded_settings()
+
+    # -------------------------------------------------------------------------
+    # Settings Persistence (SQLite)
+    # -------------------------------------------------------------------------
+    def _collect_settings(self) -> dict:
+        """Snapshot every persisted viewer setting from the ribbon widgets."""
+        return {
+            "render_mode": self.ribbon_combo_render_mode.currentData(),
+            "shape": self.ribbon_combo_shape.currentData(),
+            "sizing": self.ribbon_combo_sizing.currentData(),
+            "point_size": self.ribbon_spin_size.value(),
+            "splat": self.ribbon_combo_splat.currentData(),
+            "budget": self.ribbon_combo_budget.currentData(),
+            "node": self.ribbon_combo_node.currentData(),
+            "color": self.ribbon_combo_color.currentData(),
+            "bg": self.ribbon_combo_bg.currentData(),
+            "edl_enabled": self.ribbon_chk_edl.isChecked(),
+            "edl_radius": self.ribbon_spin_radius.value(),
+            "edl_strength": self.ribbon_spin_strength.value(),
+            "edl_opacity": self.ribbon_spin_opacity.value(),
+        }
+
+    def _schedule_save_settings(self, *_):
+        self._settings_timer.start()
+
+    def _save_settings(self):
+        try:
+            self.settings_store.set_many(self._collect_settings())
+            self.settings_store.set("geometry",
+                                    bytes(self.saveGeometry().toHex().data()).decode())
+            self.settings_store.set("splitter", self.splitter.sizes())
+        except Exception as e:  # persistence must never break editing
+            print(f"[Settings] save failed: {e}")
+
+    def _apply_loaded_settings(self):
+        """Restore the persisted settings after the page is live.
+
+        Order matters: the render-mode preset writes the shape/size/budget
+        defaults in JS, so it goes first and the individual settings win on top.
+        """
+        s = self.settings_store
+
+        def set_combo(widget, key):
+            val = s.get(key)
+            if val is None:
+                return
+            idx = widget.findData(val)
+            if idx >= 0:
+                widget.blockSignals(True)
+                widget.setCurrentIndex(idx)
+                widget.blockSignals(False)
+
+        def set_spin(widget, key):
+            val = s.get(key)
+            if val is None:
+                return
+            widget.blockSignals(True)
+            widget.setValue(float(val))
+            widget.blockSignals(False)
+
+        if s.get("render_mode") is not None:
+            set_combo(self.ribbon_combo_render_mode, "render_mode")
+            self._on_ribbon_render_mode_changed()
+        if s.get("shape") is not None:
+            set_combo(self.ribbon_combo_shape, "shape")
+            self._on_ribbon_shape_changed()
+        if s.get("sizing") is not None:
+            set_combo(self.ribbon_combo_sizing, "sizing")
+            self._on_ribbon_sizing_changed()
+        if s.get("point_size") is not None:
+            set_spin(self.ribbon_spin_size, "point_size")
+            self._on_ribbon_size_spin_changed(self.ribbon_spin_size.value())
+        if s.get("splat") is not None:
+            set_combo(self.ribbon_combo_splat, "splat")
+            self._on_ribbon_splat_changed()
+        if s.get("budget") is not None:
+            set_combo(self.ribbon_combo_budget, "budget")
+            self._on_ribbon_budget_changed()
+        if s.get("node") is not None:
+            set_combo(self.ribbon_combo_node, "node")
+            self.set_min_node_size(self.ribbon_combo_node.currentData())
+        if s.get("color") is not None:
+            set_combo(self.ribbon_combo_color, "color")
+            self._on_ribbon_color_changed()
+        if s.get("bg") is not None:
+            set_combo(self.ribbon_combo_bg, "bg")
+            self._on_ribbon_bg_changed()
+        edl = s.get("edl_enabled")
+        if edl is not None:
+            self.ribbon_chk_edl.blockSignals(True)
+            self.ribbon_chk_edl.setChecked(bool(edl))
+            self.ribbon_chk_edl.blockSignals(False)
+            self.set_edl_enabled(bool(edl))
+        for widget, key, setter in (
+                (self.ribbon_spin_radius, "edl_radius", self.set_edl_radius),
+                (self.ribbon_spin_strength, "edl_strength", self.set_edl_strength),
+                (self.ribbon_spin_opacity, "edl_opacity", self.set_edl_opacity)):
+            if s.get(key) is not None:
+                set_spin(widget, key)
+                setter(widget.value())
+
+        geometry = s.get("geometry")
+        if geometry:
+            self.restoreGeometry(QByteArray.fromHex(geometry.encode()))
+        sizes = s.get("splitter")
+        if isinstance(sizes, list) and sizes:
+            self.splitter.setSizes(sizes)
+
+    def _wire_settings_persistence(self):
+        """Every ribbon setting change schedules a debounced save."""
+        for combo in (self.ribbon_combo_shape, self.ribbon_combo_sizing,
+                      self.ribbon_combo_splat, self.ribbon_combo_budget,
+                      self.ribbon_combo_node, self.ribbon_combo_color,
+                      self.ribbon_combo_bg, self.ribbon_combo_render_mode):
+            combo.currentIndexChanged.connect(self._schedule_save_settings)
+        for spin in (self.ribbon_spin_size, self.ribbon_spin_radius,
+                     self.ribbon_spin_strength, self.ribbon_spin_opacity):
+            spin.valueChanged.connect(self._schedule_save_settings)
+        self.ribbon_slider_size.valueChanged.connect(self._schedule_save_settings)
+        self.ribbon_chk_edl.toggled.connect(self._schedule_save_settings)
+
+    def closeEvent(self, event):
+        # Final flush so a change made <450 ms before closing is not lost.
+        self._save_settings()
+        self.settings_store.close()
+        super().closeEvent(event)
+
+    def _run_js(self, script: str, callback=None):
+        """Run JS in the viewer page, queueing it while the page is still loading.
+
+        web/app.js is a type=module script, so its window.* API surface only
+        exists after loadFinished; calling the setters — and the reader calls
+        that pass callbacks — earlier silently drops the requested value.
+        """
+        if self._page_ready:
+            if callback is None:
+                self.web_view.page().runJavaScript(script)
+            else:
+                self.web_view.page().runJavaScript(script, callback)
+        else:
+            self._js_queue.append((script, callback))
+
     def set_point_shape(self, shape: str):
-        self.web_view.page().runJavaScript(f"window.setPointShape('{shape}');")
+        self._run_js(f"window.setPointShape('{shape}');")
 
     def set_point_size_type(self, stype: str):
-        self.web_view.page().runJavaScript(f"window.setPointSizeType('{stype}');")
+        self._run_js(f"window.setPointSizeType('{stype}');")
 
     def set_point_size(self, size: float):
-        self.web_view.page().runJavaScript(f"window.setPointSize({size:.2f});")
+        self._run_js(f"window.setPointSize({size:.2f});")
 
     def set_splat_quality(self, quality: str):
-        self.web_view.page().runJavaScript(f"window.setSplatQuality('{quality}');")
+        self._run_js(f"window.setSplatQuality('{quality}');")
 
     def set_edl_enabled(self, enabled: bool):
         val = "true" if enabled else "false"
-        self.web_view.page().runJavaScript(f"window.setEDLEnabled({val});")
+        self._run_js(f"window.setEDLEnabled({val});")
 
     def set_edl_radius(self, radius: float):
-        self.web_view.page().runJavaScript(f"window.setEDLRadius({radius:.1f});")
+        self._run_js(f"window.setEDLRadius({radius:.1f});")
 
     def set_edl_strength(self, strength: float):
-        self.web_view.page().runJavaScript(f"window.setEDLStrength({strength:.1f});")
+        self._run_js(f"window.setEDLStrength({strength:.1f});")
 
     def set_point_budget(self, budget: int):
-        self.web_view.page().runJavaScript(f"window.setPointBudget({budget});")
+        self._run_js(f"window.setPointBudget({budget});")
 
     def set_color_mode(self, mode: str):
-        self.web_view.page().runJavaScript(f"window.setColorAttribute('{mode}');")
+        self._run_js(f"window.setColorAttribute('{mode}');")
 
     def toggle_in_viewport_settings(self):
-        self.web_view.page().runJavaScript("window.toggleSettingsMenu();")
+        self._run_js("window.toggleSettingsMenu();")
 
     def set_edl_opacity(self, opacity: float):
-        self.web_view.page().runJavaScript(f"window.setEDLOpacity({opacity:.2f});")
+        self._run_js(f"window.setEDLOpacity({opacity:.2f});")
 
     def set_min_node_size(self, size: int):
-        self.web_view.page().runJavaScript(f"window.setMinNodeSize({size});")
+        self._run_js(f"window.setMinNodeSize({size});")
 
     def set_background(self, bg: str):
-        self.web_view.page().runJavaScript(f"window.setBackground('{bg}');")
+        self._run_js(f"window.setBackground('{bg}');")
 
     # -------------------------------------------------------------------------
     # Top Tabbed Ribbon Bar
@@ -1829,9 +3277,9 @@ class MainWindow(QMainWindow):
     def create_ribbon_bar(self) -> QWidget:
         ribbon_container = QWidget()
         ribbon_container.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        ribbon_container.setFixedHeight(98)
+        ribbon_container.setFixedHeight(134)
         v_main = QVBoxLayout(ribbon_container)
-        v_main.setContentsMargins(0, 0, 0, 0)
+        v_main.setContentsMargins(0, 6, 0, 6)
         v_main.setSpacing(0)
 
         # Top Row: Category Tabs (File, Point, Settings)
@@ -1862,15 +3310,23 @@ class MainWindow(QMainWindow):
         self.btn_tab_settings.setCheckable(True)
         self.btn_tab_settings.setProperty("class", "ribbonCategoryTab")
 
+        # Stand Filter category (active only while the Forestry sidebar tab is open)
+        self.btn_tab_filter = QPushButton("Filter")
+        self.btn_tab_filter.setCheckable(True)
+        self.btn_tab_filter.setProperty("class", "ribbonCategoryTab")
+        self.btn_tab_filter.setVisible(False)  # Shown only while the Forestry sidebar tab is open
+
         self.ribbon_tab_group.addButton(self.btn_tab_file, 0)
         self.ribbon_tab_group.addButton(self.btn_tab_point, 1)
         self.ribbon_tab_group.addButton(self.btn_tab_layers, 2)
         self.ribbon_tab_group.addButton(self.btn_tab_settings, 3)
+        self.ribbon_tab_group.addButton(self.btn_tab_filter, 4)
 
         h_tabs.addWidget(self.btn_tab_file)
         h_tabs.addWidget(self.btn_tab_point)
         h_tabs.addWidget(self.btn_tab_layers)
         h_tabs.addWidget(self.btn_tab_settings)
+        h_tabs.addWidget(self.btn_tab_filter)
         h_tabs.addStretch()
 
         v_main.addWidget(category_bar)
@@ -1878,17 +3334,19 @@ class MainWindow(QMainWindow):
         # Bottom Row: QStackedWidget switching pages based on active tab
         self.ribbon_stack = QStackedWidget()
         self.ribbon_stack.setObjectName("ribbonStack")
-        self.ribbon_stack.setFixedHeight(68)
+        self.ribbon_stack.setFixedHeight(92)
 
         page_file = self._create_ribbon_file_page()
         page_point = self._create_ribbon_point_page()
         page_layers = self._create_ribbon_layers_page()
         page_settings = self._create_ribbon_settings_page()
+        page_filter = self._create_ribbon_filter_page()
 
         self.ribbon_stack.addWidget(page_file)       # Index 0
         self.ribbon_stack.addWidget(page_point)      # Index 1
         self.ribbon_stack.addWidget(page_layers)     # Index 2
         self.ribbon_stack.addWidget(page_settings)   # Index 3
+        self.ribbon_stack.addWidget(page_filter)     # Index 4 (Stand Filter)
 
         self.ribbon_tab_group.idClicked.connect(self._on_ribbon_category_clicked)
         self.ribbon_stack.setCurrentIndex(1)
@@ -1899,16 +3357,16 @@ class MainWindow(QMainWindow):
     # Category 1: File Page
     def _create_ribbon_file_page(self) -> QWidget:
         page = QFrame()
-        page.setFixedHeight(68)
+        page.setFixedHeight(92)
         h_layout = QHBoxLayout(page)
-        h_layout.setContentsMargins(8, 3, 8, 3)
+        h_layout.setContentsMargins(8, 6, 8, 6)
         h_layout.setSpacing(8)
 
         # Open Group
         grp_open = QFrame()
         grp_open.setProperty("class", "ribbonGroup")
         v_open = QVBoxLayout(grp_open)
-        v_open.setContentsMargins(8, 4, 8, 4)
+        v_open.setContentsMargins(10, 7, 10, 7)
         v_open.setSpacing(3)
 
         h_open_btns = QHBoxLayout()
@@ -1921,8 +3379,19 @@ class MainWindow(QMainWindow):
         btn_open_las.setProperty("class", "ribbonToolBtn")
         btn_open_las.clicked.connect(self.open_las_file)
 
+        btn_convert_las = QPushButton("Convert LAS...")
+        btn_convert_las.setProperty("class", "ribbonToolBtn")
+        btn_convert_las.setToolTip("Convert a LAS/LAZ file into Potree octree with real-time logs and stats")
+        btn_convert_las.clicked.connect(self.convert_las_action)
+
+        btn_open_folder = QPushButton("Open Folder...")
+        btn_open_folder.setProperty("class", "ribbonToolBtn")
+        btn_open_folder.clicked.connect(self.open_folder_dialog)
+
         h_open_btns.addWidget(btn_open_potree)
         h_open_btns.addWidget(btn_open_las)
+        h_open_btns.addWidget(btn_convert_las)
+        h_open_btns.addWidget(btn_open_folder)
         v_open.addLayout(h_open_btns)
 
         lbl_open = QLabel("OPEN")
@@ -1935,7 +3404,7 @@ class MainWindow(QMainWindow):
         grp_save = QFrame()
         grp_save.setProperty("class", "ribbonGroup")
         v_save = QVBoxLayout(grp_save)
-        v_save.setContentsMargins(8, 4, 8, 4)
+        v_save.setContentsMargins(10, 7, 10, 7)
         v_save.setSpacing(3)
 
         h_save_btns = QHBoxLayout()
@@ -1960,41 +3429,22 @@ class MainWindow(QMainWindow):
         v_save.addWidget(lbl_save)
         h_layout.addWidget(grp_save)
 
-        # Application Group
-        grp_app = QFrame()
-        grp_app.setProperty("class", "ribbonGroup")
-        v_app = QVBoxLayout(grp_app)
-        v_app.setContentsMargins(8, 4, 8, 4)
-        v_app.setSpacing(3)
-
-        btn_exit = QPushButton("Exit Application")
-        btn_exit.setProperty("class", "ribbonToolBtn")
-        btn_exit.setObjectName("btnDanger")
-        btn_exit.clicked.connect(self.close)
-        v_app.addWidget(btn_exit)
-
-        lbl_app = QLabel("APP")
-        lbl_app.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        lbl_app.setProperty("class", "ribbonTitle")
-        v_app.addWidget(lbl_app)
-        h_layout.addWidget(grp_app)
-
         h_layout.addStretch()
         return page
 
     # Category 2: Point Page
     def _create_ribbon_point_page(self) -> QWidget:
         page = QFrame()
-        page.setFixedHeight(68)
+        page.setFixedHeight(92)
         h_layout = QHBoxLayout(page)
-        h_layout.setContentsMargins(8, 3, 8, 3)
+        h_layout.setContentsMargins(8, 6, 8, 6)
         h_layout.setSpacing(8)
 
         # 1. Point Settings Group
         grp_point = QFrame()
         grp_point.setProperty("class", "ribbonGroup")
         v_pt = QVBoxLayout(grp_point)
-        v_pt.setContentsMargins(8, 4, 8, 4)
+        v_pt.setContentsMargins(10, 7, 10, 7)
         v_pt.setSpacing(3)
 
         h_pt_controls = QHBoxLayout()
@@ -2071,7 +3521,7 @@ class MainWindow(QMainWindow):
         grp_color = QFrame()
         grp_color.setProperty("class", "ribbonGroup")
         v_color = QVBoxLayout(grp_color)
-        v_color.setContentsMargins(8, 4, 8, 4)
+        v_color.setContentsMargins(10, 7, 10, 7)
         v_color.setSpacing(3)
         h_color_controls = QHBoxLayout()
         h_color_controls.setSpacing(8)
@@ -2101,7 +3551,7 @@ class MainWindow(QMainWindow):
         grp_lod = QFrame()
         grp_lod.setProperty("class", "ribbonGroup")
         v_lod = QVBoxLayout(grp_lod)
-        v_lod.setContentsMargins(8, 4, 8, 4)
+        v_lod.setContentsMargins(10, 7, 10, 7)
         v_lod.setSpacing(3)
 
         h_lod_controls = QHBoxLayout()
@@ -2167,7 +3617,7 @@ class MainWindow(QMainWindow):
         grp_tools = QFrame()
         grp_tools.setProperty("class", "ribbonGroup")
         v_tools = QVBoxLayout(grp_tools)
-        v_tools.setContentsMargins(8, 4, 8, 4)
+        v_tools.setContentsMargins(10, 7, 10, 7)
         v_tools.setSpacing(3)
 
         h_tools = QHBoxLayout()
@@ -2175,19 +3625,23 @@ class MainWindow(QMainWindow):
 
         btn_orbit = QPushButton("Navigate")
         btn_orbit.setProperty("class", "ribbonToolBtn")
-        btn_orbit.clicked.connect(lambda: self.activate_web_tool("nav"))
-
-        btn_lasso = QPushButton("Polygon Select")
-        btn_lasso.setProperty("class", "ribbonToolBtn")
-        btn_lasso.clicked.connect(lambda: self.activate_web_tool("polygon"))
+        btn_orbit.setCheckable(True)
+        btn_orbit.setChecked(True)
+        btn_orbit.clicked.connect(lambda checked=False: self.activate_web_tool("nav"))
+        self._tool_buttons["nav"] = btn_orbit
 
         btn_box = QPushButton("Box Select")
         btn_box.setProperty("class", "ribbonToolBtn")
-        btn_box.clicked.connect(lambda: self.activate_web_tool("box"))
+        btn_box.setCheckable(True)
+        btn_box.clicked.connect(lambda checked=False: self.activate_web_tool("box"))
+        self._tool_buttons["box"] = btn_box
 
         btn_pick = QPushButton("Pick Point")
+        btn_pick.setToolTip("Pick Point (Ctrl+Click on any point to inspect and highlight)")
         btn_pick.setProperty("class", "ribbonToolBtn")
-        btn_pick.clicked.connect(lambda: self.activate_web_tool("inspect"))
+        btn_pick.setCheckable(True)
+        btn_pick.clicked.connect(lambda checked=False: self.activate_web_tool("inspect"))
+        self._tool_buttons["inspect"] = btn_pick
 
         btn_commit_ribbon = QPushButton("Commit Edits")
         btn_commit_ribbon.setProperty("class", "ribbonToolBtn")
@@ -2200,13 +3654,21 @@ class MainWindow(QMainWindow):
         btn_clear.clicked.connect(lambda: self.activate_web_tool("clear"))
 
         h_tools.addWidget(btn_orbit)
-        h_tools.addWidget(btn_lasso)
         h_tools.addWidget(btn_box)
         h_tools.addWidget(btn_pick)
         h_tools.addWidget(btn_commit_ribbon)
         h_tools.addWidget(btn_clear)
 
         v_tools.addLayout(h_tools)
+
+        # Point-to-point distance measuring on the displayed tree (Forestry
+        # overlay): markers + 3D/horizontal distance labels; double-click clears.
+        self.chk_ribbon_measure = QCheckBox("Measure")
+        self.chk_ribbon_measure.setStyleSheet("color: #e2e8f0; font-size: 11px; font-weight: 600;")
+        self.chk_ribbon_measure.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.chk_ribbon_measure.toggled.connect(self._toggle_tree_measure)
+        v_tools.addWidget(self.chk_ribbon_measure, alignment=Qt.AlignmentFlag.AlignCenter)
+
         lbl_title_tools = QLabel("SELECTION & EDITING")
         lbl_title_tools.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lbl_title_tools.setProperty("class", "ribbonTitle")
@@ -2219,16 +3681,16 @@ class MainWindow(QMainWindow):
     # Category 3: Layers Page
     def _create_ribbon_layers_page(self) -> QWidget:
         page = QFrame()
-        page.setFixedHeight(68)
+        page.setFixedHeight(92)
         h_layout = QHBoxLayout(page)
-        h_layout.setContentsMargins(8, 3, 8, 3)
+        h_layout.setContentsMargins(8, 6, 8, 6)
         h_layout.setSpacing(8)
 
         # 1. Quick Layer Visibility Toggles Group
         grp_vis = QFrame()
         grp_vis.setProperty("class", "ribbonGroup")
         v_vis = QVBoxLayout(grp_vis)
-        v_vis.setContentsMargins(8, 4, 8, 4)
+        v_vis.setContentsMargins(10, 7, 10, 7)
         v_vis.setSpacing(2)
 
         g_checks = QGridLayout()
@@ -2266,7 +3728,7 @@ class MainWindow(QMainWindow):
         grp_master = QFrame()
         grp_master.setProperty("class", "ribbonGroup")
         v_master = QVBoxLayout(grp_master)
-        v_master.setContentsMargins(8, 4, 8, 4)
+        v_master.setContentsMargins(10, 7, 10, 7)
         v_master.setSpacing(3)
 
         h_master_btns = QHBoxLayout()
@@ -2294,7 +3756,7 @@ class MainWindow(QMainWindow):
         grp_sidebar = QFrame()
         grp_sidebar.setProperty("class", "ribbonGroup")
         v_sidebar = QVBoxLayout(grp_sidebar)
-        v_sidebar.setContentsMargins(8, 4, 8, 4)
+        v_sidebar.setContentsMargins(10, 7, 10, 7)
         v_sidebar.setSpacing(3)
 
         btn_focus_lm = QPushButton("Focus Layer Manager")
@@ -2314,16 +3776,16 @@ class MainWindow(QMainWindow):
     # Category 4: Settings Page
     def _create_ribbon_settings_page(self) -> QWidget:
         page = QFrame()
-        page.setFixedHeight(68)
+        page.setFixedHeight(92)
         h_layout = QHBoxLayout(page)
-        h_layout.setContentsMargins(8, 3, 8, 3)
+        h_layout.setContentsMargins(8, 6, 8, 6)
         h_layout.setSpacing(8)
 
         # 1. Lighting (EDL) Group
         grp_edl = QFrame()
         grp_edl.setProperty("class", "ribbonGroup")
         v_edl = QVBoxLayout(grp_edl)
-        v_edl.setContentsMargins(8, 4, 8, 4)
+        v_edl.setContentsMargins(10, 7, 10, 7)
         v_edl.setSpacing(3)
 
         h_edl_controls = QHBoxLayout()
@@ -2394,7 +3856,7 @@ class MainWindow(QMainWindow):
         grp_display = QFrame()
         grp_display.setProperty("class", "ribbonGroup")
         v_display = QVBoxLayout(grp_display)
-        v_display.setContentsMargins(8, 4, 8, 4)
+        v_display.setContentsMargins(10, 7, 10, 7)
         v_display.setSpacing(3)
 
         h_disp_controls = QHBoxLayout()
@@ -2445,12 +3907,77 @@ class MainWindow(QMainWindow):
         h_layout.addStretch()
         return page
 
+    # Category 5: Stand Filter Page (shown under the ribbon "Filter" menu)
+    def _create_ribbon_filter_page(self) -> QWidget:
+        page = QFrame()
+        page.setFixedHeight(92)
+        h_layout = QHBoxLayout(page)
+        h_layout.setContentsMargins(8, 6, 8, 6)
+        h_layout.setSpacing(8)
+
+        # Stand Filter Group (moved from the ribbon category row top bar)
+        grp_filter = QFrame()
+        grp_filter.setProperty("class", "ribbonGroup")
+        grp_filter.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
+        v_filter_grp = QVBoxLayout(grp_filter)
+        v_filter_grp.setContentsMargins(10, 7, 10, 7)
+        v_filter_grp.setSpacing(3)
+
+        self.bar_stand_filter = QFrame()
+        h_sfb = QHBoxLayout(self.bar_stand_filter)
+        h_sfb.setContentsMargins(0, 0, 0, 0)
+        h_sfb.setSpacing(6)
+
+        # Info label kept alive for status updates, but not shown in the ribbon
+        self.lbl_top_stand_info = QLabel("🌲 Stand: Tree #- (0 neighbors)")
+
+        # Mode toggle (moved here from the Forestry sidebar group)
+        self.btn_tree_filter_mode = QPushButton("Filter Mode")
+        self.btn_tree_filter_mode.setCheckable(True)
+        self.btn_tree_filter_mode.setProperty("class", "ribbonToolBtn")
+        self.btn_tree_filter_mode.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_tree_filter_mode.toggled.connect(self._on_tree_filter_mode_toggled)
+        h_sfb.addWidget(self.btn_tree_filter_mode)
+
+        self.btn_top_filter = QPushButton("Filter")
+        self.btn_top_filter.setProperty("class", "ribbonToolBtn")
+        self.btn_top_filter.setObjectName("btnSuccess")
+        self.btn_top_filter.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_top_filter.clicked.connect(self._apply_tree_filter)
+        h_sfb.addWidget(self.btn_top_filter)
+
+        self.btn_top_reset = QPushButton("Reset")
+        self.btn_top_reset.setProperty("class", "ribbonToolBtn")
+        self.btn_top_reset.setObjectName("btnSecondary")
+        self.btn_top_reset.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_top_reset.clicked.connect(self._reset_tree_filter)
+        h_sfb.addWidget(self.btn_top_reset)
+
+        # Buttons are always shown on the Filter page; they start disabled (not
+        # highlighted) and light up once a tree stand with neighbors is loaded.
+        self.bar_stand_filter.setVisible(True)
+        self._set_stand_filter_buttons_enabled(False)
+        v_filter_grp.addWidget(self.bar_stand_filter)
+        v_filter_grp.addStretch()
+
+        lbl_filter = QLabel("STAND FILTER")
+        lbl_filter.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lbl_filter.setProperty("class", "ribbonTitle")
+        v_filter_grp.addWidget(lbl_filter)
+
+        h_layout.addWidget(grp_filter)
+        h_layout.addStretch()
+        return page
+
     # Ribbon Event Handlers
     def _on_ribbon_category_clicked(self, idx: int):
         self.ribbon_stack.setCurrentIndex(idx)
         if idx == 2:  # Layers tab
             if hasattr(self, "sidebar_tabs"):
                 self.sidebar_tabs.setCurrentIndex(0)
+        elif idx == 4:  # Filter tab (stand filter)
+            if hasattr(self, "sidebar_tabs"):
+                self.sidebar_tabs.setCurrentIndex(1)
 
     def _on_ribbon_shape_changed(self):
         shape = self.ribbon_combo_shape.currentData()
@@ -2539,12 +4066,12 @@ class MainWindow(QMainWindow):
 
         def apply_layers(layers):
             self._render_layer_rows(layers if isinstance(layers, list) else [])
-            self.web_view.page().runJavaScript(
+            self._run_js(
                 "window.getRenderSettings ? window.getRenderSettings() : null;",
                 lambda settings: self._sync_viewer_render_widgets(
                     settings if isinstance(settings, dict) else {}))
 
-        self.web_view.page().runJavaScript(
+        self._run_js(
             f"window.setRenderMode({json.dumps(mode)});", apply_layers)
 
     def _on_ribbon_bg_changed(self):
@@ -2554,5 +4081,17 @@ class MainWindow(QMainWindow):
     def activate_web_tool(self, tool_name: str):
         if tool_name == "clear":
             self.clear_selection()
-        else:
-            self.web_view.page().runJavaScript(f"window.setActiveTool('{tool_name}');")
+            return
+        # Re-clicking the active lasso/box/pick tool turns it off, back to navigation.
+        if self._active_tool == tool_name and tool_name in ("polygon", "box", "inspect"):
+            tool_name = "nav"
+        self._active_tool = tool_name
+        self._run_js(f"window.setActiveTool('{tool_name}');")
+        self._sync_tool_buttons()
+
+    def _sync_tool_buttons(self):
+        """Keep the ribbon tool buttons' checked state in sync with the viewer mode."""
+        for name, btn in self._tool_buttons.items():
+            btn.blockSignals(True)
+            btn.setChecked(name == self._active_tool)
+            btn.blockSignals(False)

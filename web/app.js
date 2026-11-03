@@ -50,6 +50,105 @@ function layerByName(name) {
     return viewer.scene.pointclouds.find(pc => pc.name === name) || null;
 }
 
+function getAvailableAttributes(pc) {
+    if (!pc || !pc.getAttributes) return ['elevation', 'rgba', 'classification', 'intensity'];
+    const attrs = pc.getAttributes();
+    if (!attrs || !attrs.attributes) return ['elevation', 'rgba', 'classification', 'intensity'];
+    const rawAttrs = attrs.attributes.map(a => a.name);
+    const result = [];
+
+    // Standard spatial & visual channels
+    result.push('elevation');
+    if (rawAttrs.some(a => ['rgba', 'rgb', 'color'].includes(a))) {
+        result.push('rgba');
+    }
+
+    // Include every scalar dimension present in the point cloud
+    for (const a of rawAttrs) {
+        if (['position', 'POSITION_CARTESIAN', 'rgba', 'rgb', 'color'].includes(a)) continue;
+        result.push(a);
+        if (a === 'intensity') {
+            result.push('intensity gradient');
+        }
+    }
+
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// Viridis 12-step color palette matching the forestry single-tree view
+// ---------------------------------------------------------------------------
+const VIRIDIS16 = [
+    [68, 1, 84], [72, 36, 117], [65, 68, 135], [53, 95, 141],
+    [42, 120, 142], [33, 145, 140], [34, 168, 132], [68, 190, 112],
+    [122, 209, 81], [165, 220, 54], [210, 226, 27], [253, 231, 37]
+];
+
+const FORESTRY_VIRIDIS_GRADIENT = VIRIDIS16.map((rgb, idx) => [
+    idx / (VIRIDIS16.length - 1),
+    new THREE.Color(rgb[0] / 255, rgb[1] / 255, rgb[2] / 255)
+]);
+
+// Categorical Tree-ID ramp. Uses golden-angle hues over a 330° window [45°-375°]
+// strictly bypassing the brown/mud band [15°-45°].
+// Stop 0 is rich earthy brown reserved for ground.
+const FORESTRY_TREE_STOPS = 64;
+const FORESTRY_GROUND_COLOR = new THREE.Color(0.48, 0.27, 0.14);
+const FORESTRY_TREE_GRADIENT = (() => {
+    const stops = [];
+    stops.push([0.0, FORESTRY_GROUND_COLOR]);
+    for (let i = 1; i < FORESTRY_TREE_STOPS; i++) {
+        const t = ((i * 0.61803398875) % 1.0 + 1.0) % 1.0;
+        const hue = ((45.0 + t * 330.0) % 360.0) / 360.0;
+        stops.push([i / FORESTRY_TREE_STOPS, new THREE.Color().setHSL(hue, 0.88, 0.54)]);
+    }
+    // Wrap the last band back to the first tree hue, closing the cycle
+    stops.push([1.0, stops[1][1].clone()]);
+    return stops;
+})();
+
+function treeAttrGradient(attrName) {
+    const n = String(attrName || '').toLowerCase().replace(/[\s_-]/g, '');
+    return ['itc', 'treeid', 'tree_id', 'tree'].includes(n)
+        ? FORESTRY_TREE_GRADIENT
+        : FORESTRY_VIRIDIS_GRADIENT;
+}
+
+if (typeof Potree !== 'undefined') {
+    if (Potree.Gradients) {
+        Potree.Gradients.VIRIDIS = FORESTRY_VIRIDIS_GRADIENT;
+    }
+    if (Potree.ClassificationScheme && Potree.ClassificationScheme.DEFAULT && Potree.ClassificationScheme.DEFAULT[2]) {
+        Potree.ClassificationScheme.DEFAULT[2].color = [0.48, 0.27, 0.14, 1.0];
+    }
+}
+
+function applyColorAttribute(pc, attr) {
+    if (!pc || !pc.material) return;
+
+    // Tree/ITC gets the vivid cyclic ramp; other scalar fields use forestry Viridis
+    pc.material.gradient = treeAttrGradient(attr);
+    pc.material.activeAttributeName = attr;
+
+    if (pc.getAttribute && pc.material.setRange) {
+        const attribute = pc.getAttribute(attr);
+        if (attribute) {
+            const currentRange = pc.material.getRange ? pc.material.getRange(attr) : null;
+            const range = attribute.range || attribute.initialRange;
+            if (Array.isArray(range) && range.length >= 2 && Number.isFinite(range[0]) && Number.isFinite(range[1])) {
+                let [minVal, maxVal] = range;
+                if (minVal === maxVal) maxVal = minVal + 1;
+                if (!currentRange || (currentRange[0] === 0 && currentRange[1] === 0) || attr === 'semantic_pred') {
+                    pc.material.setRange(attr, [minVal, maxVal]);
+                }
+            }
+        }
+    }
+    if (pc.material.updateShaderSource) {
+        pc.material.updateShaderSource();
+    }
+}
+
 function layerInfo(pc) {
     if (!pc) return null;
     return {
@@ -63,7 +162,7 @@ function layerInfo(pc) {
         pointType: layerStyle(pc).pointType,
         pointSizeType: layerStyle(pc).pointSizeType,
         points: (pc.potree && pc.potree.numPoints) || pc.numPoints || 0,
-        attributes: pc.getAttributes ? pc.getAttributes().attributes.map(a => a.name) : []
+        attributes: getAvailableAttributes(pc)
     };
 }
 
@@ -107,8 +206,11 @@ function setLayerVisible(name, visible) {
 
 function setLayerColorAttribute(name, attr) {
     const pc = layerByName(name);
-    if (pc && pc.material) pc.material.activeAttributeName = attr;
-    if (pc && pc === currentPointCloud) viewerSettings.colorMode = attr;
+    if (pc) applyColorAttribute(pc, attr);
+    if (pc && pc === currentPointCloud) {
+        viewerSettings.colorMode = attr;
+        updateTreeColors();
+    }
     viewer.render();
     return listLayers();
 }
@@ -151,10 +253,46 @@ window.viewer = viewer;
 const overlayScene = new THREE.Scene();
 overlayScene.name = 'potree_editor_overlay_scene';
 
+// Potree's octree camera carries a frustum tailored to the octree's bounding
+// box (aspect/plane skew). Rendering the overlay with a pose-synced camera of
+// the canvas aspect makes world positions project symmetrically — the tree
+// view lands dead-centre with plain lookAt math.
+const overlayCamP = new THREE.PerspectiveCamera(60, 1, 0.05, 2e6);
+const overlayCamO = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.05, 2e6);
+
+// Enforce close near clipping plane (5cm) on main camera so points never clip when close up or at steep angles
+viewer.addEventListener('update', () => {
+    const cam = viewer.scene.getActiveCamera();
+    if (cam && (cam.near > 0.05 || cam.near <= 0 || isNaN(cam.near))) {
+        cam.near = 0.05;
+        cam.updateProjectionMatrix();
+    }
+});
+
 viewer.addEventListener('render.pass.perspective_overlay', () => {
     const camera = viewer.scene.getActiveCamera();
     if (camera && overlayScene.children.length > 0) {
-        viewer.renderer.render(overlayScene, camera);
+        const canvas = viewer.renderer.domElement;
+        let cam2;
+        if (camera.isOrthographicCamera) {
+            overlayCamO.left = camera.left; overlayCamO.right = camera.right;
+            overlayCamO.top = camera.top;   overlayCamO.bottom = camera.bottom;
+            overlayCamO.zoom = camera.zoom; overlayCamO.near = 0.05;
+            overlayCamO.far = camera.far;
+            cam2 = overlayCamO;
+        } else {
+            overlayCamP.fov = camera.fov;
+            overlayCamP.aspect = canvas.clientHeight > 0 ? canvas.clientWidth / canvas.clientHeight : 1;
+            overlayCamP.near = 0.05;
+            overlayCamP.far = Math.max(camera.far, 10000);
+            overlayCamP.zoom = camera.zoom;
+            cam2 = overlayCamP;
+        }
+        cam2.position.copy(camera.position);
+        cam2.quaternion.copy(camera.quaternion);
+        cam2.updateProjectionMatrix();
+        cam2.updateMatrixWorld(true);
+        viewer.renderer.render(overlayScene, cam2);
     }
 });
 
@@ -177,13 +315,80 @@ const quickTreeIdInput = document.getElementById('quickTreeIdInput');
 const inspectCard = document.getElementById('inspectCard');
 const closeInspect = document.getElementById('closeInspect');
 
+let toastTimer = null;
 function showToast(text, duration = 3000) {
     if (!toastMsg) return;
+    if (toastTimer) clearTimeout(toastTimer);
     toastMsg.textContent = text;
     toastMsg.style.display = 'block';
-    setTimeout(() => {
+    toastTimer = setTimeout(() => {
         toastMsg.style.display = 'none';
     }, duration);
+}
+window.showToast = showToast;
+
+let isIndexingActive = false;
+let indexingHideTimer = null;
+
+window.updateIndexingStatus = function(data) {
+    if (!data) return;
+    const badge = document.getElementById('indexingBadge');
+    const icon = document.getElementById('indexingBadgeIcon');
+    const text = document.getElementById('indexingBadgeText');
+    const bar = document.getElementById('indexingBadgeBar');
+    const prog = document.getElementById('indexingBadgeProgress');
+    if (!badge || !text) return;
+
+    if (indexingHideTimer) {
+        clearTimeout(indexingHideTimer);
+        indexingHideTimer = null;
+    }
+
+    const type = data.type;
+    if (type === 'started' || type === 'progress') {
+        isIndexingActive = true;
+        badge.style.display = 'flex';
+        badge.style.borderColor = '#0284c7';
+        badge.style.color = '#38bdf8';
+        if (icon) icon.textContent = data.stage === 'trees' ? '🌲' : '⚡';
+        text.textContent = data.msg || 'Automatic Background Indexing...';
+        if (bar && prog && data.percent !== undefined) {
+            bar.style.display = 'block';
+            prog.style.width = Math.min(100, Math.max(0, data.percent)) + '%';
+        }
+    } else if (type === 'completed' || type === 'ready') {
+        isIndexingActive = false;
+        badge.style.display = 'flex';
+        badge.style.borderColor = '#059669';
+        badge.style.color = '#34d399';
+        if (icon) icon.textContent = '✓';
+        text.textContent = data.msg || 'Spatial index ready';
+        if (bar) bar.style.display = 'none';
+        indexingHideTimer = setTimeout(() => {
+            badge.style.display = 'none';
+        }, 8000);
+    } else if (type === 'error') {
+        isIndexingActive = false;
+        badge.style.display = 'flex';
+        badge.style.borderColor = '#dc2626';
+        badge.style.color = '#f87171';
+        if (icon) icon.textContent = '⚠';
+        text.textContent = 'Streaming Fallback Active';
+        if (bar) bar.style.display = 'none';
+    }
+};
+
+// Single POST helper: awaits, checks res.ok, throws with the endpoint name.
+async function postJSON(url, body) {
+    const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+    });
+    if (!res.ok) {
+        throw new Error(`${url} -> HTTP ${res.status}`);
+    }
+    return res.json();
 }
 
 // ---------------------------------------------------------------------------
@@ -202,7 +407,7 @@ window.setActiveTool = function(tool) {
         startBoxSelection();
     } else if (tool === 'inspect') {
         renderArea.style.cursor = 'crosshair';
-        showToast('Pick Point Mode: Click any point in the cloud to inspect and highlight');
+        showToast('Pick Point Mode: Ctrl+Click any point in the cloud to inspect and highlight');
     }
 };
 
@@ -252,6 +457,9 @@ function applyMaterialSettings(pc = currentPointCloud) {
     mat.shape = getPointShapeEnum(style.pointType);
     mat.pointSizeType = getPointSizeTypeEnum(style.pointSizeType);
     mat.size = Number(style.pointSize);
+    if (typeof FORESTRY_VIRIDIS_GRADIENT !== 'undefined' && FORESTRY_VIRIDIS_GRADIENT) {
+        mat.gradient = treeAttrGradient(mat.activeAttributeName);
+    }
 }
 
 function updateAllPointClouds() {
@@ -287,11 +495,11 @@ window.loadPointCloudUrl = async function(url, displayName) {
 
         const hasRGBA = pc.getAttributes().attributes.some(a => a.name === 'rgba');
         if (hasRGBA && viewerSettings.colorMode === 'rgba') {
-            pc.material.activeAttributeName = 'rgba';
+            applyColorAttribute(pc, 'rgba');
         } else if (viewerSettings.colorMode) {
-            pc.material.activeAttributeName = viewerSettings.colorMode;
+            applyColorAttribute(pc, viewerSettings.colorMode);
         } else {
-            pc.material.activeAttributeName = 'color';
+            applyColorAttribute(pc, 'color');
         }
 
         viewer.scene.addPointCloud(pc);
@@ -491,12 +699,7 @@ function finishPolygonSelection() {
     const coords2d = polygonPoints.map(p => [p.x, p.y]);
     const coords3d = polygonPoints.map(p => [p.x, p.y, p.z]);
 
-    fetch('/api/select_polygon', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ coordinates: coords2d, points_3d: coords3d })
-    })
-    .then(r => r.json())
+    postJSON('/api/select_polygon', { coordinates: coords2d, points_3d: coords3d })
     .then(data => {
         handleSelectionResult(data);
     })
@@ -517,22 +720,21 @@ function startBoxSelection() {
 
     if (viewer.volumeTool) {
         const volume = viewer.volumeTool.startInsertion({ type: Potree.BoxVolume });
-        volume.addEventListener('insertion_finished', () => {
+        // The shipped 1.8.x renderer fires 'drop' when the volume placement finishes.
+        volume.addEventListener('drop', () => {
             const min = volume.boundingBox.min;
             const max = volume.boundingBox.max;
             activeSelectionMesh = volume;
 
-            fetch('/api/select_box', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    min: [min.x, min.y, min.z],
-                    max: [max.x, max.y, max.z]
-                })
+            postJSON('/api/select_box', {
+                min: [min.x, min.y, min.z],
+                max: [max.x, max.y, max.z]
             })
-            .then(r => r.json())
             .then(data => handleSelectionResult(data))
-            .catch(err => console.error(err));
+            .catch(err => {
+                console.error('Box query failed:', err);
+                showToast('Query error: ' + err.message);
+            });
 
             activeTool = 'nav';
         });
@@ -554,7 +756,7 @@ function getIntersectionAt(screenX, screenY, allowPlaneFallback = true) {
             camera,
             viewer,
             pointclouds,
-            { pickClipped: true }
+            { pickClipped: true, pickWindowSize: 17 }
         );
         if (I && I.location) {
             return {
@@ -652,6 +854,8 @@ function extractAttr(pt, ...keys) {
 }
 
 function clearPickedPointHighlight() {
+    const btnInspectViewTree = document.getElementById('btnInspectViewTree');
+    if (btnInspectViewTree) btnInspectViewTree.style.display = 'none';
     if (pickedPointMarker) {
         overlayScene.remove(pickedPointMarker);
         pickedPointMarker.traverse(child => {
@@ -828,7 +1032,91 @@ viewer.addEventListener('update', () => {
 // ---------------------------------------------------------------------------
 // Inspection / Pick Point Tool
 // ---------------------------------------------------------------------------
+// Raycast the Forestry tab's isolated tree overlay (THREE.Points) and show the
+// same picked-point highlight + Point Attributes card as the main cloud picker.
+function pickTreeOverlayPoint(mouseEvent) {
+    const activeData = treeActiveFilteredData || treeRawData;
+    if (!treeOverlayPoints || !activeData) return;
+
+    const rect = renderArea.getBoundingClientRect();
+    const ndc = new THREE.Vector2(
+        ((mouseEvent.clientX - rect.left) / rect.width) * 2 - 1,
+        -((mouseEvent.clientY - rect.top) / rect.height) * 2 + 1
+    );
+    const camera = viewer.scene.getActiveCamera();
+    if (!camera) return;
+
+    const raycaster = new THREE.Raycaster();
+    raycaster.setFromCamera(ndc, camera);
+    // Point-pick tolerance in world meters, scaled to view distance
+    const viewDist = camera.position.distanceTo(treeOverlayPoints.position);
+    raycaster.params.Points.threshold = Math.max(0.02, viewDist * 0.004);
+
+    const hits = raycaster.intersectObject(treeOverlayPoints, false);
+    if (!hits.length) {
+        showToast('No point found under cursor. Click directly on a point.');
+        return;
+    }
+
+    const i = hits[0].index;
+    const { xyz, intensity, classification, scalars, targetCount } = activeData;
+    // Filtered datasets reuse the original tree centroid (overlay node position never moves)
+    const ox = activeData.cx !== undefined ? activeData.cx : (treeRawData ? treeRawData.cx : 0);
+    const oy = activeData.cy !== undefined ? activeData.cy : (treeRawData ? treeRawData.cy : 0);
+    const oz = activeData.cz !== undefined ? activeData.cz : (treeRawData ? treeRawData.cz : 0);
+    const world = new THREE.Vector3(
+        xyz[i * 3] + ox,
+        xyz[i * 3 + 1] + oy,
+        xyz[i * 3 + 2] + oz
+    );
+
+    const tidArr = scalars ? (scalars.itc || scalars.tree_id || scalars.treeID) : null;
+    const isTarget = targetCount === undefined || i < targetCount;
+    const tid = isTarget ? treeOverlayItc : (tidArr ? Math.round(tidArr[i]) : 0);
+
+    highlightPickedPoint(world, `Tree #${treeOverlayItc}${isTarget ? '' : ` (neighbor #${tid})`} | Z: ${world.z.toFixed(2)}m`);
+
+    const inspX = document.getElementById('inspX');
+    const inspY = document.getElementById('inspY');
+    const inspZ = document.getElementById('inspZ');
+    if (inspX) inspX.textContent = world.x.toFixed(3);
+    if (inspY) inspY.textContent = world.y.toFixed(3);
+    if (inspZ) inspZ.textContent = world.z.toFixed(3);
+
+    const inspClass = document.getElementById('inspClass');
+    const inspInt = document.getElementById('inspInt');
+    const inspITC = document.getElementById('inspITC');
+    const btnInspectViewTree = document.getElementById('btnInspectViewTree');
+
+    if (inspClass) inspClass.textContent = classification ? formatClassName(classification[i]) : '-';
+    if (inspInt) inspInt.textContent = intensity ? intensity[i] : '-';
+    if (inspITC) inspITC.textContent = tid > 0 ? tid : '-';
+    if (btnInspectViewTree) btnInspectViewTree.style.display = 'none'; // already in the tree view
+
+    const extraTbody = document.getElementById('inspExtraAttrs');
+    if (extraTbody) {
+        extraTbody.innerHTML = '';
+        if (scalars) {
+            for (const [k, arr] of Object.entries(scalars)) {
+                if (!arr || i >= arr.length) continue;
+                let val = arr[i];
+                if (typeof val === 'number' && !Number.isInteger(val)) val = Number(val.toFixed(3));
+                const label = k.replace(/_/g, ' ').replace(/-/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
+                const tr = document.createElement('tr');
+                tr.innerHTML = `<td>${label}:</td><td>${val}</td>`;
+                extraTbody.appendChild(tr);
+            }
+        }
+    }
+
+    if (inspectCard) inspectCard.style.display = 'block';
+}
+
 async function pickPointAt(mouseEvent) {
+    if (treeOverlayPoints && treeOverlayPoints.visible) {
+        return pickTreeOverlayPoint(mouseEvent);
+    }
+
     const rect = renderArea.getBoundingClientRect();
     const x = mouseEvent.clientX - rect.left;
     const y = mouseEvent.clientY - rect.top;
@@ -855,6 +1143,29 @@ async function pickPointAt(mouseEvent) {
     const inspClass = document.getElementById('inspClass');
     const inspInt = document.getElementById('inspInt');
     const inspITC = document.getElementById('inspITC');
+    const btnInspectViewTree = document.getElementById('btnInspectViewTree');
+
+    const updateViewTreeButton = (itcVal) => {
+        if (!btnInspectViewTree) return;
+        const num = Number(itcVal);
+        if (itcVal !== null && itcVal !== undefined && !isNaN(num) && num > 0) {
+            btnInspectViewTree.style.display = 'block';
+            btnInspectViewTree.textContent = `View Tree #${num} (All Points)`;
+            btnInspectViewTree.onclick = () => {
+                if (inspectCard) inspectCard.style.display = 'none';
+                if (pickedPointMarker) pickedPointMarker.visible = false;
+                window.viewTreeById(num, pos.x, pos.y);
+                postJSON('/api/event', {
+                    event: 'tree_view_requested',
+                    itc: num,
+                    x: pos.x,
+                    y: pos.y
+                }).catch(() => {});
+            };
+        } else {
+            btnInspectViewTree.style.display = 'none';
+        }
+    };
 
     // Extract attributes from Potree GPU pick if immediately available
     const initialClass = extractAttr(pickResult.point, 'classification');
@@ -864,15 +1175,41 @@ async function pickPointAt(mouseEvent) {
     if (inspClass) inspClass.textContent = formatClassName(initialClass);
     if (inspInt) inspInt.textContent = initialInt !== null ? initialInt : '-';
     if (inspITC) inspITC.textContent = initialITC !== null ? initialITC : '-';
+    updateViewTreeButton(initialITC);
+
+    // Populate any extra scalar fields dynamically into inspExtraAttrs
+    const extraTbody = document.getElementById('inspExtraAttrs');
+    const extraAttrs = {};
+    if (extraTbody) {
+        extraTbody.innerHTML = '';
+        const standardKeys = new Set(['x', 'y', 'z', 'position', 'classification', 'intensity', 'itc', 'tree_id', 'treeID', 'pointCloud', 'index']);
+        if (pickResult.point) {
+            for (const [k, v] of Object.entries(pickResult.point)) {
+                if (standardKeys.has(k) || k.startsWith('_')) continue;
+                let val = extractAttr(pickResult.point, k);
+                if (val !== null && val !== undefined) {
+                    extraAttrs[k] = val;
+                    if (typeof val === 'number') {
+                        val = Number.isInteger(val) ? val : Number(val.toFixed(3));
+                    }
+                    const tr = document.createElement('tr');
+                    const label = k.replace(/_/g, ' ').replace(/-/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
+                    tr.innerHTML = `<td>${label}:</td><td>${val}</td>`;
+                    extraTbody.appendChild(tr);
+                }
+            }
+        }
+    }
     if (inspectCard) inspectCard.style.display = 'block';
 
     try {
-        const res = await fetch('/api/pick_point', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ x: pos.x, y: pos.y, z: pos.z })
+        const data = await postJSON('/api/pick_point', {
+            x: pos.x,
+            y: pos.y,
+            z: pos.z,
+            itc: initialITC,
+            attributes: extraAttrs
         });
-        const data = await res.json();
         const picked = data.picked;
 
         if (picked) {
@@ -881,21 +1218,28 @@ async function pickPointAt(mouseEvent) {
             if (inspClass) inspClass.textContent = formatClassName(finalClass);
             if (inspInt) inspInt.textContent = finalInt ?? '-';
 
+            const activeITC = (picked.itc !== undefined && picked.itc !== null && Number(picked.itc) > 0)
+                ? Number(picked.itc)
+                : (initialITC !== null ? Number(initialITC) : 0);
+
             if (picked.staged_hit) {
                 if (inspITC) inspITC.textContent = `${picked.staged_hit.label} (Staged)`;
                 updatePickedPointLabel(picked.staged_hit.label, picked.staged_hit.color || '#10b981');
-            } else if (picked.itc !== undefined && picked.itc !== null) {
-                if (inspITC) inspITC.textContent = picked.itc !== 0 ? picked.itc : 'None';
-                if (picked.itc !== 0) {
-                    updatePickedPointLabel(`Tree #${picked.itc}`, '#10b981');
-                } else if (finalClass !== null && finalClass !== undefined) {
+                updateViewTreeButton(null);
+            } else if (activeITC > 0) {
+                if (inspITC) inspITC.textContent = activeITC;
+                updatePickedPointLabel(`Tree #${activeITC}`, '#10b981');
+                updateViewTreeButton(activeITC);
+            } else {
+                if (inspITC) inspITC.textContent = 'None';
+                updateViewTreeButton(null);
+                if (finalClass !== null && finalClass !== undefined) {
                     updatePickedPointLabel(formatClassName(finalClass), '#00f5ff');
                 }
-            } else if (finalClass !== null && finalClass !== undefined) {
-                updatePickedPointLabel(formatClassName(finalClass), '#00f5ff');
             }
         } else if (initialClass !== null) {
             updatePickedPointLabel(formatClassName(initialClass), '#00f5ff');
+            updateViewTreeButton(initialITC);
         }
     } catch (e) {
         console.error('Pick point API error:', e);
@@ -956,11 +1300,8 @@ function clearSelection(notifyServer = true) {
     if (selectionBanner) selectionBanner.style.display = 'none';
 
     if (notifyServer) {
-        fetch('/api/select_polygon', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ coordinates: [], points_3d: [] })
-        });
+        postJSON('/api/select_polygon', { coordinates: [], points_3d: [] })
+            .catch(err => console.warn('Clear-selection notify failed:', err));
         showToast('Selection cleared.');
     }
 }
@@ -968,7 +1309,54 @@ function clearSelection(notifyServer = true) {
 // ---------------------------------------------------------------------------
 // Mouse & Click Event Listeners
 // ---------------------------------------------------------------------------
+let mouseDownPos = { x: 0, y: 0 };
+
+renderArea.addEventListener('mousedown', (e) => {
+    mouseDownPos = { x: e.clientX, y: e.clientY };
+});
+
+window.addEventListener('keydown', (e) => {
+    if ((e.key === 'Control' || e.key === 'Meta') && (activeTool === 'nav' || activeTool === 'inspect')) {
+        renderArea.style.cursor = 'crosshair';
+    }
+});
+
+window.addEventListener('keyup', (e) => {
+    if (e.key === 'Control' || e.key === 'Meta') {
+        if (activeTool === 'nav') {
+            renderArea.style.cursor = 'default';
+        }
+    }
+});
+
+window.addEventListener('blur', () => {
+    if (activeTool === 'nav') {
+        renderArea.style.cursor = 'default';
+    }
+});
+
 renderArea.addEventListener('click', (e) => {
+    // If user dragged to orbit/pan camera, ignore click to avoid accidental picking
+    const isDrag = Math.hypot(e.clientX - mouseDownPos.x, e.clientY - mouseDownPos.y) > 5;
+    if (isDrag) {
+        return;
+    }
+
+    const isCtrl = e.ctrlKey || e.metaKey;
+
+    if (treeOverlayPoints && treeOverlayPoints.visible) {
+        // Filter Mode ON: clicks toggle whole-tree selection
+        if (treeFilterMode) {
+            pickTreeInStand(e);
+            return;
+        }
+        // Filter Mode OFF: Ctrl+Click picks a single point (attributes card), like the Layers tab
+        if (isCtrl) {
+            pickPointAt(e);
+            return;
+        }
+    }
+
     if (activeTool === 'polygon') {
         const rect = renderArea.getBoundingClientRect();
         const pick = getIntersectionAt(e.clientX - rect.left, e.clientY - rect.top);
@@ -982,8 +1370,10 @@ renderArea.addEventListener('click', (e) => {
             polygonLine.geometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(flat), 3));
             polygonLine.geometry.attributes.position.needsUpdate = true;
         }
-    } else if (activeTool === 'inspect') {
+    } else if (isCtrl && (activeTool === 'inspect' || activeTool === 'nav')) {
         pickPointAt(e);
+    } else if (activeTool === 'inspect' && !isCtrl) {
+        showToast('Hold Ctrl and click on a point to pick it.');
     }
 });
 
@@ -991,6 +1381,11 @@ renderArea.addEventListener('dblclick', (e) => {
     if (activeTool === 'polygon') {
         e.preventDefault();
         finishPolygonSelection();
+        return;
+    }
+
+    if (treeOverlayPoints && treeOverlayPoints.visible) {
+        zoomToTreeAt(e);
     }
 });
 
@@ -1028,12 +1423,7 @@ if (btnQuickAssignTree) {
             color: '#10b981'
         };
 
-        fetch('/api/stage_edit', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(edit)
-        })
-        .then(r => r.json())
+        postJSON('/api/stage_edit', edit)
         .then(data => {
             if (data.success) {
                 window.addStagedVisualPolygon(data.edit);
@@ -1067,12 +1457,7 @@ if (btnQuickNoise) {
             color: '#ef4444'
         };
 
-        fetch('/api/stage_edit', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(edit)
-        })
-        .then(r => r.json())
+        postJSON('/api/stage_edit', edit)
         .then(data => {
             if (data.success) {
                 window.addStagedVisualPolygon(data.edit);
@@ -1106,7 +1491,7 @@ const RENDER_MODES = {
     balanced: { pointType: 'CIRCLE', pointSizeType: 'ADAPTIVE', pointSize: 0.8,
                 splatQuality: 'standard', pointBudget: 5_000_000, minNodeSize: 10 },
     quality: { pointType: 'PARABOLOID', pointSizeType: 'FIXED', pointSize: 0.45,
-               splatQuality: 'hq', pointBudget: 15_000_000, minNodeSize: 5 }
+               splatQuality: 'standard', pointBudget: 15_000_000, minNodeSize: 5 }
 };
 
 window.setRenderMode = (mode) => {
@@ -1180,6 +1565,10 @@ window.setPointSize = (size) => {
         layerStyle(currentPointCloud).pointSize = Number(size);
         applyMaterialSettings(currentPointCloud);
     }
+    if (treeOverlayPoints && treeOverlayPoints.material) {
+        treeOverlayPoints.material.size = getTreePointSize();
+        treeOverlayPoints.material.needsUpdate = true;
+    }
     viewer.render();
 };
 
@@ -1223,7 +1612,10 @@ window.setEDLOpacity = (opacity) => {
 
 window.setColorAttribute = (attr) => {
     viewerSettings.colorMode = attr;
-    if (currentPointCloud) currentPointCloud.material.activeAttributeName = attr;
+    if (currentPointCloud) applyColorAttribute(currentPointCloud, attr);
+    updateTreeColors();
+    viewer.render();
+    showToast(`Color by: ${attr}`);
 };
 
 window.setMinNodeSize = (val) => {
@@ -1313,4 +1705,1190 @@ window.zoomToStagedEdit = (editId) => {
             showToast('Zoomed to staged edit');
         }
     }
+};
+
+// ===========================================================================
+// Full-Density Tree View
+//
+// The octree keeps ~127M of 213M points (1 mm Poisson decimation) for fast
+// streaming. A single tree's full point set lives in the LAS master; the
+// server streams it here on demand as a binary blob and we render it as a
+// second, complete overlay cloud — the main octree stays as context.
+// ===========================================================================
+
+let treeOverlayPoints = null;
+let treeOverlayItc = null;
+let treeContextHidden = [];
+
+// Open: dim the world to just the tree. Close: bring the context back.
+function hideTreeContext() {
+    showTreeContext();
+    viewer.scene.pointclouds.forEach(pc => {
+        if (pc.visible) { pc.visible = false; treeContextHidden.push(pc); }
+    });
+    if (typeof stagedVisuals !== 'undefined') {
+        stagedVisuals.forEach(group => {
+            if (group.visible) { group.visible = false; treeContextHidden.push(group); }
+        });
+    }
+}
+
+function showTreeContext() {
+    treeContextHidden.forEach(o => { o.visible = true; });
+    treeContextHidden = [];
+}
+
+function treeColorLUT(t) {
+    const s = Math.min(1, Math.max(0, t)) * (VIRIDIS16.length - 1);
+    const i = Math.floor(s);
+    const f = s - i;
+    const a = VIRIDIS16[i];
+    const b = VIRIDIS16[Math.min(VIRIDIS16.length - 1, i + 1)];
+    return [(a[0] + (b[0] - a[0]) * f) / 255, (a[1] + (b[1] - a[1]) * f) / 255, (a[2] + (b[2] - a[2]) * f) / 255];
+}
+
+let treeRawData = null;
+let treeColorMode = 'auto';
+let treePointSizeUser = 1.0;
+
+// ---- Tree bounding box + measurement (Forestry tab) ----
+let treeBBoxHelper = null;
+let treeBBoxLabel = null;
+let treeOverlayTargetBBox = null;   // world-space {min,max} of the target tree
+window.treeBBoxEnabled = true;      // bounding box visible by default
+
+function treeTextSprite(text, scaleBase) {
+    let canvas = document.createElement('canvas');
+    let ctx = canvas.getContext('2d');
+    ctx.font = 'bold 72px sans-serif';
+    const w = Math.min(900, ctx.measureText(text).width + 44);
+    canvas = document.createElement('canvas');
+    canvas.width = Math.ceil(w); canvas.height = 110;
+    ctx = canvas.getContext('2d');
+    ctx.fillStyle = 'rgba(10,14,20,0.78)';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.font = 'bold 72px sans-serif';
+    ctx.fillStyle = '#ffd27f';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(text, 22, canvas.height / 2);
+    const tex = new THREE.CanvasTexture(canvas);
+    tex.minFilter = THREE.LinearFilter;
+    const mat = new THREE.SpriteMaterial({ map: tex, depthTest: false, transparent: true });
+    const sprite = new THREE.Sprite(mat);
+    const s = scaleBase || 1.4;
+    sprite.scale.set(s * (canvas.width / canvas.height), s, 1);
+    sprite.renderOrder = 30;
+    return sprite;
+}
+
+function showTreeBBox() {
+    if (treeBBoxHelper) {
+        viewer.scene.scene.remove(treeBBoxHelper);
+        treeBBoxHelper.geometry.dispose();
+        treeBBoxHelper.material.dispose();
+        treeBBoxHelper = null;
+    }
+    if (treeBBoxLabel) {
+        viewer.scene.scene.remove(treeBBoxLabel);
+        treeBBoxLabel.material.map.dispose();
+        treeBBoxLabel.material.dispose();
+        treeBBoxLabel = null;
+    }
+    if (!treeOverlayTargetBBox || window.treeBBoxEnabled === false) {
+        viewer.render();
+        return;
+    }
+    const b = treeOverlayTargetBBox;
+    const box = new THREE.Box3(new THREE.Vector3(...b.min), new THREE.Vector3(...b.max));
+    treeBBoxHelper = new THREE.Box3Helper(box, new THREE.Color(0xffaa33));
+    treeBBoxHelper.renderOrder = 29;
+    treeBBoxHelper.frustumCulled = false;
+    viewer.scene.scene.add(treeBBoxHelper);
+
+    const h = b.max[2] - b.min[2];
+    treeBBoxLabel = treeTextSprite(`H ${h.toFixed(2)} m`, Math.min(0.8, Math.max(0.25, h * 0.04)));
+    treeBBoxLabel.position.set(b.min[0], b.min[1], b.max[2]);
+    viewer.scene.scene.add(treeBBoxLabel);
+    viewer.render();
+}
+
+window.setTreeBBox = function (visible) {
+    window.treeBBoxEnabled = visible !== false;
+    showTreeBBox();
+};
+
+// ---- Measure: click points on the tree, 3D distances shown in metres ----
+let measureOn = false;
+let measurePts = [];
+let measureObjs = [];
+let measureDownXY = null;
+
+function clearMeasure() {
+    measureObjs.forEach(o => {
+        viewer.scene.scene.remove(o);
+        if (o.geometry) o.geometry.dispose();
+        if (o.material) {
+            if (o.material.map) o.material.map.dispose();
+            o.material.dispose();
+        }
+    });
+    measureObjs = [];
+    measurePts = [];
+    viewer.render();
+}
+
+window.setTreeMeasure = function (on) {
+    measureOn = !!on;
+    if (!measureOn) return;
+    const canvas = document.getElementById('potree_render_area').querySelector('canvas')
+                   || viewer.canvas || document.querySelector('canvas');
+    if (!canvas || canvas.dataset.treeMeasure) return;
+    canvas.dataset.treeMeasure = '1';
+
+    canvas.addEventListener('mousedown', (e) => { measureDownXY = [e.clientX, e.clientY]; });
+    canvas.addEventListener('click', (e) => {
+        if (!measureOn) return;
+        if (measureDownXY) {
+            const dx = e.clientX - measureDownXY[0], dy = e.clientY - measureDownXY[1];
+            if (dx * dx + dy * dy > 36) return;   // drag, not click
+        }
+        if (!treeOverlayPoints || !treeOverlayPoints.visible) return;
+        const rect = canvas.getBoundingClientRect();
+        const ndc = new THREE.Vector2(
+            ((e.clientX - rect.left) / rect.width) * 2 - 1,
+            -((e.clientY - rect.top) / rect.height) * 2 + 1);
+        const ray = new THREE.Raycaster();
+        ray.params.Points.threshold = 0.15;
+        ray.setFromCamera(ndc, viewer.scene.camera);
+        const hits = ray.intersectObject(treeOverlayPoints, false);
+        if (!hits.length) return;
+        const p = hits[0].point.clone();
+        p.applyMatrix4(treeOverlayPoints.matrixWorld);   // geometry is centroid-relative
+        addMeasurePoint(p);
+    });
+    canvas.addEventListener('dblclick', () => { if (measureOn) clearMeasure(); });
+};
+
+function addMeasurePoint(worldPoint) {
+    if (measurePts.length && worldPoint.distanceTo(measurePts[measurePts.length - 1]) < 0.01) return;
+    measurePts.push(worldPoint.clone());
+
+    const r = treeOverlayTargetBBox
+        ? Math.min(0.6, Math.max(0.12, (treeOverlayTargetBBox.max[2] - treeOverlayTargetBBox.min[2]) * 0.03))
+        : 0.15;
+    const marker = new THREE.Mesh(
+        new THREE.SphereGeometry(r, 12, 12),
+        new THREE.MeshBasicMaterial({ color: 0xff5533, depthTest: false, transparent: true, opacity: 0.95 }));
+    marker.position.copy(worldPoint);
+    marker.renderOrder = 30;
+    viewer.scene.scene.add(marker);
+    measureObjs.push(marker);
+
+    if (measurePts.length > 1) {
+        const a = measurePts[measurePts.length - 2];
+        const b = worldPoint;
+        const lineGeo = new THREE.BufferGeometry().setFromPoints([a, b]);
+        const line = new THREE.Line(lineGeo,
+            new THREE.LineBasicMaterial({ color: 0xffdd55, depthTest: false, transparent: true, opacity: 0.95 }));
+        line.renderOrder = 30;
+        viewer.scene.scene.add(line);
+        measureObjs.push(line);
+
+        const d3 = a.distanceTo(b);
+        const dh = Math.hypot(b.x - a.x, b.y - a.y);
+        const label = treeTextSprite(`d ${d3.toFixed(2)} m  (h ${dh.toFixed(2)})`, 1.1);
+        label.position.copy(a).add(b).multiplyScalar(0.5);
+        viewer.scene.scene.add(label);
+        measureObjs.push(label);
+    }
+    viewer.render();
+}
+// ---- end bounding box + measurement ----
+
+// Neighbor Stand Filter State (Exclusive to Forestry Tab)
+let treeFilterActive = false;
+let treeFilterMode = false;
+let treeFilterSelectedIds = new Set();
+let treeActiveFilteredData = null;
+
+function getStandTreeList() {
+    if (!treeRawData) return [];
+    const { count, targetCount, neighborCount, scalars } = treeRawData;
+    const tidArr = scalars ? (scalars.itc || scalars.tree_id || scalars.treeID) : null;
+
+    const treeCounts = new Map();
+    // Target tree points:
+    treeCounts.set(treeOverlayItc, targetCount);
+
+    // Neighbor points:
+    if (tidArr && neighborCount > 0) {
+        for (let i = targetCount; i < count; i++) {
+            const tid = Math.round(tidArr[i]);
+            treeCounts.set(tid, (treeCounts.get(tid) || 0) + 1);
+        }
+    } else if (neighborCount > 0) {
+        treeCounts.set(0, neighborCount);
+    }
+
+    const list = [];
+    for (const [tid, ptCount] of treeCounts.entries()) {
+        list.push({
+            id: tid,
+            isTarget: tid === treeOverlayItc,
+            count: ptCount
+        });
+    }
+    list.sort((a, b) => {
+        if (a.isTarget) return -1;
+        if (b.isTarget) return 1;
+        if (a.id <= 0) return 1;
+        if (b.id <= 0) return -1;
+        return b.count - a.count;
+    });
+    return list;
+}
+
+window.getStandTrees = getStandTreeList;
+
+window.setTreeFilterMode = function (enabled) {
+    treeFilterMode = !!enabled;
+    // Entering filter mode starts from a clean slate: every tree unselected
+    if (treeFilterMode) treeFilterSelectedIds = new Set();
+    if (renderArea) {
+        renderArea.style.cursor = treeFilterMode ? 'pointer' : 'default';
+    }
+    updateStandFilterHud();
+    updateTreeColors();
+    showToast(treeFilterMode ? 'Filter Mode ON: Click trees in 3D to select/deselect them' : 'Filter Mode OFF');
+};
+
+window.isTreeFilterMode = function () {
+    return treeFilterMode;
+};
+
+window.setTreeFilterSelection = function (treeIds) {
+    treeFilterSelectedIds = new Set((treeIds || []).map(Number));
+    updateStandFilterHud();
+    updateTreeColors();
+};
+
+window.toggleTreeFilterId = function (tid) {
+    const num = Number(tid);
+    if (treeFilterSelectedIds.has(num)) {
+        treeFilterSelectedIds.delete(num);
+    } else {
+        treeFilterSelectedIds.add(num);
+    }
+    updateStandFilterHud();
+    updateTreeColors();
+    postJSON('/api/event', {
+        event: 'tree_filter_selection_changed',
+        selected_ids: Array.from(treeFilterSelectedIds),
+        toggled_id: num,
+        is_selected: treeFilterSelectedIds.has(num)
+    }).catch(() => {});
+
+    const label = num === 0 ? 'Canopy / Ground' : `Tree #${num}`;
+    showToast(`${label} ${treeFilterSelectedIds.has(num) ? 'selected' : 'deselected'} (${treeFilterSelectedIds.size} trees selected for filter)`);
+};
+
+function pickTreeInStand(e) {
+    if (!treeOverlayPoints || !treeRawData) return;
+    const rect = renderArea.getBoundingClientRect();
+    const clickX = e.clientX - rect.left;
+    const clickY = e.clientY - rect.top;
+    const camera = viewer.scene.getActiveCamera();
+    if (!camera) return;
+
+    const mouse = new THREE.Vector2(
+        (clickX / rect.width) * 2 - 1,
+        -(clickY / rect.height) * 2 + 1
+    );
+    const raycaster = new THREE.Raycaster();
+    const ptSize = getTreePointSize();
+    raycaster.params.Points.threshold = Math.max(0.35, ptSize * 0.45);
+    raycaster.setFromCamera(mouse, camera);
+    const intersects = raycaster.intersectObject(treeOverlayPoints);
+    if (intersects && intersects.length > 0) {
+        // Project all candidates to screen coordinates to find the point closest to the mouse cursor
+        let bestCandidate = null;
+        let minScreenDist = Infinity;
+
+        for (const hit of intersects) {
+            const ndc = hit.point.clone().project(camera);
+            const px = ((ndc.x + 1) / 2) * rect.width;
+            const py = ((-ndc.y + 1) / 2) * rect.height;
+            const sDist = Math.hypot(px - clickX, py - clickY);
+
+            // Favor hit closest to cursor on screen. If two hits are within 2.5px, pick the one closer to the ray.
+            if (sDist < minScreenDist - 2.5 ||
+                (Math.abs(sDist - minScreenDist) <= 2.5 && hit.distanceToRay < (bestCandidate ? bestCandidate.hit.distanceToRay : Infinity))) {
+                minScreenDist = sDist;
+                bestCandidate = { hit, sDist };
+            }
+        }
+
+        if (bestCandidate && minScreenDist <= 32) {
+            const hitIdx = bestCandidate.hit.index;
+            const activeData = treeActiveFilteredData || treeRawData;
+            const tidArr = activeData.scalars ? (activeData.scalars.itc || activeData.scalars.tree_id || activeData.scalars.treeID) : null;
+            let hitTid = 0;
+            if (hitIdx < activeData.targetCount) {
+                hitTid = treeOverlayItc;
+            } else if (tidArr) {
+                hitTid = Math.round(tidArr[hitIdx]);
+            }
+            window.toggleTreeFilterId(hitTid);
+        } else {
+            showToast('No tree point hit under cursor');
+        }
+    } else {
+        showToast('No tree point hit under cursor');
+    }
+}
+
+function zoomToTreeAt(e) {
+    if (!treeOverlayPoints || !treeOverlayPoints.visible || !viewer.scene || !viewer.scene.view) return;
+    const rect = renderArea.getBoundingClientRect();
+    const clickX = e.clientX - rect.left;
+    const clickY = e.clientY - rect.top;
+    const camera = viewer.scene.getActiveCamera();
+    if (!camera) return;
+
+    const mouse = new THREE.Vector2(
+        (clickX / rect.width) * 2 - 1,
+        -(clickY / rect.height) * 2 + 1
+    );
+
+    const raycaster = new THREE.Raycaster();
+    const ptSize = getTreePointSize();
+    raycaster.params.Points.threshold = Math.max(0.4, ptSize * 0.55);
+    raycaster.setFromCamera(mouse, camera);
+
+    const intersects = raycaster.intersectObject(treeOverlayPoints);
+    if (!intersects || intersects.length === 0) return;
+
+    let bestHit = null;
+    let minScreenDist = Infinity;
+    for (const hit of intersects) {
+        const ndc = hit.point.clone().project(camera);
+        const px = ((ndc.x + 1) / 2) * rect.width;
+        const py = ((-ndc.y + 1) / 2) * rect.height;
+        const sDist = Math.hypot(px - clickX, py - clickY);
+        if (sDist < minScreenDist) {
+            minScreenDist = sDist;
+            bestHit = hit;
+        }
+    }
+
+    if (!bestHit || minScreenDist > 40) return;
+
+    const targetPos = bestHit.point;
+    const view = viewer.scene.view;
+    const currentRadius = view.radius || 15.0;
+    const targetRadius = Math.max(1.5, Math.min(currentRadius * 0.4, 7.0));
+    const d = view.direction.clone().multiplyScalar(-targetRadius);
+    const endPosition = new THREE.Vector3().addVectors(targetPos, d);
+
+    const startPos = view.position.clone();
+    const startRadius = currentRadius;
+    const animationDuration = 500;
+
+    if (typeof TWEEN !== 'undefined') {
+        const tweenObj = { t: 0 };
+        const tween = new TWEEN.Tween(tweenObj)
+            .to({ t: 1 }, animationDuration)
+            .easing(TWEEN.Easing.Quartic.Out)
+            .onUpdate(() => {
+                const t = tweenObj.t;
+                view.position.lerpVectors(startPos, endPosition, t);
+                view.radius = (1 - t) * startRadius + t * targetRadius;
+                if (viewer.setMoveSpeed) viewer.setMoveSpeed(view.radius);
+                viewer.render();
+            })
+            .start();
+    } else {
+        view.position.copy(endPosition);
+        view.radius = targetRadius;
+        if (viewer.setMoveSpeed) viewer.setMoveSpeed(view.radius);
+        viewer.render();
+    }
+}
+
+window.applyTreeFilter = function (treeIds) {
+    if (!treeOverlayPoints || !treeRawData) return;
+    const allowed = new Set((treeIds ? treeIds : Array.from(treeFilterSelectedIds)).map(Number));
+    if (allowed.size === 0) {
+        showToast('Select at least one tree to keep.');
+        return;
+    }
+    treeFilterSelectedIds = allowed;
+    treeFilterActive = true;
+
+    const { count, targetCount, neighborCount, xyz, rgb, intensity, classification, scalars } = treeRawData;
+    const tidArr = scalars ? (scalars.itc || scalars.tree_id || scalars.treeID) : null;
+
+    const keepIndices = [];
+    for (let i = 0; i < count; i++) {
+        const tid = (i < targetCount) ? treeOverlayItc : (tidArr ? Math.round(tidArr[i]) : 0);
+        if (allowed.has(tid)) {
+            keepIndices.push(i);
+        }
+    }
+
+    if (keepIndices.length === 0) {
+        showToast('No points match the selected trees.');
+        return;
+    }
+
+    const filteredCount = keepIndices.length;
+    const newXyz = new Float32Array(filteredCount * 3);
+    for (let j = 0; j < filteredCount; j++) {
+        const src = keepIndices[j];
+        newXyz[j * 3] = xyz[src * 3];
+        newXyz[j * 3 + 1] = xyz[src * 3 + 1];
+        newXyz[j * 3 + 2] = xyz[src * 3 + 2];
+    }
+
+    const filteredScalars = {};
+    if (scalars) {
+        for (const [k, arr] of Object.entries(scalars)) {
+            const newArr = new Float32Array(filteredCount);
+            for (let j = 0; j < filteredCount; j++) {
+                newArr[j] = arr[keepIndices[j]];
+            }
+            filteredScalars[k] = newArr;
+        }
+    }
+
+    let filteredRgb = null;
+    if (rgb) {
+        filteredRgb = new Uint8Array(filteredCount * 3);
+        for (let j = 0; j < filteredCount; j++) {
+            const src = keepIndices[j];
+            filteredRgb[j * 3] = rgb[src * 3];
+            filteredRgb[j * 3 + 1] = rgb[src * 3 + 1];
+            filteredRgb[j * 3 + 2] = rgb[src * 3 + 2];
+        }
+    }
+
+    let filteredIntensity = null;
+    if (intensity) {
+        filteredIntensity = new Uint16Array(filteredCount);
+        for (let j = 0; j < filteredCount; j++) {
+            filteredIntensity[j] = intensity[keepIndices[j]];
+        }
+    }
+
+    let filteredClassification = null;
+    if (classification) {
+        filteredClassification = new Uint8Array(filteredCount);
+        for (let j = 0; j < filteredCount; j++) {
+            filteredClassification[j] = classification[keepIndices[j]];
+        }
+    }
+
+    const geom = treeOverlayPoints.geometry;
+    geom.setAttribute('position', new THREE.BufferAttribute(newXyz, 3));
+    geom.setAttribute('color', new THREE.BufferAttribute(new Float32Array(filteredCount * 3), 3));
+    geom.computeBoundingSphere();
+    geom.computeBoundingBox();
+
+    treeActiveFilteredData = {
+        count: filteredCount,
+        targetCount: keepIndices.filter(idx => idx < targetCount).length,
+        neighborCount: keepIndices.filter(idx => idx >= targetCount).length,
+        xyz: newXyz,
+        rgb: filteredRgb,
+        intensity: filteredIntensity,
+        classification: filteredClassification,
+        scalars: filteredScalars,
+        bboxMin: treeRawData.bboxMin,
+        bboxMax: treeRawData.bboxMax
+    };
+
+    treeOverlayPoints.frustumCulled = false;
+    updateTreeColors();
+    viewer.render();
+    updateStandFilterHud();
+    showToast(`Filter applied: keeping ${allowed.size} tree(s) (${filteredCount.toLocaleString()} pts)`);
+    postJSON('/api/event', {
+        event: 'tree_filter_applied',
+        filtered_count: filteredCount,
+        allowed_trees: Array.from(allowed)
+    }).catch(() => {});
+};
+
+window.resetTreeFilter = function () {
+    if (!treeOverlayPoints || !treeRawData) return;
+    treeFilterActive = false;
+    treeActiveFilteredData = null;
+    treeFilterSelectedIds = new Set(getStandTreeList().map(t => t.id));
+
+    const { count, xyz } = treeRawData;
+    const geom = treeOverlayPoints.geometry;
+    geom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(xyz), 3));
+    geom.setAttribute('color', new THREE.BufferAttribute(new Float32Array(count * 3), 3));
+    geom.computeBoundingSphere();
+    geom.computeBoundingBox();
+    treeOverlayPoints.frustumCulled = false;
+
+    updateTreeColors();
+    viewer.render();
+    updateStandFilterHud();
+    showToast(`Filter reset: all ${count.toLocaleString()} stand points restored`);
+    postJSON('/api/event', {
+        event: 'tree_filter_reset',
+        count: count
+    }).catch(() => {});
+};
+
+function updateStandFilterHud() {
+    // HUD moved to application top menu bar
+}
+
+function getTreePointSize() {
+    const userSize = (treePointSizeUser !== null && treePointSizeUser !== undefined)
+        ? treePointSizeUser
+        : (Number(viewerSettings.pointSize) || 1.0);
+    return Math.max(0.04, userSize * 0.08);
+}
+
+window.setTreePointSize = function (size) {
+    const val = Number(size);
+    if (!isNaN(val) && val > 0) {
+        treePointSizeUser = val;
+        if (treeOverlayPoints && treeOverlayPoints.material) {
+            treeOverlayPoints.material.size = getTreePointSize();
+            treeOverlayPoints.material.needsUpdate = true;
+            viewer.render();
+        }
+    }
+};
+
+window.setTreeColorMode = function (mode) {
+    treeColorMode = mode || 'auto';
+    updateTreeColors();
+};
+
+function getClassificationColor(cls) {
+    if (window.Potree && Potree.ClassificationScheme && Potree.ClassificationScheme.DEFAULT) {
+        const item = Potree.ClassificationScheme.DEFAULT[cls] || Potree.ClassificationScheme.DEFAULT.DEFAULT;
+        if (item && item.color) {
+            return [item.color[0], item.color[1], item.color[2]];
+        }
+    }
+    switch (Number(cls)) {
+        case 2: return [0.48, 0.27, 0.14]; // Ground (rich earthy brown)
+        case 3: return [0.0, 1.0, 0.0];    // Low veg (light green)
+        case 4: return [0.0, 0.8, 0.0];    // Medium veg (green)
+        case 5: return [0.0, 0.5, 0.0];    // High veg (dark forest green)
+        case 6: return [1.0, 0.66, 0.0];   // Building (orange)
+        case 7: return [1.0, 0.0, 0.0];    // Noise (red)
+        case 9: return [0.0, 0.4, 0.9];    // Water (blue)
+        default: return [0.5, 0.5, 0.5];
+    }
+}
+
+function elevationColorLUT(t) {
+    const clamped = Math.min(1.0, Math.max(0.0, t));
+    const h = (1.0 - clamped) * 0.66;
+    let r, g, b;
+    let i = Math.floor(h * 6);
+    let f = h * 6 - i;
+    let p = 0.95 * (1 - 0.9);
+    let q = 0.95 * (1 - 0.9 * f);
+    let tt = 0.95 * (1 - 0.9 * (1 - f));
+    switch (i % 6) {
+        case 0: r = 0.95; g = tt; b = p; break;
+        case 1: r = q; g = 0.95; b = p; break;
+        case 2: r = p; g = 0.95; b = tt; break;
+        case 3: r = p; g = q; b = 0.95; break;
+        case 4: r = tt; g = p; b = 0.95; break;
+        case 5: r = 0.95; g = p; b = q; break;
+    }
+    return [r, g, b];
+}
+
+function hslToRgb(h, s, l) {
+    let r, g, b;
+    if (s === 0) {
+        r = g = b = l;
+    } else {
+        const hue2rgb = (p, q, t) => {
+            let val = t;
+            if (val < 0) val += 1;
+            if (val > 1) val -= 1;
+            if (val < 1/6) return p + (q - p) * 6 * val;
+            if (val < 1/2) return q;
+            if (val < 2/3) return p + (q - p) * (2/3 - val) * 6;
+            return p;
+        };
+        const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+        const p = 2 * l - q;
+        r = hue2rgb(p, q, h + 1/3);
+        g = hue2rgb(p, q, h);
+        b = hue2rgb(p, q, h - 1/3);
+    }
+    return [r, g, b];
+}
+
+function getNeighborTreeColor(tid, isGround) {
+    if (isGround || tid <= 0) return [0.48, 0.27, 0.14]; // Rich earthy soil brown
+    // Golden ratio hue stepping over [45°, 375°] mod 360°, bypassing the brown band [15°-45°]
+    const t = ((tid * 0.61803398875) % 1.0 + 1.0) % 1.0;
+    const hue = ((45.0 + t * 330.0) % 360.0) / 360.0;
+    return hslToRgb(hue, 0.88, 0.54);
+}
+
+function updateTreeColors() {
+    if (!treeOverlayPoints || !treeRawData) return;
+    const activeData = treeActiveFilteredData || treeRawData;
+    const { count, targetCount, neighborCount, rgb, intensity, classification, xyz, bboxMin, bboxMax, scalars } = activeData;
+    const colorAttr = treeOverlayPoints.geometry.attributes.color;
+    if (!colorAttr) return;
+    const colors = colorAttr.array;
+
+    let mode = treeColorMode;
+    if (!mode || mode === 'auto') {
+        mode = viewerSettings.colorMode || 'rgba';
+    }
+
+    const normKey = (k) => String(k || '').toLowerCase().replace(/[\s_-]/g, '');
+    const nMode = normKey(mode);
+
+    // 1. Tree ID / ITC mode: color all trees (target tree and neighbor trees) by distinct Tree ID
+    const isTreeIdMode = ['itc', 'treeid', 'tree_id', 'trees', 'tree'].includes(nMode);
+    if (isTreeIdMode) {
+        const tCount = targetCount || (count - (neighborCount || 0));
+        const tidArr = scalars ? (scalars.itc || scalars.tree_id || scalars.treeID) : null;
+        for (let i = 0; i < count; i++) {
+            let tid = 0;
+            if (i < tCount) {
+                tid = treeOverlayItc || (tidArr ? Math.round(tidArr[i]) : 1);
+            } else {
+                tid = tidArr ? Math.round(tidArr[i]) : 0;
+            }
+            // Ground determination:
+            // Point is ground if ASPRS classification == 2 (in neighbor/ground disc) or outside trees
+            const isGround = (classification && classification[i] === 2 && (i >= tCount || tid <= 0)) || (i >= tCount && tid <= 0);
+            if (!isGround && tid <= 0) {
+                // Surrounding unsegmented canopy/vegetation (not ground, but has no discrete tree id):
+                // render lush vegetation green so it is never mistaken for brown ground!
+                colors[i * 3] = 0.18; colors[i * 3 + 1] = 0.65; colors[i * 3 + 2] = 0.28;
+            } else {
+                const c = getNeighborTreeColor(tid, isGround);
+                colors[i * 3] = c[0]; colors[i * 3 + 1] = c[1]; colors[i * 3 + 2] = c[2];
+            }
+        }
+    } else {
+        // 2. Extra scalar field matching (e.g. return number, tree_score, ndvi, gps-time, semantic_pred, etc.)
+        let matchedScalar = null;
+        let matchedScalarName = null;
+        if (scalars) {
+            for (const [sname, sarr] of Object.entries(scalars)) {
+                if (normKey(sname) === nMode) {
+                    matchedScalar = sarr;
+                    matchedScalarName = sname;
+                    break;
+                }
+            }
+        }
+
+        if (matchedScalar && !['elevation', 'height', 'classification', 'intensity', 'intensitygradient', 'green', 'viridis', 'rgba', 'rgb', 'color'].includes(nMode)) {
+            let lo = Infinity, hi = -Infinity;
+            let globalAttr = null;
+            if (currentPointCloud && currentPointCloud.getAttribute && matchedScalarName) {
+                globalAttr = currentPointCloud.getAttribute(matchedScalarName);
+            }
+            if (globalAttr && Array.isArray(globalAttr.range) && globalAttr.range.length >= 2 && Number.isFinite(globalAttr.range[0]) && Number.isFinite(globalAttr.range[1])) {
+                lo = globalAttr.range[0];
+                hi = globalAttr.range[1];
+            } else {
+                for (let i = 0; i < count; i++) {
+                    const v = matchedScalar[i];
+                    if (v < lo) lo = v;
+                    if (v > hi) hi = v;
+                }
+            }
+            const span = Math.max(0.0001, hi - lo);
+            for (let i = 0; i < count; i++) {
+                const t = Math.min(1.0, Math.max(0.0, (matchedScalar[i] - lo) / span));
+                const c = treeColorLUT(t);
+                colors[i * 3] = c[0]; colors[i * 3 + 1] = c[1]; colors[i * 3 + 2] = c[2];
+            }
+        } else if (nMode === 'classification') {
+            const clsArr = classification || (matchedScalar && nMode === 'classification' ? matchedScalar : null);
+            if (clsArr) {
+                for (let i = 0; i < count; i++) {
+                    const c = getClassificationColor(clsArr[i]);
+                    colors[i * 3] = c[0]; colors[i * 3 + 1] = c[1]; colors[i * 3 + 2] = c[2];
+                }
+            } else {
+                const zSpan = Math.max(0.1, bboxMax[2] - bboxMin[2]);
+                for (let i = 0; i < count; i++) {
+                    const t = Math.min(1.0, Math.max(0.0, (xyz[i * 3 + 2] - bboxMin[2]) / zSpan));
+                    colors[i * 3] = 0.10 + 0.14 * t;
+                    colors[i * 3 + 1] = 0.38 + 0.36 * t;
+                    colors[i * 3 + 2] = 0.12 + 0.16 * t;
+                }
+            }
+        } else if (nMode === 'intensity' || nMode === 'intensitygradient') {
+            const intArr = intensity || matchedScalar;
+            if (intArr) {
+                let lo = 65535, hi = 0;
+                for (let i = 0; i < count; i++) { const v = intArr[i]; if (v < lo) lo = v; if (v > hi) hi = v; }
+                const span = Math.max(1, hi - lo);
+                for (let i = 0; i < count; i++) {
+                    const v = Math.min(1.0, Math.max(0.0, (intArr[i] - lo) / span));
+                    colors[i * 3] = v; colors[i * 3 + 1] = v; colors[i * 3 + 2] = v;
+                }
+            } else {
+                const zSpan = Math.max(0.1, bboxMax[2] - bboxMin[2]);
+                for (let i = 0; i < count; i++) {
+                    const t = Math.min(1.0, Math.max(0.0, (xyz[i * 3 + 2] - bboxMin[2]) / zSpan));
+                    const c = elevationColorLUT(t);
+                    colors[i * 3] = c[0]; colors[i * 3 + 1] = c[1]; colors[i * 3 + 2] = c[2];
+                }
+            }
+        } else if (nMode === 'elevation' || nMode === 'height') {
+            const zSpan = Math.max(0.1, bboxMax[2] - bboxMin[2]);
+            for (let i = 0; i < count; i++) {
+                const t = Math.min(1.0, Math.max(0.0, (xyz[i * 3 + 2] - bboxMin[2]) / zSpan));
+                const c = elevationColorLUT(t);
+                colors[i * 3] = c[0]; colors[i * 3 + 1] = c[1]; colors[i * 3 + 2] = c[2];
+            }
+        } else if (nMode === 'green') {
+            const zSpan = Math.max(0.1, bboxMax[2] - bboxMin[2]);
+            for (let i = 0; i < count; i++) {
+                const t = Math.min(1.0, Math.max(0.0, (xyz[i * 3 + 2] - bboxMin[2]) / zSpan));
+                colors[i * 3] = 0.10 + 0.14 * t;
+                colors[i * 3 + 1] = 0.38 + 0.36 * t;
+                colors[i * 3 + 2] = 0.12 + 0.16 * t;
+            }
+        } else if (nMode === 'viridis') {
+            const zSpan = Math.max(0.1, bboxMax[2] - bboxMin[2]);
+            for (let i = 0; i < count; i++) {
+                const t = Math.min(1.0, Math.max(0.0, (xyz[i * 3 + 2] - bboxMin[2]) / zSpan));
+                const c = treeColorLUT(t);
+                colors[i * 3] = c[0]; colors[i * 3 + 1] = c[1]; colors[i * 3 + 2] = c[2];
+            }
+        } else if (['rgba', 'rgb', 'color'].includes(nMode) && rgb) {
+            for (let i = 0; i < count * 3; i++) {
+                colors[i] = rgb[i] / 255;
+            }
+        } else if (rgb) {
+            for (let i = 0; i < count * 3; i++) {
+                colors[i] = rgb[i] / 255;
+            }
+        } else if (classification) {
+            for (let i = 0; i < count; i++) {
+                const c = getClassificationColor(classification[i]);
+                colors[i * 3] = c[0]; colors[i * 3 + 1] = c[1]; colors[i * 3 + 2] = c[2];
+            }
+        } else {
+            const zSpan = Math.max(0.1, bboxMax[2] - bboxMin[2]);
+            for (let i = 0; i < count; i++) {
+                if (classification && classification[i] === 2) {
+                    colors[i * 3] = 0.48; colors[i * 3 + 1] = 0.27; colors[i * 3 + 2] = 0.14; // Rich earthy brown ground
+                } else {
+                    const t = Math.min(1.0, Math.max(0.0, (xyz[i * 3 + 2] - bboxMin[2]) / zSpan));
+                    colors[i * 3] = 0.10 + 0.14 * t;
+                    colors[i * 3 + 1] = 0.38 + 0.36 * t;
+                    colors[i * 3 + 2] = 0.12 + 0.16 * t;
+                }
+            }
+        }
+    }
+
+    // In Filter mode, dim trees that are not selected to keep:
+    if (treeFilterMode && treeRawData && treeRawData.neighborCount > 0) {
+        const tCount = targetCount || (count - (neighborCount || 0));
+        const tidArr = scalars ? (scalars.itc || scalars.tree_id || scalars.treeID) : null;
+        for (let i = 0; i < count; i++) {
+            let tid = 0;
+            if (i < tCount) {
+                tid = treeOverlayItc || (tidArr ? Math.round(tidArr[i]) : 1);
+            } else {
+                tid = tidArr ? Math.round(tidArr[i]) : 0;
+            }
+            if (!treeFilterSelectedIds.has(tid)) {
+                colors[i * 3] = colors[i * 3] * 0.18 + 0.04;
+                colors[i * 3 + 1] = colors[i * 3 + 1] * 0.18 + 0.04;
+                colors[i * 3 + 2] = colors[i * 3 + 2] * 0.18 + 0.04;
+            }
+        }
+    }
+
+    colorAttr.needsUpdate = true;
+    viewer.render();
+}
+
+window.showMainCloudContext = function () {
+    if (treeOverlayPoints) {
+        treeOverlayPoints.visible = false;
+    }
+    if (pickedPointMarker) pickedPointMarker.visible = true;
+    updateStandFilterHud();
+    showTreeContext();
+    viewer.render();
+};
+
+window.showTreeOverlayContext = function () {
+    if (inspectCard) inspectCard.style.display = 'none';
+    if (pickedPointMarker) pickedPointMarker.visible = false;
+
+    if (treeOverlayPoints) {
+        hideTreeContext();
+        treeOverlayPoints.visible = true;
+        updateTreeColors();
+        updateStandFilterHud();
+        viewer.render();
+    }
+};
+
+window.closeTreeOverlay = function () {
+    if (treeOverlayPoints) {
+        if (viewer.scene && viewer.scene.scene) {
+            viewer.scene.scene.remove(treeOverlayPoints);
+        }
+        treeOverlayPoints.geometry.dispose();
+        treeOverlayPoints.material.dispose();
+        treeOverlayPoints = null;
+        treeOverlayItc = null;
+        treeRawData = null;
+        treeActiveFilteredData = null;
+        treeFilterActive = false;
+        treeFilterMode = false;
+        treeFilterSelectedIds.clear();
+        treeOverlayTargetBBox = null;
+        showTreeBBox();
+        clearMeasure();
+    }
+    updateStandFilterHud();
+    if (inspectCard) inspectCard.style.display = 'none';
+    clearPickedPointHighlight();
+    showTreeContext();
+    showToast('Tree view closed — context layers restored');
+    viewer.render();
+};
+
+window.hideTreeOverlay = window.showMainCloudContext;
+
+const treeBufferCache = new Map();
+
+async function prefetchTree(itcValue, hintX, hintY) {
+    const num = Number(itcValue);
+    if (!num || num <= 0 || treeBufferCache.has(num)) return;
+    try {
+        const payload = { itc: num };
+        if (hintX !== undefined && hintX !== null) payload.x = Number(hintX);
+        if (hintY !== undefined && hintY !== null) payload.y = Number(hintY);
+        const res = await fetch('/api/get_tree', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+        if (res.ok) {
+            const buf = await res.arrayBuffer();
+            treeBufferCache.set(num, buf);
+            if (treeBufferCache.size > 80) {
+                const firstKey = treeBufferCache.keys().next().value;
+                treeBufferCache.delete(firstKey);
+            }
+        }
+    } catch (_) {}
+}
+window.prefetchTree = prefetchTree;
+
+window.viewTreeById = async function (itcValue, hintX, hintY, radius, neighborMode, groundRadius, endpoint) {
+    if (itcValue === null || itcValue === undefined) return;
+    const num = Number(itcValue);
+    if (!num || num <= 0) return;
+
+    if (inspectCard) inspectCard.style.display = 'none';
+    if (pickedPointMarker) pickedPointMarker.visible = false;
+
+    const radVal = Number(radius) || 0.0;
+    const nMode = neighborMode || 'trees_only';
+    const gRad = Number(groundRadius) || 0.0;
+    const ep = endpoint || '/api/get_tree';
+    const seg = ep.indexOf('segment') !== -1;
+    const cacheKey = `${num}_${radVal}_${nMode}_${gRad}_${seg ? 'seg' : 'itc'}`;
+
+    try {
+        let buf = treeBufferCache.get(cacheKey);
+        if (!buf) {
+            const label = radVal > 0 ? `Tree #${num} + neighbors (${radVal}m)` : `Tree #${num}`;
+            if (seg) {
+                showToast('ForestFormer3D: segmenting cloud (first run loads the model, ~15 s)...', 8000);
+            } else if (isIndexingActive) {
+                showToast(`Fetching ${label} via streaming fallback (background indexing in progress)...`, 3500);
+            } else {
+                showToast(`Fetching ${label} — querying full density...`);
+            }
+            const payload = { itc: num, radius: radVal, neighbor_mode: nMode };
+            if (gRad > 0) payload.ground_radius = gRad;
+            if (hintX !== undefined && hintX !== null) payload.x = Number(hintX);
+            if (hintY !== undefined && hintY !== null) payload.y = Number(hintY);
+
+            const res = await fetch(ep, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+            if (!res.ok) throw new Error(`${ep} -> HTTP ${res.status}`);
+            buf = await res.arrayBuffer();
+            treeBufferCache.set(cacheKey, buf);
+        }
+
+        const dv = new DataView(buf);
+        const count = dv.getUint32(8, true);
+        const flags = dv.getUint32(12, true);
+        const hasRgb = (flags & 1) !== 0;
+        const hasIntensity = (flags & 2) !== 0;
+        const hasClassification = (flags & 4) !== 0;
+        const hasScalars = (flags & 8) !== 0;
+        const cx = dv.getFloat64(16, true), cy = dv.getFloat64(24, true), cz = dv.getFloat64(32, true);
+        const bboxMin = [dv.getFloat32(40, true), dv.getFloat32(44, true), dv.getFloat32(48, true)];
+        const bboxMax = [dv.getFloat32(52, true), dv.getFloat32(56, true), dv.getFloat32(60, true)];
+
+        if (count === 0) {
+            showToast(`Tree #${itcValue}: no points found in master file`);
+            return;
+        }
+
+        let off = 64;
+        let scalarMeta = [];
+        let targetCount = count;
+        let neighborCount = 0;
+        let standRadius = radVal;
+        let ff3dTrees = 0;
+        let ff3dLas = null;
+        if (hasScalars) {
+            const metaLen = dv.getUint32(off, true);
+            off += 4;
+            const metaBytes = new Uint8Array(buf, off, metaLen);
+            const metaStr = new TextDecoder().decode(metaBytes);
+            try {
+                const parsed = JSON.parse(metaStr);
+                scalarMeta = parsed.scalars || [];
+                if (parsed.target_count !== undefined) targetCount = parsed.target_count;
+                if (parsed.neighbor_count !== undefined) neighborCount = parsed.neighbor_count;
+                if (parsed.radius !== undefined) standRadius = parsed.radius;
+                if (parsed.ff3d_trees !== undefined) ff3dTrees = parsed.ff3d_trees;
+                if (parsed.ff3d_las) ff3dLas = parsed.ff3d_las;
+            } catch (e) {
+                console.warn('Failed to parse tree scalar metadata:', e);
+            }
+            off += metaLen;
+            const padMeta = (4 - ((4 + metaLen) % 4)) % 4;
+            if (padMeta > 0) off += padMeta;
+        }
+
+        const xyz = new Float32Array(buf, off, count * 3);
+        off += count * 12;
+
+        let rgb = null, intensity = null, classification = null;
+        if (hasRgb) {
+            rgb = new Uint8Array(buf, off, count * 3);
+            off += count * 3;
+            if (off % 2 !== 0) off += 1; // alignment padding
+        }
+        if (hasIntensity) {
+            if (off % 2 !== 0) {
+                intensity = new Uint16Array(buf.slice(off, off + count * 2));
+            } else {
+                intensity = new Uint16Array(buf, off, count);
+            }
+            off += count * 2;
+        }
+        let totalBytes = 0;
+        if (hasClassification) {
+            classification = new Uint8Array(buf, off, count);
+            off += count;
+            totalBytes += count;
+        }
+
+        const scalars = {};
+        if (hasScalars && scalarMeta.length > 0) {
+            const padScalars = (4 - (totalBytes % 4)) % 4;
+            if (padScalars > 0) off += padScalars;
+            for (const sname of scalarMeta) {
+                let arr;
+                if (off % 4 !== 0) {
+                    arr = new Float32Array(buf.slice(off, off + count * 4));
+                } else {
+                    arr = new Float32Array(buf, off, count);
+                }
+                scalars[sname] = arr;
+                off += count * 4;
+            }
+        }
+
+        treeRawData = {
+            count,
+            targetCount,
+            neighborCount,
+            radius: standRadius,
+            xyz,
+            rgb,
+            intensity,
+            classification,
+            scalars,
+            cx, cy, cz,
+            bboxMin, bboxMax
+        };
+
+        // Hide octree context now that valid tree points have arrived
+        hideTreeContext();
+
+        if (treeOverlayPoints) {
+            if (viewer.scene && viewer.scene.scene) {
+                viewer.scene.scene.remove(treeOverlayPoints);
+            }
+            treeOverlayPoints.geometry.dispose();
+            treeOverlayPoints.material.dispose();
+            treeOverlayPoints = null;
+        }
+
+        const geom = new THREE.BufferGeometry();
+        geom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(count * 3), 3));
+        geom.setAttribute('color', new THREE.BufferAttribute(new Float32Array(count * 3), 3));
+
+        const posAttr = geom.attributes.position.array;
+        for (let i = 0; i < count * 3; i++) posAttr[i] = xyz[i];
+        geom.computeBoundingSphere();
+        geom.computeBoundingBox();
+
+        // Points material styled like Potree point clouds:
+        // - sizeAttenuation: true for 3D perspective
+        // - depthTest: true and depthWrite: true so foliage points properly occlude each other in 3D
+        // - onBeforeCompile shader discards fragments outside the circle and adds 3D spherical shading (EDL look)
+        const ptSize = getTreePointSize();
+
+        const mat = new THREE.PointsMaterial({
+            size: ptSize,
+            vertexColors: true,
+            sizeAttenuation: true,
+            depthTest: true,
+            depthWrite: true,
+            transparent: false
+        });
+
+        mat.onBeforeCompile = (shader) => {
+            shader.fragmentShader = shader.fragmentShader.replace(
+                '#include <color_fragment>',
+                `#include <color_fragment>
+                 vec2 coord = gl_PointCoord - vec2(0.5);
+                 float distSq = dot(coord, coord);
+                 if (distSq > 0.25) discard;
+                 float nz = sqrt(max(0.0, 0.25 - distSq)) * 2.0;
+                 diffuseColor.rgb *= clamp(0.55 + 0.45 * nz, 0.0, 1.0);
+                `
+            );
+        };
+
+        const points = new THREE.Points(geom, mat);
+        points.position.set(cx, cy, cz);   // geometry is centroid-relative
+        points.name = `tree_overlay_${itcValue}`;
+        points.renderOrder = 10;
+        points.frustumCulled = false;
+        viewer.scene.scene.add(points);
+        const isNewTree = treeOverlayItc !== itcValue;
+        treeOverlayPoints = points;
+        treeOverlayItc = itcValue;
+
+        updateTreeColors();
+
+        const standTrees = getStandTreeList();
+        treeFilterActive = false;
+        treeActiveFilteredData = null;
+        treeFilterSelectedIds = new Set();
+        updateStandFilterHud();
+
+        // Target-tree bbox (world): powers the bounding box + height label,
+        // and the fixed eye-level pose on tree change.
+        {
+            let fx0 = Infinity, fy0 = Infinity, fz0 = Infinity;
+            let fx1 = -Infinity, fy1 = -Infinity, fz1 = -Infinity;
+            const nT = Math.max(1, Math.min(targetCount, count));
+            for (let i = 0; i < nT * 3; i += 3) {
+                if (xyz[i] < fx0) fx0 = xyz[i];       if (xyz[i] > fx1) fx1 = xyz[i];
+                if (xyz[i+1] < fy0) fy0 = xyz[i+1];   if (xyz[i+1] > fy1) fy1 = xyz[i+1];
+                if (xyz[i+2] < fz0) fz0 = xyz[i+2];   if (xyz[i+2] > fz1) fz1 = xyz[i+2];
+            }
+            treeOverlayTargetBBox = {
+                min: [cx + fx0, cy + fy0, cz + fz0],
+                max: [cx + fx1, cy + fy1, cz + fz1]
+            };
+
+            if (isNewTree) {
+                const center = new THREE.Vector3(
+                    cx + (fx0 + fx1) / 2,
+                    cy + (fy0 + fy1) / 2,
+                    cz + (fz0 + fz1) / 2);
+                const radius = Math.max(fx1 - fx0, fy1 - fy0, fz1 - fz0, 4) * 0.5;
+                const fov = (viewer.getFOV ? viewer.getFOV() : 60) * Math.PI / 180;
+                const dist = (radius / Math.tan(fov * 0.5)) * 1.3;
+                viewer.scene.view.position.set(
+                    center.x,
+                    center.y - dist,
+                    center.z + dist * 0.35);
+                viewer.scene.view.lookAt(center);
+            }
+        }
+        showTreeBBox();
+
+        viewer.render();
+        const savedNote = ff3dLas ? ` · saved ${ff3dLas.split(/[\\/]/).pop()}` : '';
+        if (ff3dTrees > 1) {
+            showToast(`ForestFormer3D: ${ff3dTrees} trees found — colours show the split. Inspect, then Merge.${savedNote}`, 7000);
+        } else if (ff3dTrees === 1) {
+            showToast(`ForestFormer3D: 1 tree — the cloud is a single tree (no split).${savedNote}`, 6000);
+        } else if (isIndexingActive) {
+            showToast(`Tree #${itcValue} stand rendered via streaming fallback (background indexing continues)...`, 4000);
+        } else if (neighborCount > 0) {
+            showToast(`Tree #${itcValue} (${targetCount.toLocaleString()} pts) + ${neighborCount.toLocaleString()} neighbor pts (${standRadius}m stand)`);
+        } else {
+            showToast(`Tree #${itcValue} — ${count.toLocaleString()} pts (full density)`);
+        }
+
+        postJSON('/api/event', {
+            event: 'tree_loaded',
+            itc: itcValue,
+            count: count,
+            target_count: targetCount,
+            neighbor_count: neighborCount,
+            radius: standRadius,
+            trees: standTrees
+        }).catch(() => {});
+
+        if (neighborCount > 0) {
+            postJSON('/api/event', {
+                event: 'tree_stand_loaded',
+                target_itc: itcValue,
+                count: count,
+                target_count: targetCount,
+                neighbor_count: neighborCount,
+                radius: standRadius,
+                trees: standTrees
+            }).catch(() => {});
+        }
+    } catch (e) {
+        console.error('Tree view failed:', e);
+        showToast('Tree view failed: ' + e.message);
+        showTreeContext();
+    }
+};
+
+// Segment the displayed tree/stand with ForestFormer3D: the overlay rebuilds
+// coloured per detected instance (green = tree 1, 48-stop palette per tree).
+window.segmentTreeById = function (itcValue, hintX, hintY, radius, neighborMode, groundRadius) {
+    return window.viewTreeById(itcValue, hintX, hintY, radius, neighborMode, groundRadius,
+                               '/api/segment_tree');
+};
+
+window.currentTreeViewItc = function () {
+    return treeOverlayItc;
 };

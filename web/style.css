@@ -135,6 +135,44 @@ html, body {
     box-shadow: 0 4px 12px rgba(0,0,0,0.3);
 }
 
+/* Indexing Status HUD Badge */
+.indexing-badge {
+    position: absolute;
+    bottom: 24px;
+    left: 24px;
+    background: rgba(15, 23, 42, 0.92);
+    border: 1px solid #0284c7;
+    backdrop-filter: blur(8px);
+    color: #f0f9ff;
+    padding: 7px 12px;
+    border-radius: 6px;
+    font-size: 11px;
+    font-weight: 500;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+    z-index: 1000;
+    pointer-events: auto;
+    transition: opacity 0.3s ease, border-color 0.3s ease;
+}
+
+.indexing-mini-bar {
+    width: 50px;
+    height: 6px;
+    background: #1e293b;
+    border-radius: 3px;
+    overflow: hidden;
+    border: 1px solid #334155;
+}
+
+.indexing-mini-progress {
+    height: 100%;
+    width: 0%;
+    background: #38bdf8;
+    transition: width 0.2s ease;
+}
+
 /* Inspection Popover */
 .inspect-card {
     position: absolute;

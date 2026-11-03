@@ -419,11 +419,13 @@ def write_copc(src: Path, out: Path, chunk_size: int = 40_000, max_level: Option
         at += nbytes
     point_data_end = at
     # Prove the layout: the chunk table the file advertises must start exactly
-    # where the chunks end.  This is how the shipped sample is laid out too.
+    # where the chunks end. This is how the shipped sample is laid out too.
+    # Newer lazrs builds record the advertised offset after the 4-byte
+    # num_chunks field, i.e. data_end (laz-perf) or data_end + 4 (lazrs).
     with open(out, "rb") as fh:
         fh.seek(header_bytes)
         chunk_table_pos = struct.unpack("<q", fh.read(8))[0]
-    if chunk_table_pos != point_data_end:
+    if chunk_table_pos not in (point_data_end, point_data_end + 4):
         raise AssertionError(
             f"chunks cover {data_start:,}..{point_data_end:,} but the file says the LAZ "
             f"chunk table starts at {chunk_table_pos:,}")
