@@ -421,6 +421,33 @@ class PointCloudManager:
         self.las_data.add_extra_dim(laspy.ExtraBytesParams(name="itc", type=np.int32))
         self.las_data.itc[:] = default_val
 
+    def get_max_itc(self) -> int:
+        """Find the maximum ITC/tree-id in the current point cloud."""
+        if self.las_path:
+            chunk_idx_path = f"{self.las_path}.chunk_idx.json"
+            if os.path.exists(chunk_idx_path):
+                try:
+                    with open(chunk_idx_path, "r", encoding="utf-8") as f:
+                        chunks = json.load(f)
+                    return max(c.get("max_itc", 0) for c in chunks)
+                except Exception:
+                    pass
+            tree_idx_path = f"{self.las_path}.tree_idx.json"
+            if os.path.exists(tree_idx_path):
+                try:
+                    with open(tree_idx_path, "r", encoding="utf-8") as f:
+                        tdata = json.load(f)
+                    return max(int(k) for k in tdata.keys() if str(k).isdigit())
+                except Exception:
+                    pass
+        if self.las_data is not None:
+            extra_dims = [d.name for d in self.las_data.point_format.dimensions]
+            itc_name = next((n for n in ("itc", "treeID", "tree_id") if n in extra_dims), None)
+            if itc_name:
+                arr = np.asarray(getattr(self.las_data, itc_name))
+                return int(np.max(arr)) if len(arr) > 0 else 0
+        return 10000
+
     # -------------------------------------------------------------------------
     # Optimistic Visual Staging System
     # -------------------------------------------------------------------------
@@ -439,6 +466,8 @@ class PointCloudManager:
                 edit["color"] = "#ef4444"
             elif action == "assign_itc":
                 edit["color"] = "#10b981"
+            elif action == "ff3d_split":
+                edit["color"] = "#06b6d4"
             elif action == "set_classification":
                 edit["color"] = "#3b82f6"
             elif action == "delete":
@@ -449,6 +478,8 @@ class PointCloudManager:
         if "label" not in edit or not edit["label"]:
             if action == "assign_itc":
                 edit["label"] = f"Tree #{edit.get('value', 1)}"
+            elif action == "ff3d_split":
+                edit["label"] = f"FF3D Split Tree #{edit.get('target_itc', '?')}"
             elif action == "mark_noise":
                 edit["label"] = "Noise (7)"
             elif action == "set_classification":
@@ -574,6 +605,47 @@ class PointCloudManager:
                         "ry0": ry0, "ry1": ry1,
                         "rz0": rz0, "rz1": rz1,
                     })
+                elif etype == "ff3d_split" and "segmented_las" in edit and os.path.exists(edit["segmented_las"]):
+                    from scipy.spatial import cKDTree
+                    seg_data = laspy.read(edit["segmented_las"])
+                    seg_xyz = np.column_stack([
+                        np.asarray(seg_data.x, dtype=np.float64),
+                        np.asarray(seg_data.y, dtype=np.float64),
+                        np.asarray(seg_data.z, dtype=np.float64)
+                    ])
+                    extra_names = [d.name for d in seg_data.point_format.extra_dimensions]
+                    if "ff3d_tree_id" in extra_names:
+                        seg_tree_ids = np.asarray(seg_data.ff3d_tree_id, dtype=np.int32)
+                    elif "tree_id" in extra_names:
+                        seg_tree_ids = np.asarray(seg_data.tree_id, dtype=np.int32)
+                    else:
+                        seg_tree_ids = np.zeros(len(seg_data), dtype=np.int32)
+
+                    id_mapping = edit.get("id_mapping", {})
+                    mapped_itc = np.zeros(len(seg_data), dtype=np.int32)
+                    for raw_id, target_id in id_mapping.items():
+                        mapped_itc[seg_tree_ids == int(raw_id)] = int(target_id)
+
+                    min_x, max_x = float(np.min(seg_xyz[:, 0])), float(np.max(seg_xyz[:, 0]))
+                    min_y, max_y = float(np.min(seg_xyz[:, 1])), float(np.max(seg_xyz[:, 1]))
+                    min_z, max_z = float(np.min(seg_xyz[:, 2])), float(np.max(seg_xyz[:, 2]))
+                    rx0 = int(np.floor((min_x - ox) / sx))
+                    rx1 = int(np.ceil((max_x - ox) / sx))
+                    ry0 = int(np.floor((min_y - oy) / sy))
+                    ry1 = int(np.ceil((max_y - oy) / sy))
+                    rz0 = int(np.floor((min_z - oz) / sz))
+                    rz1 = int(np.ceil((max_z - oz) / sz))
+
+                    compiled_edits.append({
+                        "type": "ff3d_split",
+                        "edit": edit,
+                        "rx0": rx0, "rx1": rx1,
+                        "ry0": ry0, "ry1": ry1,
+                        "rz0": rz0, "rz1": rz1,
+                        "kdtree": cKDTree(seg_xyz),
+                        "mapped_itc": mapped_itc,
+                        "seg_tree_ids": seg_tree_ids
+                    })
 
             # Stream chunks from reader to writer
             total_modified = 0
@@ -611,6 +683,26 @@ class PointCloudManager:
                         if c_edit["type"] == "box":
                             bmask &= (work.Z >= c_edit["rz0"]) & (work.Z <= c_edit["rz1"])
                             matched = np.where(bmask)[0]
+                        elif c_edit["type"] == "ff3d_split":
+                            bmask &= (work.Z >= c_edit["rz0"]) & (work.Z <= c_edit["rz1"])
+                            cands = np.where(bmask)[0]
+                            if len(cands) > 0:
+                                cand_xyz = np.column_stack((work.X[cands] * sx + ox, work.Y[cands] * sy + oy, work.Z[cands] * sz + oz))
+                                dists, indices = c_edit["kdtree"].query(cand_xyz, distance_upper_bound=0.03)
+                                valid = dists < 0.03
+                                if valid.any():
+                                    cand_matched = cands[valid]
+                                    matched_seg_idx = indices[valid]
+                                    touched[cand_matched] = True
+
+                                    new_itcs = c_edit["mapped_itc"][matched_seg_idx]
+                                    for fld in itc_fields:
+                                        work[fld][cand_matched] = new_itcs
+
+                                    is_ground = (c_edit["seg_tree_ids"][matched_seg_idx] < 0) | (new_itcs == 0)
+                                    if is_ground.any() and "classification" in work.point_format.dimension_names:
+                                        work["classification"][cand_matched[is_ground]] = 2
+                            continue
                         else:
                             cands = np.where(bmask)[0]
                             matched = cands

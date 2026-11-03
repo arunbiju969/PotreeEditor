@@ -78,6 +78,91 @@ class CommitWorker(QThread):
             self.error.emit(str(e))
 
 
+class ConfirmSplitDialog(QDialog):
+    """Dialog to review and confirm individual Tree IDs when ForestFormer3D splits a tree."""
+    def __init__(self, parent, target_itc: int, n_trees: int, seg_las_path: str, max_itc: int):
+        super().__init__(parent)
+        self.setWindowTitle("Confirm ForestFormer3D Tree Split")
+        self.resize(460, 360)
+        self.target_itc = target_itc
+        self.n_trees = n_trees
+        self.seg_las_path = seg_las_path
+        self.max_itc = max_itc
+        self.id_spinners = []
+        self.action_choice = "cancel"
+        self.init_ui()
+
+    def init_ui(self):
+        v = QVBoxLayout(self)
+        v.setSpacing(12)
+
+        lbl_title = QLabel(f"<b>ForestFormer3D Split: Tree #{self.target_itc}</b>")
+        lbl_title.setStyleSheet("font-size: 13px; color: #10b981;")
+        v.addWidget(lbl_title)
+
+        lbl_desc = QLabel(
+            f"ForestFormer3D detected <b>{self.n_trees} individual trees</b> in this area.<br>"
+            "Assign Tree IDs below to update the master point cloud:"
+        )
+        lbl_desc.setStyleSheet("color: #cbd5e1; font-size: 11px;")
+        v.addWidget(lbl_desc)
+
+        grp = QGroupBox("Tree ID Assignments")
+        v_grp = QVBoxLayout(grp)
+        v_grp.setSpacing(8)
+
+        for i in range(self.n_trees):
+            h = QHBoxLayout()
+            lbl = QLabel(f"Tree {i + 1} (Cluster {i}):")
+            lbl.setStyleSheet("font-weight: 600; color: #f8fafc;")
+            spin = QSpinBox()
+            spin.setRange(1, 9999999)
+            if i == 0:
+                spin.setValue(self.target_itc)
+            else:
+                spin.setValue(self.max_itc + i)
+            spin.setStyleSheet("padding: 4px 8px; font-size: 12px;")
+            self.id_spinners.append(spin)
+            h.addWidget(lbl)
+            h.addWidget(spin)
+            v_grp.addLayout(h)
+
+        lbl_ground = QLabel("• Surrounding non-tree points will be classified as Ground (Class 2, ITC 0)")
+        lbl_ground.setStyleSheet("color: #94a3b8; font-size: 10px; font-style: italic;")
+        v_grp.addWidget(lbl_ground)
+
+        v.addWidget(grp)
+
+        h_btns = QHBoxLayout()
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.setStyleSheet("padding: 6px 14px;")
+        btn_cancel.clicked.connect(self.reject)
+
+        self.btn_stage = QPushButton("Stage Edits Only")
+        self.btn_stage.setStyleSheet("padding: 6px 14px; background-color: #0284c7; color: white; font-weight: 600; border-radius: 4px;")
+        self.btn_stage.clicked.connect(lambda: self._finish("stage"))
+
+        self.btn_commit = QPushButton("Stage & Commit Now...")
+        self.btn_commit.setStyleSheet("padding: 6px 14px; background-color: #059669; color: white; font-weight: 700; border-radius: 4px;")
+        self.btn_commit.clicked.connect(lambda: self._finish("commit"))
+
+        h_btns.addWidget(btn_cancel)
+        h_btns.addStretch()
+        h_btns.addWidget(self.btn_stage)
+        h_btns.addWidget(self.btn_commit)
+        v.addLayout(h_btns)
+
+    def _finish(self, choice: str):
+        self.action_choice = choice
+        self.accept()
+
+    def get_id_mapping(self) -> dict:
+        mapping = {}
+        for i, spin in enumerate(self.id_spinners):
+            mapping[i] = spin.value()
+        return mapping
+
+
 class MainWindow(QMainWindow):
     def __init__(self, server: HybridServer, manager: PointCloudManager, potree_dir: str,
                  initial_path: Optional[str] = None):
@@ -1207,6 +1292,31 @@ class MainWindow(QMainWindow):
         self.btn_segment_tree.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_segment_tree.clicked.connect(self.segment_tree_action)
         v_tree.addWidget(self.btn_segment_tree)
+
+        # Confirm & Stage Split Edits Button
+        self.btn_confirm_segmentation = QPushButton("Confirm & Stage Split Edits")
+        self.btn_confirm_segmentation.setObjectName("btnSuccess")
+        self.btn_confirm_segmentation.setStyleSheet("""
+            QPushButton {
+                padding: 6px 10px;
+                font-size: 11px;
+                font-weight: 700;
+                background-color: #059669;
+                color: #ffffff;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #10b981;
+            }
+            QPushButton:disabled {
+                background-color: #334155;
+                color: #64748b;
+            }
+        """)
+        self.btn_confirm_segmentation.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_confirm_segmentation.setEnabled(False)
+        self.btn_confirm_segmentation.clicked.connect(self.confirm_segmentation_action)
+        v_tree.addWidget(self.btn_confirm_segmentation)
 
         btn_close_tree = QPushButton("Close Tree View & Back to Layers")
         btn_close_tree.setObjectName("btnSecondary")
@@ -2504,6 +2614,53 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Extract Tree Stand",
                                     "No points found for the current tree view / filter.")
 
+    def confirm_segmentation_action(self):
+        """Review and confirm ForestFormer3D tree split, staging or committing edits to the point cloud."""
+        data = getattr(self, "_last_segmented_data", None)
+        if not data or not data.get("ff3d_las"):
+            QMessageBox.warning(self, "No Segmentation Data", "Please run 'Segment (ForestFormer3D)' on a tree first.")
+            return
+
+        itc = int(data.get("itc", 0))
+        n_trees = int(data.get("ff3d_trees", 0))
+        seg_las = str(data.get("ff3d_las", ""))
+        max_itc = self.manager.get_max_itc()
+
+        dlg = ConfirmSplitDialog(self, itc, n_trees, seg_las, max_itc)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        id_map = dlg.get_id_mapping()
+        # Stage the edit in PointCloudManager
+        staged_edit = {
+            "type": "ff3d_split",
+            "action": "ff3d_split",
+            "target_itc": itc,
+            "segmented_las": seg_las,
+            "id_mapping": id_map,
+            "label": f"FF3D Split Tree #{itc} -> {list(id_map.values())}",
+            "color": "#06b6d4"
+        }
+        self.manager.add_staged_edit(staged_edit)
+        self.refresh_staged_edits_table()
+
+        if hasattr(self, "btn_confirm_segmentation"):
+            self.btn_confirm_segmentation.setEnabled(False)
+
+        self.status_bar.showMessage(f"Staged ForestFormer3D split for Tree #{itc} -> IDs {list(id_map.values())}", 8000)
+
+        if dlg.action_choice == "commit":
+            self.commit_staged_edits_action()
+        else:
+            QMessageBox.information(
+                self,
+                "Split Staged",
+                f"ForestFormer3D split for Tree #{itc} has been staged successfully!\n\n"
+                f"Assigned Tree IDs: {list(id_map.values())}\n\n"
+                "You can see it in the 'Staged Trees & Edits' list on the Layers tab.\n"
+                "When ready, click 'Commit & Save to LAS/LAZ...' (or Ctrl+Shift+S) to write the updated point cloud."
+            )
+
     def on_tree_loaded(self, data: dict):
         itc = data.get("itc")
         t_cnt = data.get("target_count", 0)
@@ -2511,6 +2668,29 @@ class MainWindow(QMainWindow):
         rad = data.get("radius", 0.0)
         is_indexing = getattr(self.manager, "_is_indexing", False)
         fallback_notice = " via streaming fallback (indexing in background)" if is_indexing else ""
+
+        ff3d_trees = int(data.get("ff3d_trees", 0))
+        ff3d_las = data.get("ff3d_las")
+        is_segmented = bool(data.get("is_segmented")) or (ff3d_trees > 0)
+
+        if is_segmented and ff3d_trees > 0:
+            self._last_segmented_data = data
+            if hasattr(self, "btn_confirm_segmentation"):
+                self.btn_confirm_segmentation.setEnabled(True)
+                self.btn_confirm_segmentation.setText(f"Confirm & Stage Split ({ff3d_trees} Trees)")
+            if hasattr(self, "combo_tree_color"):
+                t_idx = self.combo_tree_color.findData("itc")
+                if t_idx >= 0:
+                    self.combo_tree_color.blockSignals(True)
+                    self.combo_tree_color.setCurrentIndex(t_idx)
+                    self.combo_tree_color.blockSignals(False)
+            if hasattr(self, "lbl_tree_view_status"):
+                self.lbl_tree_view_status.setText(
+                    f"ForestFormer3D: {ff3d_trees} trees detected for Tree #{itc} · Click 'Confirm & Stage Split' to apply"
+                )
+        elif hasattr(self, "btn_confirm_segmentation") and not is_segmented:
+            self.btn_confirm_segmentation.setEnabled(False)
+            self.btn_confirm_segmentation.setText("Confirm & Stage Split Edits")
 
         # A full-density tree/stand is on screen: the Extract action can re-query it
         if itc is not None:

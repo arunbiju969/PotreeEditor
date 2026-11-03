@@ -2365,13 +2365,13 @@ function updateTreeColors() {
         for (let i = 0; i < count; i++) {
             let tid = 0;
             if (i < tCount) {
-                tid = treeOverlayItc || (tidArr ? Math.round(tidArr[i]) : 1);
+                tid = (tidArr ? Math.round(tidArr[i]) : treeOverlayItc) || 1;
             } else {
                 tid = tidArr ? Math.round(tidArr[i]) : 0;
             }
             // Ground determination:
-            // Point is ground if ASPRS classification == 2 (in neighbor/ground disc) or outside trees
-            const isGround = (classification && classification[i] === 2 && (i >= tCount || tid <= 0)) || (i >= tCount && tid <= 0);
+            // Point is ground if ASPRS classification == 2 or tid <= 0 (unassigned / ground from FF3D)
+            const isGround = (classification && classification[i] === 2) || (tid <= 0);
             if (!isGround && tid <= 0) {
                 // Surrounding unsegmented canopy/vegetation (not ground, but has no discrete tree id):
                 // render lush vegetation green so it is never mistaken for brown ground!
@@ -2508,7 +2508,7 @@ function updateTreeColors() {
         for (let i = 0; i < count; i++) {
             let tid = 0;
             if (i < tCount) {
-                tid = treeOverlayItc || (tidArr ? Math.round(tidArr[i]) : 1);
+                tid = (tidArr ? Math.round(tidArr[i]) : treeOverlayItc) || 1;
             } else {
                 tid = tidArr ? Math.round(tidArr[i]) : 0;
             }
@@ -2799,6 +2799,10 @@ window.viewTreeById = async function (itcValue, hintX, hintY, radius, neighborMo
         treeOverlayPoints = points;
         treeOverlayItc = itcValue;
 
+        if (seg) {
+            treeColorMode = 'itc';
+        }
+
         updateTreeColors();
 
         const standTrees = getStandTreeList();
@@ -2861,7 +2865,10 @@ window.viewTreeById = async function (itcValue, hintX, hintY, radius, neighborMo
             target_count: targetCount,
             neighbor_count: neighborCount,
             radius: standRadius,
-            trees: standTrees
+            trees: standTrees,
+            ff3d_trees: ff3dTrees,
+            ff3d_las: ff3dLas,
+            is_segmented: seg
         }).catch(() => {});
 
         if (neighborCount > 0) {
