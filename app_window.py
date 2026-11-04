@@ -171,6 +171,169 @@ class ConfirmSplitDialog(QDialog):
         return mapping
 
 
+class EditHistoryDialog(QDialog):
+    """Dialog to review logged edits and revert/undo changes in the active dataset."""
+
+    def __init__(self, parent, settings_store: SettingsStore, potree_dir: Optional[str] = None):
+        super().__init__(parent)
+        self.setWindowTitle("Edit History & Undo / Revert")
+        self.resize(820, 500)
+        self.settings_store = settings_store
+        self.potree_dir = potree_dir
+        self.selected_edit = None
+        self.edits = []
+        self.init_ui()
+        self.load_history()
+
+    def init_ui(self):
+        v = QVBoxLayout(self)
+        v.setSpacing(10)
+
+        lbl_title = QLabel("<b>Point Cloud Edit History (Database Log)</b>")
+        lbl_title.setStyleSheet("font-size: 14px; color: #10b981;")
+        v.addWidget(lbl_title)
+
+        lbl_desc = QLabel(
+            "Below is the persistent log of all tree splits and octree edits recorded in <code>settings.db</code>.<br>"
+            "You can review previous actions and revert any committed split in-place."
+        )
+        lbl_desc.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        v.addWidget(lbl_desc)
+
+        self.table = QTableWidget()
+        self.table.setColumnCount(7)
+        self.table.setHorizontalHeaderLabels([
+            "ID", "Timestamp", "Type", "Target Tree", "Assigned IDs", "Points Changed", "Status"
+        ])
+        self.table.horizontalHeader().setStretchLastSection(False)
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.itemSelectionChanged.connect(self._on_row_selected)
+        v.addWidget(self.table)
+
+        self.lbl_details = QLabel("Select an edit above to view details.")
+        self.lbl_details.setStyleSheet("font-size: 11px; color: #cbd5e1; background-color: #1e293b; padding: 8px; border-radius: 4px;")
+        self.lbl_details.setWordWrap(True)
+        v.addWidget(self.lbl_details)
+
+        h_btns = QHBoxLayout()
+        self.btn_refresh = QPushButton("Refresh")
+        self.btn_refresh.clicked.connect(self.load_history)
+        h_btns.addWidget(self.btn_refresh)
+
+        h_btns.addStretch()
+
+        self.btn_revert = QPushButton("Revert Selected Edit in Octree")
+        self.btn_revert.setStyleSheet("padding: 6px 14px; background-color: #dc2626; color: white; font-weight: 700; border-radius: 4px;")
+        self.btn_revert.setEnabled(False)
+        self.btn_revert.clicked.connect(self._revert_selected)
+        h_btns.addWidget(self.btn_revert)
+
+        btn_close = QPushButton("Close")
+        btn_close.clicked.connect(self.accept)
+        h_btns.addWidget(btn_close)
+
+        v.addLayout(h_btns)
+
+    def load_history(self):
+        self.edits = self.settings_store.get_edit_history(self.potree_dir)
+        self.table.setRowCount(len(self.edits))
+        for row, rec in enumerate(self.edits):
+            self.table.setItem(row, 0, QTableWidgetItem(f"#{rec.get('id')}"))
+            self.table.setItem(row, 1, QTableWidgetItem(str(rec.get("timestamp", ""))[:19]))
+            self.table.setItem(row, 2, QTableWidgetItem(str(rec.get("edit_type", ""))))
+            self.table.setItem(row, 3, QTableWidgetItem(f"Tree #{rec.get('target_itc')}" if rec.get("target_itc") else "-"))
+            assigned = rec.get("assigned_itcs", [])
+            self.table.setItem(row, 4, QTableWidgetItem(str(assigned)))
+            pts = rec.get("points_affected", 0)
+            self.table.setItem(row, 5, QTableWidgetItem(f"{pts:,}"))
+
+            status = rec.get("status", "committed")
+            item_status = QTableWidgetItem(status.capitalize())
+            if status == "committed":
+                item_status.setForeground(QColor("#10b981"))
+            else:
+                item_status.setForeground(QColor("#94a3b8"))
+            self.table.setItem(row, 6, item_status)
+
+        self.btn_revert.setEnabled(False)
+        self.lbl_details.setText(f"Loaded {len(self.edits)} edit records from database.")
+
+    def _on_row_selected(self):
+        rows = self.table.selectedIndexes()
+        if not rows:
+            self.btn_revert.setEnabled(False)
+            return
+        row = rows[0].row()
+        if 0 <= row < len(self.edits):
+            rec = self.edits[row]
+            self.selected_edit = rec
+            status = rec.get("status", "committed")
+            self.btn_revert.setEnabled(status == "committed")
+            seg_path = rec.get("segmented_las_path", "")
+            self.lbl_details.setText(
+                f"<b>Edit #{rec.get('id')}</b> | Timestamp: {rec.get('timestamp')}<br>"
+                f"• Target Tree: #{rec.get('target_itc')} &rarr; Assigned IDs: {rec.get('assigned_itcs')}<br>"
+                f"• Points Changed: {rec.get('points_affected', 0):,} | Status: <b>{status}</b><br>"
+                f"• Segmented LAS: <code>{os.path.basename(seg_path) if seg_path else 'None'}</code>"
+            )
+
+    def _revert_selected(self):
+        if not self.selected_edit:
+            return
+        rec = self.selected_edit
+        edit_id = rec.get("id")
+        target_itc = rec.get("target_itc")
+        reply = QMessageBox.question(
+            self,
+            "Confirm Revert",
+            f"Are you sure you want to revert Edit #{edit_id} (Tree #{target_itc})?\n\n"
+            f"This will restore Tree #{target_itc} points in the octree in-place and mark this edit as reverted.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        parent = self.parent()
+        potree_dir = self.potree_dir or getattr(parent, "current_potree_dir", None)
+        if not potree_dir or not os.path.isdir(potree_dir):
+            QMessageBox.warning(self, "No Octree", "No active Potree octree folder loaded to revert.")
+            return
+
+        try:
+            res = parent.manager.revert_potree_octree(potree_dir, rec)
+            rev_pts = res.get("reverted_points", 0)
+            self.settings_store.mark_edit_reverted(edit_id)
+
+            # Remove from staged edits if currently present
+            parent.manager.staged_edits = [
+                e for e in parent.manager.staged_edits
+                if e.get("db_edit_id") != edit_id and e.get("target_itc") != target_itc
+            ]
+            parent.refresh_staged_edits_table()
+            parent._run_js("window.reloadCurrentPointCloud();")
+
+            QMessageBox.information(
+                self,
+                "Revert Complete",
+                f"Successfully reverted Edit #{edit_id} in-place!\n\n"
+                f"• Tree #{target_itc} restored ({rev_pts:,} points updated).\n"
+                f"• Octree reloaded in viewer."
+            )
+            self.load_history()
+        except Exception as e:
+            QMessageBox.critical(self, "Revert Failed", f"Failed to revert edit in octree:\n\n{e}")
+
+
 class MainWindow(QMainWindow):
     def __init__(self, server: HybridServer, manager: PointCloudManager, potree_dir: str,
                  initial_path: Optional[str] = None):
@@ -189,8 +352,9 @@ class MainWindow(QMainWindow):
         self._tool_buttons: dict = {}
 
         # Persisted settings (SQLite key/value in the project folder)
-        self.settings_store = SettingsStore(
-            os.path.join(os.path.dirname(os.path.abspath(potree_dir)), "settings.db"))
+        potree_dir_abs = os.path.abspath(potree_dir) if potree_dir else os.getcwd()
+        self._settings_store = SettingsStore(
+            os.path.join(os.path.dirname(potree_dir_abs), "settings.db"))
         self._settings_applied = False
         self._settings_timer = QTimer(self)
         self._settings_timer.setSingleShot(True)
@@ -224,6 +388,28 @@ class MainWindow(QMainWindow):
         # page exists; _run_js queues JS until loadFinished).
         if initial_path:
             QTimer.singleShot(500, lambda: self._load_initial_path(initial_path))
+
+    @property
+    def settings_store(self) -> SettingsStore:
+        potree_dir = getattr(self, "current_potree_dir", None) or getattr(self, "potree_dir", None)
+        if potree_dir and os.path.exists(potree_dir):
+            db_dir = os.path.dirname(os.path.abspath(potree_dir))
+        else:
+            db_dir = os.path.dirname(os.path.abspath(__file__))
+        db_path = os.path.join(db_dir, "settings.db")
+        if not hasattr(self, "_settings_store") or self._settings_store.path != db_path:
+            self._settings_store = SettingsStore(db_path)
+        return self._settings_store
+
+    @settings_store.setter
+    def settings_store(self, store: SettingsStore):
+        self._settings_store = store
+
+    def open_edit_history_dialog(self):
+        """Open the Edit History & Revert dialog."""
+        potree_dir = getattr(self, "current_potree_dir", None) or getattr(self, "potree_dir", None)
+        dlg = EditHistoryDialog(self, self.settings_store, potree_dir)
+        dlg.exec()
 
     def _load_initial_path(self, path: str):
         path = os.path.abspath(path)
@@ -892,6 +1078,20 @@ class MainWindow(QMainWindow):
         act_exit.triggered.connect(self.close)
         menu_file.addAction(act_exit)
 
+        # 2. Edit Menu
+        menu_edit = menubar.addMenu("&Edit")
+
+        act_history = QAction("Edit History & Undo / Revert...", self)
+        act_history.setShortcut("Ctrl+H")
+        act_history.triggered.connect(self.open_edit_history_dialog)
+        menu_edit.addAction(act_history)
+
+        menu_edit.addSeparator()
+
+        act_clear_staged = QAction("Clear All Staged Edits", self)
+        act_clear_staged.triggered.connect(self.clear_all_staged_edits)
+        menu_edit.addAction(act_clear_staged)
+
     # -------------------------------------------------------------------------
     # Sidebar Construction
     # -------------------------------------------------------------------------
@@ -1546,6 +1746,13 @@ class MainWindow(QMainWindow):
         btn_clear_staged.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_clear_staged.clicked.connect(self.clear_all_staged_edits)
         v_staged.addWidget(btn_clear_staged)
+
+        btn_history = QPushButton("Edit History & Undo / Revert...")
+        btn_history.setStyleSheet("padding: 5px 10px; font-size: 11px; background-color: #334155; color: #e2e8f0; border-radius: 4px;")
+        btn_history.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_history.setToolTip("View persistent SQLite log of all octree patches and splits, and revert changes in-place.")
+        btn_history.clicked.connect(self.open_edit_history_dialog)
+        v_staged.addWidget(btn_history)
 
         layout.addWidget(grp_staged)
         layout.addStretch()
@@ -2672,7 +2879,30 @@ class MainWindow(QMainWindow):
             try:
                 res = self.manager.patch_potree_octree(potree_dir, [staged_edit])
                 pts_changed = res.get("changed_points", 0)
-                self.status_bar.showMessage(f"Patched Potree octree ({pts_changed:,} points updated) in place!", 8000)
+
+                # 1. Automatically log to SQLite database for history and undo/revert
+                db_id = self.settings_store.log_edit(
+                    edit_type="ff3d_split",
+                    potree_dir=potree_dir,
+                    las_path=self.manager.las_path,
+                    target_itc=itc,
+                    assigned_itcs=list(id_map.values()),
+                    id_mapping=id_map,
+                    segmented_las_path=seg_las,
+                    points_affected=pts_changed,
+                    details=staged_edit
+                )
+
+                # 2. Automatically stage the edit in PointCloudManager
+                staged_edit["committed_octree"] = True
+                staged_edit["db_edit_id"] = db_id
+                staged_edit["action"] = "ff3d_split [Octree Patched]"
+                staged_edit["color"] = "#0284c7"
+                staged_edit["label"] = f"FF3D Split Tree #{itc} -> {list(id_map.values())} [Octree Patched]"
+                self.manager.add_staged_edit(staged_edit)
+                self.refresh_staged_edits_table()
+
+                self.status_bar.showMessage(f"Patched Potree octree ({pts_changed:,} points) and logged to database!", 8000)
                 self._run_js("window.reloadCurrentPointCloud();")
                 if hasattr(self, "btn_confirm_segmentation"):
                     self.btn_confirm_segmentation.setEnabled(False)
@@ -2683,9 +2913,10 @@ class MainWindow(QMainWindow):
                     f"• Target Tree: #{itc}\n"
                     f"• Assigned Tree IDs: {list(id_map.values())}\n"
                     f"• Octree Points Updated: {pts_changed:,}\n"
-                    f"• Octree Folder: {os.path.basename(potree_dir)}\n\n"
-                    "The change is permanently written into octree.bin and metadata.json.\n"
-                    "The viewer has been reloaded to show the new segmentation."
+                    f"• Octree Folder: {os.path.basename(potree_dir)}\n"
+                    f"• Database History ID: #{db_id}\n\n"
+                    "The edit has been automatically staged and logged into settings.db.\n"
+                    "You can revert this change anytime via 'Edit History & Undo / Revert'."
                 )
             except Exception as e:
                 QMessageBox.critical(self, "Octree Patch Failed", f"Failed to patch Potree octree in place:\n\n{e}")
@@ -3097,11 +3328,21 @@ class MainWindow(QMainWindow):
             label_text = edit.get("label", f"Edit #{row+1}")
             action_text = f"{edit.get('action')} ({edit.get('value')})" if "value" in edit else edit.get("action")
             coords_len = len(edit.get("coords", []))
-            type_text = f"Poly ({coords_len} pts)" if edit.get("type") == "polygon" else edit.get("type")
+            if edit.get("committed_octree"):
+                type_text = "Octree Patched"
+            elif edit.get("type") == "polygon":
+                type_text = f"Poly ({coords_len} pts)"
+            else:
+                type_text = edit.get("type")
 
             item_lbl = QTableWidgetItem(label_text)
             item_act = QTableWidgetItem(action_text)
             item_type = QTableWidgetItem(type_text)
+
+            if edit.get("committed_octree"):
+                item_lbl.setForeground(QColor("#38bdf8"))
+                item_act.setForeground(QColor("#38bdf8"))
+                item_type.setForeground(QColor("#10b981"))
 
             self.table_staged.setItem(row, 0, item_lbl)
             self.table_staged.setItem(row, 1, item_act)
@@ -3153,6 +3394,8 @@ class MainWindow(QMainWindow):
                 pix = QPixmap(10, 10)
                 pix.fill(QColor(color_hex))
                 item_label = QTableWidgetItem(QIcon(pix), label_text)
+                if edit.get("committed_octree"):
+                    item_label.setForeground(QColor("#38bdf8"))
                 self.table_layer_staged.setItem(row, 1, item_label)
 
                 # Column 2: Action
@@ -3179,6 +3422,33 @@ class MainWindow(QMainWindow):
                 self.table_layer_staged.setCellWidget(row, 3, btn_del_lm)
 
     def remove_single_staged_edit(self, edit_id: str):
+        edit = next((e for e in self.manager.staged_edits if e.get("id") == edit_id), None)
+        if edit and edit.get("committed_octree"):
+            potree_dir = getattr(self, "current_potree_dir", None)
+            reply = QMessageBox.question(
+                self,
+                "Revert Octree Edit?",
+                f"This edit was already committed to the active Potree Octree in-place:\n\n"
+                f"• {edit.get('label', edit_id)}\n\n"
+                "Would you like to revert this edit in the Potree Octree now?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Yes
+            )
+            if reply == QMessageBox.StandardButton.Cancel:
+                return
+            if reply == QMessageBox.StandardButton.Yes:
+                if potree_dir and os.path.isdir(potree_dir):
+                    try:
+                        self.manager.revert_potree_octree(potree_dir, edit)
+                        db_id = edit.get("db_edit_id")
+                        if db_id:
+                            self.settings_store.mark_edit_reverted(db_id)
+                        self._run_js("window.reloadCurrentPointCloud();")
+                        self.status_bar.showMessage(f"Reverted octree edit for Tree #{edit.get('target_itc')}", 6000)
+                    except Exception as e:
+                        QMessageBox.critical(self, "Revert Failed", f"Failed to revert octree edit:\n\n{e}")
+                        return
+
         self.manager.remove_staged_edit(edit_id)
         self._run_js(f"window.removeStagedVisualPolygon('{edit_id}');")
         self.refresh_staged_edits_table()
@@ -3281,6 +3551,24 @@ class MainWindow(QMainWindow):
                 self.status_bar.showMessage("Syncing committed edits to active Potree 2.0 octree in place...", 6000)
                 oct_res = self.manager.patch_potree_octree(potree_dir, committed_edits)
                 print(f"[MainWindow] Auto-patched Potree octree {potree_dir}: {oct_res}")
+                # Ensure committed edits are logged to database
+                for e in committed_edits:
+                    if not e.get("db_edit_id"):
+                        try:
+                            db_id = self.settings_store.log_edit(
+                                edit_type=e.get("type", "edit"),
+                                potree_dir=potree_dir,
+                                las_path=out,
+                                target_itc=e.get("target_itc"),
+                                assigned_itcs=list(e.get("id_mapping", {}).values()) if e.get("id_mapping") else None,
+                                id_mapping=e.get("id_mapping"),
+                                segmented_las_path=e.get("segmented_las"),
+                                points_affected=oct_res.get("changed_points", 0),
+                                details=e
+                            )
+                            e["db_edit_id"] = db_id
+                        except Exception as log_err:
+                            print(f"[MainWindow] Error logging edit: {log_err}")
                 self._run_js("window.reloadCurrentPointCloud();")
             except Exception as pe:
                 print(f"[MainWindow] Warning: Failed to patch Potree octree after LAS commit: {pe}")

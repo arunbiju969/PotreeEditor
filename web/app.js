@@ -176,6 +176,9 @@ function removeLayer(name) {
     viewer.scene.scenePointCloud.remove(pc);
     const idx = viewer.scene.pointclouds.indexOf(pc);
     if (idx >= 0) viewer.scene.pointclouds.splice(idx, 1);
+    if (pc.geometry && typeof pc.geometry.dispose === 'function') {
+        try { pc.geometry.dispose(); } catch (e) {}
+    }
     if (currentPointCloud === pc) currentPointCloud = null;
     if (activeLayerName === name) {
         const next = viewer.scene.pointclouds[0];
@@ -522,8 +525,7 @@ window.reloadCurrentPointCloud = async function() {
     console.log('[PotreeHybrid] Reloading active point cloud layer:', name);
     removeLayer(name);
     const cleanUrl = url.split('?')[0];
-    const busterUrl = `${cleanUrl}?t=${Date.now()}`;
-    await window.loadPointCloudUrl(busterUrl, name);
+    await window.loadPointCloudUrl(cleanUrl, name);
 };
 
 // ---------------------------------------------------------------------------

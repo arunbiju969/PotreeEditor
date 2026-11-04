@@ -435,6 +435,124 @@ class Potree2Cloud:
         finally:
             del mm
 
+    def revert_edit(self, edit: dict) -> dict:
+        """Revert a previously committed edit in place in octree.bin and metadata.json."""
+        etype = edit.get("type", edit.get("edit_type", "ff3d_split"))
+        if etype == "ff3d_split":
+            target_itc = edit.get("target_itc")
+            seg_las = edit.get("segmented_las") or edit.get("segmented_las_path")
+            if not seg_las or not os.path.exists(seg_las):
+                raise FileNotFoundError(f"Segmented LAS file not found to revert: {seg_las}")
+            if target_itc is None:
+                raise ValueError("Target ITC is required to revert a tree split.")
+
+            import laspy
+            from scipy.spatial import cKDTree
+
+            seg_data = laspy.read(seg_las)
+            seg_xyz = np.column_stack([
+                np.asarray(seg_data.x, dtype=np.float64),
+                np.asarray(seg_data.y, dtype=np.float64),
+                np.asarray(seg_data.z, dtype=np.float64)
+            ])
+            extra_names = [d.name for d in seg_data.point_format.extra_dimensions]
+            if "ff3d_tree_id" in extra_names:
+                seg_tree_ids = np.asarray(seg_data.ff3d_tree_id, dtype=np.int32)
+            elif "tree_id" in extra_names:
+                seg_tree_ids = np.asarray(seg_data.tree_id, dtype=np.int32)
+            else:
+                seg_tree_ids = np.zeros(len(seg_data), dtype=np.int32)
+
+            # In the split, points with seg_tree_ids >= 0 were the individual trees
+            tree_points = seg_tree_ids >= 0
+
+            mm = self.records("r+")
+            touched_attrs = set()
+            total_reverted = 0
+
+            try:
+                has_itc = "itc" in self.dtype.names
+                has_tree_id = "tree_id" in self.dtype.names or "treeID" in self.dtype.names
+                tree_id_field = "tree_id" if "tree_id" in self.dtype.names else ("treeID" if "treeID" in self.dtype.names else None)
+                has_cls = "classification" in self.dtype.names
+                has_sem = "semantic_pred" in self.dtype.names
+
+                sc = np.asarray(self.scale, np.float64)
+                of = np.asarray(self.offset, np.float64)
+
+                min_x, max_x = float(np.min(seg_xyz[:, 0])), float(np.max(seg_xyz[:, 0]))
+                min_y, max_y = float(np.min(seg_xyz[:, 1])), float(np.max(seg_xyz[:, 1]))
+                min_z, max_z = float(np.min(seg_xyz[:, 2])), float(np.max(seg_xyz[:, 2]))
+
+                rx0, rx1 = int(np.floor((min_x - of[0]) / sc[0])), int(np.ceil((max_x - of[0]) / sc[0]))
+                ry0, ry1 = int(np.floor((min_y - of[1]) / sc[1])), int(np.ceil((max_y - of[1]) / sc[1]))
+                rz0, rz1 = int(np.floor((min_z - of[2]) / sc[2])), int(np.ceil((max_z - of[2]) / sc[2]))
+
+                bmask = ((mm["x"] >= rx0) & (mm["x"] <= rx1) &
+                         (mm["y"] >= ry0) & (mm["y"] <= ry1) &
+                         (mm["z"] >= rz0) & (mm["z"] <= rz1))
+
+                # Also search for assigned tree IDs
+                id_mapping = edit.get("id_mapping") or {}
+                if isinstance(id_mapping, str):
+                    try:
+                        id_mapping = json.loads(id_mapping)
+                    except Exception:
+                        id_mapping = {}
+                assigned_ids = [int(v) for v in id_mapping.values()] + [int(target_itc)]
+                if has_itc:
+                    for aid in assigned_ids:
+                        bmask |= (mm["itc"] == aid)
+
+                cands = np.flatnonzero(bmask)
+                if len(cands) > 0:
+                    cand_xyz = np.column_stack([
+                        mm["x"][cands].astype(np.float64) * sc[0] + of[0],
+                        mm["y"][cands].astype(np.float64) * sc[1] + of[1],
+                        mm["z"][cands].astype(np.float64) * sc[2] + of[2]
+                    ])
+
+                    kdtree = cKDTree(seg_xyz)
+                    dists, indices = kdtree.query(cand_xyz, distance_upper_bound=0.03)
+                    valid = dists < 0.03
+
+                    if valid.any():
+                        cand_matched = cands[valid]
+                        matched_seg_idx = indices[valid]
+                        is_tree_pt = tree_points[matched_seg_idx]
+
+                        if is_tree_pt.any():
+                            cand_trees = cand_matched[is_tree_pt]
+                            if has_itc:
+                                mm["itc"][cand_trees] = int(target_itc)
+                                touched_attrs.add("itc")
+                            if has_tree_id and tree_id_field:
+                                mm[tree_id_field][cand_trees] = int(target_itc) - 1
+                                touched_attrs.add(tree_id_field)
+                            if has_cls:
+                                mm["classification"][cand_trees] = 4
+                                touched_attrs.add("classification")
+                            if has_sem:
+                                mm["semantic_pred"][cand_trees] = 0
+                                touched_attrs.add("semantic_pred")
+                            total_reverted += int(is_tree_pt.sum())
+
+                mm.flush()
+                for attr_name in touched_attrs:
+                    self.refresh_statistics(attr_name, mm)
+                if touched_attrs:
+                    self.write_metadata()
+
+                return {
+                    "success": True,
+                    "reverted_points": total_reverted,
+                    "touched_attributes": list(touched_attrs)
+                }
+            finally:
+                del mm
+        else:
+            raise NotImplementedError(f"Revert not implemented for edit type: {etype}")
+
     def summary(self) -> str:
         ranges = self.record_ranges()
         proxies = sum(1 for n in self.nodes if n[0] == PROXY)

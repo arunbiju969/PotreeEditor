@@ -44,7 +44,17 @@ class HybridRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
-        parsed = urlparse(self.path)
+        raw_url = self.path
+        if "/../" in raw_url:
+            # If relative paths were appended across query strings:
+            # e.g., /clouds/foo/metadata.json?t=123/../octree.bin -> /clouds/foo/octree.bin
+            parts = raw_url.split("/../")
+            base_part = parts[0].split("?")[0]
+            parent_dir = os.path.dirname(base_part)
+            clean_rel = "/../".join(parts[1:])
+            raw_url = os.path.normpath(os.path.join(parent_dir, clean_rel))
+
+        parsed = urlparse(raw_url)
         path = unquote(parsed.path)
 
         # 1. API Status
@@ -466,30 +476,83 @@ class HybridRequestHandler(BaseHTTPRequestHandler):
             else:
                 content_type = "application/octet-stream"
 
+        # Handle empty files safely
+        if file_size == 0:
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", "0")
+            self.send_header("Accept-Ranges", "bytes")
+            if file_path.endswith("metadata.json"):
+                self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+            self.send_cors_headers()
+            self.end_headers()
+            return
+
         # Handle HTTP 206 Partial Content (Range requests)
         range_header = self.headers.get("Range")
         if range_header:
             match = re.match(r"bytes=(\d*)-(\d*)", range_header)
             if match:
                 start_str, end_str = match.groups()
-                start = int(start_str) if start_str else 0
-                end = int(end_str) if end_str else file_size - 1
+                if not start_str and not end_str:
+                    start = 0
+                    end = file_size - 1
+                elif not start_str:
+                    suffix_len = int(end_str)
+                    start = max(0, file_size - suffix_len)
+                    end = file_size - 1
+                else:
+                    start = int(start_str)
+                    end = int(end_str) if end_str else file_size - 1
+
+                # Check for unsatisfiable or out-of-bounds byte ranges
+                if start >= file_size or (end_str and end < start):
+                    # Zero-length slice requested (e.g. byteOffset with byteSize == 0: start == end + 1)
+                    if end_str and int(end_str) == start - 1:
+                        self.send_response(206)
+                        self.send_header("Content-Type", content_type)
+                        self.send_header("Content-Range", f"bytes */{file_size}")
+                        self.send_header("Content-Length", "0")
+                        self.send_header("Accept-Ranges", "bytes")
+                        if file_path.endswith("metadata.json"):
+                            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+                        self.send_cors_headers()
+                        self.end_headers()
+                        return
+
+                    self.send_response(416)
+                    self.send_header("Content-Range", f"bytes */{file_size}")
+                    self.send_header("Content-Length", "0")
+                    self.send_header("Accept-Ranges", "bytes")
+                    self.send_cors_headers()
+                    self.end_headers()
+                    return
+
                 if end >= file_size:
                     end = file_size - 1
 
-                length = end - start + 1
+                length = max(0, end - start + 1)
 
                 self.send_response(206)
                 self.send_header("Content-Type", content_type)
                 self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
                 self.send_header("Content-Length", str(length))
                 self.send_header("Accept-Ranges", "bytes")
+                if file_path.endswith("metadata.json"):
+                    self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
                 self.send_cors_headers()
                 self.end_headers()
 
-                with open(file_path, "rb") as f:
-                    f.seek(start)
-                    self.wfile.write(f.read(length))
+                if length > 0:
+                    with open(file_path, "rb") as f:
+                        f.seek(start)
+                        remaining = length
+                        while remaining > 0:
+                            chunk = f.read(min(remaining, 64 * 1024))
+                            if not chunk:
+                                break
+                            self.wfile.write(chunk)
+                            remaining -= len(chunk)
                 return
 
         # Regular 200 OK
@@ -497,11 +560,9 @@ class HybridRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(file_size))
         self.send_header("Accept-Ranges", "bytes")
-        # App assets (web/app.js, style.css, index.html) are iterated on constantly;
-        # without validators QWebEngine serves them from cache and edits need a
-        # full restart. Localhost re-fetches are free.
-        if file_path.startswith(self.web_root):
-            self.send_header("Cache-Control", "no-cache")
+        # App assets and metadata: never cache on localhost
+        if file_path.startswith(self.web_root) or file_path.endswith("metadata.json"):
+            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
         self.send_cors_headers()
         self.end_headers()
 

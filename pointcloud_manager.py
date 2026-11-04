@@ -771,6 +771,15 @@ class PointCloudManager:
         print(f"[PointCloudManager] Successfully patched Potree octree {octree_dir}: {res}")
         return res
 
+    def revert_potree_octree(self, octree_dir: str, edit: Dict[str, Any]) -> Dict[str, Any]:
+        """Revert a previously committed edit in a Potree 2.0 octree in place in seconds."""
+        from pathlib import Path
+        from potree2_patch import Potree2Cloud
+        cloud = Potree2Cloud(Path(octree_dir))
+        res = cloud.revert_edit(edit)
+        print(f"[PointCloudManager] Successfully reverted edit in Potree octree {octree_dir}: {res}")
+        return res
+
     # -------------------------------------------------------------------------
     # Spatial Queries & In-Memory Fallbacks
     # -------------------------------------------------------------------------
