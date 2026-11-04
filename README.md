@@ -134,7 +134,9 @@ The top ribbon has a permanent **Segmentation** category that runs the complete 
 | **Run Segmentation** | Starts the run; the bar animates and the label streams tiles completed and trees found |
 | **Load Result** | Streams the finished cloud into the Potree viewport (converts on demand) |
 
-Runs land in the workspace at `<master>.potreeedit/segmented/pipeline/` as `<stem>_entire_tract_stitched.las` (tract) or `<stem>_ff3d_segmented.las` (single cloud). Parameters are stored per dataset in `edits.db`, so a tract reopens with the settings that produced the last run. Changing a model-level parameter rebuilds the warm model on the next run (~10 s); the tiled tract run reports progress from ForestFormer3D's own `tract_tiling_progress.json`, so the counter is real, not a guess.
+Runs land in the workspace at `<master>.potreeedit/segmented/pipeline/` as `<stem>_entire_tract_stitched.las` (tract) or `<stem>_ff3d_segmented.las` (single cloud). Parameters are stored per dataset in `edits.db`, so a tract reopens with the settings that produced the last run. Changing a model-level parameter rebuilds the warm model on the next run (~10 s); the tiled tract run reports progress from ForestFormer3D's own `tract_tiling_progress.json`, so the tile and tree counters are real, not a guess.
+
+**The Activity console narrates the run**: the parameters a run started with, every line the engine prints (model build, per-tile inference, merge, seam stitch), the running tile/tree counts, and the final file with elapsed time and tree count — errors land at `error` level with the engine's message. Closing the window mid-run cancels the pass: the pass is interrupted and the CUDA child terminated, so the GPU is released instead of chewing on a detached process after the editor is gone.
 
 ---
 

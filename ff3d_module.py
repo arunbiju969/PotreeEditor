@@ -135,12 +135,18 @@ for line in sys.stdin:
 '''
 
 
-def _read_tagged(stdout):
-    """Read stdout lines until one carries our tag; model chatter is ignored."""
+def _read_tagged(stdout, on_line=None):
+    """Read stdout lines until one carries our tag.
+
+    Everything else is the engine's own chatter (model build, per-tile lines,
+    merge/stitch notes); `on_line` forwards it so a UI can show live progress.
+    """
     for line in stdout:
         line = line.strip()
         if line.startswith("##FF3D## "):
             return json.loads(line[9:])
+        if on_line is not None and line:
+            on_line(line)
     raise RuntimeError("ForestFormer3D worker closed the pipe")
 
 
@@ -174,13 +180,13 @@ class ForestFormer3DModule:
         self._proc = subprocess.Popen(
             [FF3D_PYTHON, self._runner],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, text=True, env=env,
+            stderr=subprocess.STDOUT, text=True, env=env,
             cwd=FF3D_REPO)
         ready = _read_tagged(self._proc.stdout)   # blocks through model load (~6 s)
         if not ready.get("ready"):
             raise RuntimeError("ForestFormer3D worker died on startup")
 
-    def predict(self, xyz: np.ndarray):
+    def predict(self, xyz: np.ndarray, on_output=None):
         """xyz (N,3) float32 -> (sem int16, inst int32, scores float32)."""
         self._ensure()
         tag = f"{int(time.time()*1000)%10**9}"
@@ -189,7 +195,7 @@ class ForestFormer3DModule:
         np.savez(in_path, xyz=np.asarray(xyz, dtype=np.float32))
         self._proc.stdin.write(json.dumps({"in": in_path, "out": out_path}) + "\n")
         self._proc.stdin.flush()
-        res = _read_tagged(self._proc.stdout)
+        res = _read_tagged(self._proc.stdout, on_output)
         if not res.get("ok"):
             raise RuntimeError(f"ForestFormer3D failed: {res}")
         d = np.load(out_path)
@@ -199,7 +205,7 @@ class ForestFormer3DModule:
 
     def predict_file(self, in_las: str, out_dir: str, mode: str = "tract", *,
                      tile_size: float = 70.0, overlap: float = 10.0,
-                     roi=None, model: dict = None) -> dict:
+                     roi=None, model: dict = None, on_output=None) -> dict:
         """Full-pipeline run over a LAS/LAZ file (blocks for minutes on a tract).
 
         mode="tract"  tiles the cloud, runs each tile, merges and seam-stitches
@@ -209,8 +215,9 @@ class ForestFormer3DModule:
 
         `model` optionally carries ForestFormer3D constructor overrides
         (config, checkpoint, device, radius, step_size, score_th); changing one
-        rebuilds the warm model on the next request. Returns the worker's reply:
-        {"ok": True, "out_las": path, "n_trees": int|None}.
+        rebuilds the warm model on the next request. `on_output` receives each
+        engine log line — tile progress, merge, stitch — as it is printed.
+        Returns the worker's reply: {"ok": True, "out_las": path, "n_trees": int|None}.
         """
         self._ensure()
         os.makedirs(out_dir, exist_ok=True)
@@ -226,16 +233,26 @@ class ForestFormer3DModule:
                 payload[k] = v
         self._proc.stdin.write(json.dumps(payload) + "\n")
         self._proc.stdin.flush()
-        res = _read_tagged(self._proc.stdout)
+        res = _read_tagged(self._proc.stdout, on_output)
         if not res.get("ok"):
             raise RuntimeError(f"ForestFormer3D {mode} run failed: {res}")
         return res
 
     def close(self):
-        if self._proc is not None and self._proc.poll() is None:
-            self._proc.stdin.close()
-            self._proc.terminate()
-            self._proc = None
+        """Terminate the CUDA child so the GPU is actually released."""
+        proc, self._proc = self._proc, None
+        if proc is None:
+            return
+        try:
+            proc.stdin.close()
+        except OSError:
+            pass
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
 
 
 # One shared module per app process.
@@ -247,3 +264,14 @@ def get_module() -> ForestFormer3DModule:
     if _module is None:
         _module = ForestFormer3DModule()
     return _module
+
+
+def shutdown():
+    """Stop the shared worker. Called from the app's closeEvent: the model runs
+    in its own interpreter, so without this a run started seconds before
+    quitting keeps the child (and ~6 GB of VRAM) alive after the window is gone.
+    """
+    global _module
+    if _module is not None:
+        _module.close()
+        _module = None

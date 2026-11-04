@@ -5,11 +5,15 @@ The engine is stubbed, so the test proves the UI plumbing: parameter capture,
 output routing into the workspace, run -> Load Result -> viewer handoff, and
 that settings round-trip through the workspace database.
 """
+import json
 import os
 import shutil
+import tempfile
 import time
 import sys
 import unittest
+
+from PyQt6.QtCore import QCoreApplication, QDeadlineTimer
 
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
@@ -45,12 +49,18 @@ class StubModule:
     """Stands in for ff3d_module.ForestFormer3DModule."""
 
     calls = []
+    delay = 0.0
 
     def predict_file(self, in_las, out_dir, mode="tract", *, tile_size=70.0,
-                     overlap=10.0, roi=None, model=None):
+                     overlap=10.0, roi=None, model=None, on_output=None):
         StubModule.calls.append({"in_las": in_las, "out_dir": out_dir, "mode": mode,
                                  "tile_size": tile_size, "overlap": overlap,
                                  "roi": roi, "model": dict(model or {})})
+        if on_output:
+            on_output(f"[stub] {mode} pass over {os.path.basename(in_las)}")
+            on_output("[stub] merge + seam stitch complete")
+        if StubModule.delay:
+            time.sleep(StubModule.delay)      # keep the worker in flight
         os.makedirs(out_dir, exist_ok=True)
         stem = os.path.splitext(os.path.basename(in_las))[0]
         name = (f"{stem}_entire_tract_stitched.las" if mode == "tract"
@@ -86,6 +96,7 @@ class TestSegmentationTab(unittest.TestCase):
 
     def setUp(self):
         StubModule.calls = []
+        StubModule.delay = 0.0
         # test_finished_run... stubs open_las_path on the shared window; restore it
         self.win.__dict__.pop("open_las_path", None)
         shutil.rmtree(workspace_path_for(MASTER), ignore_errors=True)
@@ -105,7 +116,6 @@ class TestSegmentationTab(unittest.TestCase):
         self.win.btn_seg_load.setEnabled(False)
 
     def _run_to_completion(self, timeout_ms=20000):
-        from PyQt6.QtCore import QDeadlineTimer, QCoreApplication
         deadline = QDeadlineTimer(timeout_ms)
         while not deadline.hasExpired():
             QCoreApplication.processEvents()
@@ -115,6 +125,14 @@ class TestSegmentationTab(unittest.TestCase):
                 QCoreApplication.processEvents()   # deliver finished/error
                 return True
         self.fail("segmentation run did not finish")
+
+    def _settle(self, ms=150):
+        from PyQt6.QtCore import QTimer
+        QTimer.singleShot(ms, lambda: None)
+        deadline = QDeadlineTimer(ms)
+        while not deadline.hasExpired():
+            QCoreApplication.processEvents()
+            time.sleep(0.005)
 
     def test_tab_exists_with_pipeline_defaults(self):
         self.win.btn_tab_segmentation.click()
@@ -134,7 +152,6 @@ class TestSegmentationTab(unittest.TestCase):
         self.win.seg_use_open_cloud()
         self.assertEqual(self.win.seg_edit_input.text(), MASTER)
 
-        self.win.seg_worker = None
         self.win.run_segmentation_action()
         self.assertTrue(self._run_to_completion())
 
@@ -198,6 +215,63 @@ class TestSegmentationTab(unittest.TestCase):
         self.assertIn("Tiles done: 2", self.win.lbl_seg_status.text())
         self.win._seg_timer.stop()
 
+    def test_engine_output_streams_to_the_console(self):
+        self.win.txt_console.clear()
+        self.win._on_seg_output("[tile_0_1] cylinder inference written in 12.3 s")
+        self.win._on_seg_output("Processing regions (FAST): 44%|████ | 4/9 [00:01<00:01]")
+        self.win._on_seg_output("Processing regions (FAST): 100%|█████| 9/9 [00:02<00:00]")
+        self.win._on_seg_output("Error: CUDA out of memory")
+        text = self.win.txt_console.toPlainText()
+        self.assertIn("[tile_0_1] cylinder inference written in 12.3 s", text)
+        self.assertIn("CUDA out of memory", text)
+        # Progress-bar redraws collapse to the completed bar.
+        self.assertEqual(text.count("Processing regions (FAST):"), 1)
+        self.assertIn("100%", text)
+        # The label mirrors the most recent engine line.
+        self.assertIn("CUDA out of memory", self.win.lbl_seg_status.text())
+
+    def test_tile_counter_is_logged_once_per_tile(self):
+        self.win.txt_console.clear()
+        self.win._seg_run_dir = self.win._seg_output_dir()
+        self.win._seg_tiles_logged = 0
+        os.makedirs(self.win._seg_run_dir, exist_ok=True)
+        with open(os.path.join(self.win._seg_run_dir, "tract_tiling_progress.json"), "w") as f:
+            json.dump({"completed_tiles": {"a": {}}, "global_tree_offset": 9}, f)
+        self.win._on_seg_tick()
+        self.win._on_seg_tick()
+        text = self.win.txt_console.toPlainText()
+        self.assertEqual(text.count("1 tile(s) segmented"), 1)
+        self.assertIn("9 trees found so far", text)
+
+    def test_closing_the_window_stops_the_engine(self):
+        """The CUDA child must not outlive the window."""
+        closed = []
+        real_shutdown = ff3d_module.shutdown
+        ff3d_module.shutdown = lambda: closed.append(True)
+        self.win._seg_closing = False
+        StubModule.delay = 0.6
+        try:
+            self.win.seg_edit_input.setText(MASTER)
+            self.win.run_segmentation_action()
+            deadline = QDeadlineTimer(3000)
+            while not self.win.seg_worker.isRunning() and not deadline.hasExpired():
+                QCoreApplication.processEvents()
+                time.sleep(0.005)
+            self.assertTrue(self.win.seg_worker.isRunning(), "run should be in flight")
+            from PyQt6.QtGui import QCloseEvent
+            self.win.closeEvent(QCloseEvent())
+            self.assertTrue(closed, "ff3d_module.shutdown() was not called on close")
+            self.assertFalse(self.win.seg_worker.isRunning())
+            self._settle(200)   # deliver the queued cancellation signal
+            self.assertIn("cancelling the running", self.win.txt_console.toPlainText())
+            # The engine child was told to stop; a real CUDA child dies mid-run
+            # (Cancelled), a stubbed one finishes its pending call (Finished).
+            self.assertIn(self.win.lbl_seg_status.text(), ("Cancelled", "Finished"))
+            StubModule.delay = 0.0
+            self.win.show()   # shared window for the remaining tests
+        finally:
+            ff3d_module.shutdown = real_shutdown
+
     def test_parameters_persist_to_the_workspace(self):
         self.win.spin_seg_radius.setValue(22.5)
         self.win.combo_seg_mode.setCurrentIndex(1)
@@ -213,6 +287,43 @@ class TestSegmentationTab(unittest.TestCase):
         self.assertEqual(fresh.combo_seg_mode.currentData(), "single")
         self.assertTrue(fresh.chk_seg_roi.isChecked())
         self.assertEqual(fresh._seg_advanced.get("device"), "cuda:1")
+
+
+class TestEngineProcess(unittest.TestCase):
+    """The engine runs in its own interpreter: shutdown() must kill the child."""
+
+    def test_worker_child_terminates_on_shutdown(self):
+        tmp = tempfile.mkdtemp(prefix="ff3d_fake_")
+        with open(os.path.join(tmp, "ff3d_api.py"), "w", encoding="utf-8") as f:
+            f.write(
+                "import numpy as np\n"
+                "class ForestFormer3D:\n"
+                "    def __init__(self, **kw):\n"
+                "        self.kw = kw\n"
+                "    def predict_points(self, xyz):\n"
+                "        print('[fake] cylinder inference', flush=True)\n"
+                "        n = len(xyz)\n"
+                "        return (np.zeros(n, np.int16), np.arange(n, dtype=np.int32),\n"
+                "                np.zeros(n, np.float32))\n")
+        real_repo, real_py = ff3d_module.FF3D_REPO, ff3d_module.FF3D_PYTHON
+        ff3d_module.FF3D_REPO, ff3d_module.FF3D_PYTHON = tmp, sys.executable
+        mod = ff3d_module.ForestFormer3DModule()
+        try:
+            heard = []
+            sem, inst, _ = mod.predict(np.zeros((4, 3), dtype=np.float32),
+                                       on_output=heard.append)
+            self.assertEqual(len(sem), 4)
+            self.assertIn("[fake] cylinder inference", " ".join(heard))
+
+            pid = mod._proc.pid
+            self.assertIsNone(mod._proc.poll(), "child should be warm and alive")
+            ff3d_module._module = mod
+            ff3d_module.shutdown()
+            self.assertIsNone(mod._proc, "module forgets the terminated child")
+            with self.assertRaises(OSError):   # the CUDA child is really gone
+                os.kill(pid, 0)
+        finally:
+            ff3d_module.FF3D_REPO, ff3d_module.FF3D_PYTHON = real_repo, real_py
 
 
 if __name__ == "__main__":

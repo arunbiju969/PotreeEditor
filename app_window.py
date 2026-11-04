@@ -98,6 +98,7 @@ class SegmentationWorker(QThread):
     runs queue behind each other instead of fighting over the GPU.
     """
     progress = pyqtSignal(str)
+    log = pyqtSignal(str)
     finished = pyqtSignal(dict)
     error = pyqtSignal(str)
 
@@ -122,7 +123,7 @@ class SegmentationWorker(QThread):
             res = self.module.predict_file(
                 self.in_las, self.out_dir, mode=self.mode,
                 tile_size=self.tile_size, overlap=self.overlap,
-                roi=self.roi, model=self.model)
+                roi=self.roi, model=self.model, on_output=self.log.emit)
             res["elapsed_seconds"] = time.time() - t0
             res["mode"] = self.mode
             self.finished.emit(res)
@@ -433,6 +434,8 @@ class MainWindow(QMainWindow):
         self._seg_result: Optional[str] = None
         self._seg_run_dir: Optional[str] = None
         self._seg_advanced: Dict[str, str] = {}
+        self._seg_closing = False
+        self._seg_tiles_logged = 0
         self._seg_timer = QTimer(self)
         self._seg_timer.setInterval(1200)
         self._seg_timer.timeout.connect(self._on_seg_tick)
@@ -4468,6 +4471,23 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         # Final flush so a change made <450 ms before closing is not lost.
         self._save_settings()
+        # ForestFormer3D runs in its own interpreter, so a pass started seconds
+        # before quitting keeps the CUDA child — and the GPU — alive after the
+        # window is gone. Cancel the pass, then stop the child.
+        self._seg_closing = True
+        self._seg_timer.stop()
+        worker = getattr(self, "seg_worker", None)
+        running = worker is not None and worker.isRunning()
+        if running:
+            self.log_console("FF3D", "Window closing — cancelling the running "
+                                     "ForestFormer3D pass", level="warning")
+        try:
+            from ff3d_module import shutdown as ff3d_shutdown
+            ff3d_shutdown()          # closing the pipe unblocks the pending read
+        except Exception:
+            pass
+        if running:
+            worker.wait(5000)
         self.settings_store.close()
         super().closeEvent(event)
 
@@ -5660,10 +5680,12 @@ class MainWindow(QMainWindow):
             return
 
         self._seg_run_dir = out_dir
+        self._seg_tiles_logged = 0
         self.seg_worker = SegmentationWorker(
             module, in_las, out_dir, mode,
             self.spin_seg_tile.value(), self.spin_seg_overlap.value(), roi, model)
         self.seg_worker.progress.connect(self._on_seg_progress)
+        self.seg_worker.log.connect(self._on_seg_output)
         self.seg_worker.finished.connect(self._on_seg_finished)
         self.seg_worker.error.connect(self._on_seg_error)
         self.seg_worker.start()
@@ -5685,6 +5707,19 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage(msg)
         self.log_console("FF3D", msg, level="info")
 
+    def _on_seg_output(self, line: str):
+        """A ForestFormer3D log line (model build, per-tile, merge, stitch)."""
+        text = " ".join(str(line).split())
+        if not text:
+            return
+        # tqdm redraws a dozen times per tile; keep only the completed bar.
+        if text.startswith("Processing regions") and "100%" not in text:
+            return
+        self.lbl_seg_status.setText(text[:110])
+        self.status_bar.showMessage(text[:160])
+        self.log_console("FF3D", text[:220],
+                         level="error" if text[:6].lower() in ("error", "trace") else "info")
+
     def _on_seg_tick(self):
         """Live tile progress from ForestFormer3D's tract progress file."""
         if getattr(self, "seg_worker", None) is None:
@@ -5697,6 +5732,10 @@ class MainWindow(QMainWindow):
             trees = prog.get("global_tree_offset")
             if done:
                 self.lbl_seg_status.setText(f"Tiles done: {done} · trees so far: {trees or 0}")
+            if done > getattr(self, "_seg_tiles_logged", 0):
+                self._seg_tiles_logged = done
+                self.log_console("FF3D", f"Tiled tract: {done} tile(s) segmented, "
+                                         f"{trees or 0} trees found so far", level="info")
         except (OSError, ValueError):
             pass
 
@@ -5720,9 +5759,10 @@ class MainWindow(QMainWindow):
         self.bar_seg_progress.setValue(0)
         self.btn_seg_run.setEnabled(True)
         self._seg_timer.stop()
-        self.lbl_seg_status.setText("Failed")
+        self.lbl_seg_status.setText("Cancelled" if getattr(self, "_seg_closing", False) else "Failed")
         self.log_console("FF3D", f"Pipeline failed: {msg}", level="error")
-        QMessageBox.critical(self, "Segmentation Failed", msg)
+        if not getattr(self, "_seg_closing", False):
+            QMessageBox.critical(self, "Segmentation Failed", msg)
 
     def load_segmentation_result(self):
         """Stream the stitched/segmented result into the Potree viewport."""
