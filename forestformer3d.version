@@ -14,9 +14,9 @@
 url         = https://github.com/arunbiju969/ForestFormer3D.git
 path        = vendor/ForestFormer3D
 branch      = main
-commit      = 1b03f4cddf09aa5d3fa3ca0ea71ac1a1a697f994
+commit      = da564030
 date        = 2026-11-04
-subject     = fix(setup): resolve repo root from the script location
+subject     = perf(predict_fast): batch the mask edge filter, fuse the decode transfers
 
 # Upstream lineage (informational — the editor does not read these)
 upstream_repo   = https://github.com/bxiang233/FF3D.git
