@@ -1128,13 +1128,16 @@ class MainWindow(QMainWindow):
         return container
 
     def _on_sidebar_tab_changed(self, index: int):
-        # Ribbon "Filter" menu is only visible while the Forestry tab is open
+        # Ribbon "Filter" and "AI" menus are only visible while the Forestry tab is open
+        is_forestry = (index == 1)
         if hasattr(self, "btn_tab_filter"):
-            self.btn_tab_filter.setVisible(index == 1)
-            # Keep the ribbon page in sync with the hidden Filter tab
-            if index != 1 and self.ribbon_stack.currentIndex() == 4:
-                self.ribbon_stack.setCurrentIndex(2)  # Layers page
-                self.btn_tab_layers.setChecked(True)
+            self.btn_tab_filter.setVisible(is_forestry)
+        if hasattr(self, "btn_tab_ai"):
+            self.btn_tab_ai.setVisible(is_forestry)
+        # Keep the ribbon page in sync if currently on Filter or AI tab and leaving Forestry
+        if not is_forestry and self.ribbon_stack.currentIndex() in (4, 5):
+            self.ribbon_stack.setCurrentIndex(2)  # Layers page
+            self.btn_tab_layers.setChecked(True)
 
         if index == 0:  # Returned to Layers tab
             # Restore the full point cloud context on the main layer and hide individual tree overlay
@@ -1363,7 +1366,7 @@ class MainWindow(QMainWindow):
         h_tree.addWidget(lbl_tvid)
         self.spin_tree_view = QSpinBox()
         self.spin_tree_view.setRange(1, 999999)
-        self.spin_tree_view.setValue(1)
+        self.spin_tree_view.setValue(self.spin_ai_tree.value() if hasattr(self, "spin_ai_tree") else 1)
         self.spin_tree_view.setStyleSheet("font-size: 11px; padding: 3px 6px;")
         self.spin_tree_view.setCursor(Qt.CursorShape.PointingHandCursor)
         self.spin_tree_view.valueChanged.connect(self._on_tree_spin_changed)
@@ -1416,6 +1419,8 @@ class MainWindow(QMainWindow):
         self.chk_tree_neighbors = QCheckBox("Include Neighbors")
         self.chk_tree_neighbors.setStyleSheet("color: #e2e8f0; font-size: 11px; font-weight: 600;")
         self.chk_tree_neighbors.setCursor(Qt.CursorShape.PointingHandCursor)
+        if hasattr(self, "chk_ai_neighbors"):
+            self.chk_tree_neighbors.setChecked(self.chk_ai_neighbors.isChecked())
         self.chk_tree_neighbors.toggled.connect(self._on_tree_neighbors_toggled)
         h_neighbors.addWidget(self.chk_tree_neighbors)
 
@@ -1425,11 +1430,12 @@ class MainWindow(QMainWindow):
 
         self.spin_tree_radius = QDoubleSpinBox()
         self.spin_tree_radius.setRange(2.0, 100.0)
-        self.spin_tree_radius.setValue(5.0)
+        self.spin_tree_radius.setValue(self.spin_ai_radius.value() if hasattr(self, "spin_ai_radius") else 5.0)
         self.spin_tree_radius.setSingleStep(5.0)
         self.spin_tree_radius.setSuffix(" m")
         self.spin_tree_radius.setStyleSheet("font-size: 11px; padding: 2px 4px; max-width: 65px;")
-        self.spin_tree_radius.setEnabled(False)
+        self.spin_tree_radius.setEnabled(self.chk_tree_neighbors.isChecked())
+        self.spin_tree_radius.valueChanged.connect(self._on_tree_radius_changed)
         h_neighbors.addWidget(self.spin_tree_radius)
         h_neighbors.addStretch()
         v_tree.addLayout(h_neighbors)
@@ -1504,39 +1510,14 @@ class MainWindow(QMainWindow):
         self.btn_extract_tree.clicked.connect(self.extract_tree_view_action)
         v_tree.addWidget(self.btn_extract_tree)
 
-        # ForestFormer3D instance segmentation on the displayed tree/stand:
-        # overlay recolours per detected tree (splits merged ITC trees).
-        self.btn_segment_tree = QPushButton("Segment (ForestFormer3D)")
-        self.btn_segment_tree.setObjectName("btnSecondary")
-        self.btn_segment_tree.setStyleSheet("padding: 5px 10px; font-size: 11px; font-weight: 600;")
-        self.btn_segment_tree.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_segment_tree.clicked.connect(self.segment_tree_action)
-        v_tree.addWidget(self.btn_segment_tree)
-
-        # Confirm & Stage Split Edits Button
-        self.btn_confirm_segmentation = QPushButton("Confirm & Stage Split Edits")
-        self.btn_confirm_segmentation.setObjectName("btnSuccess")
-        self.btn_confirm_segmentation.setStyleSheet("""
-            QPushButton {
-                padding: 6px 10px;
-                font-size: 11px;
-                font-weight: 700;
-                background-color: #059669;
-                color: #ffffff;
-                border-radius: 4px;
-            }
-            QPushButton:hover {
-                background-color: #10b981;
-            }
-            QPushButton:disabled {
-                background-color: #334155;
-                color: #64748b;
-            }
-        """)
-        self.btn_confirm_segmentation.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_confirm_segmentation.setEnabled(False)
-        self.btn_confirm_segmentation.clicked.connect(self.confirm_segmentation_action)
-        v_tree.addWidget(self.btn_confirm_segmentation)
+        # AI Segmentation has moved to the top ribbon "AI" tab (under AI SEGMENTATION TOOLSET)
+        btn_open_ai_tab = QPushButton("🤖 AI Segmentation Toolset (Top Ribbon Tab) →")
+        btn_open_ai_tab.setObjectName("btnSecondary")
+        btn_open_ai_tab.setStyleSheet("padding: 6px 10px; font-size: 11px; font-weight: 600; color: #38bdf8;")
+        btn_open_ai_tab.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_open_ai_tab.setToolTip("Open the AI Segmentation Toolset in the top ribbon bar")
+        btn_open_ai_tab.clicked.connect(self._switch_to_ai_tab)
+        v_tree.addWidget(btn_open_ai_tab)
 
         btn_close_tree = QPushButton("Close Tree View & Back to Layers")
         btn_close_tree.setObjectName("btnSecondary")
@@ -2620,6 +2601,10 @@ class MainWindow(QMainWindow):
                 self.spin_tree_view.blockSignals(True)
                 self.spin_tree_view.setValue(itc_int)
                 self.spin_tree_view.blockSignals(False)
+            if hasattr(self, "spin_ai_tree"):
+                self.spin_ai_tree.blockSignals(True)
+                self.spin_ai_tree.setValue(itc_int)
+                self.spin_ai_tree.blockSignals(False)
             if hasattr(self, "lbl_tree_view_status"):
                 self.lbl_tree_view_status.setText(
                     f"Tree #{itc_int} picked — click View to render every point of this tree."
@@ -2656,6 +2641,10 @@ class MainWindow(QMainWindow):
                     self.spin_tree_view.blockSignals(True)
                     self.spin_tree_view.setValue(itc_int)
                     self.spin_tree_view.blockSignals(False)
+                if hasattr(self, "spin_ai_tree"):
+                    self.spin_ai_tree.blockSignals(True)
+                    self.spin_ai_tree.setValue(itc_int)
+                    self.spin_ai_tree.blockSignals(False)
                 if hasattr(self, "lbl_tree_view_status"):
                     self.lbl_tree_view_status.setText(f"Viewing Tree #{itc_int} (full density)...")
                 self.status_bar.showMessage(f"Viewing Tree #{itc_int} in Forestry tab.")
@@ -2670,6 +2659,9 @@ class MainWindow(QMainWindow):
         self._tree_view_state = None
         if hasattr(self, "btn_extract_tree"):
             self.btn_extract_tree.setEnabled(False)
+        if hasattr(self, "btn_confirm_segmentation"):
+            self.btn_confirm_segmentation.setEnabled(False)
+            self.btn_confirm_segmentation.setText("Confirm & Stage Split Edits")
         if hasattr(self, "grp_stand_filter"):
             self.grp_stand_filter.setVisible(False)
             self.list_stand_trees.clear()
@@ -2697,6 +2689,10 @@ class MainWindow(QMainWindow):
         self._run_js(f"if (window.setTreePointSize) window.setTreePointSize({fval:.2f});")
 
     def _on_tree_spin_changed(self, val: int):
+        if hasattr(self, "spin_ai_tree") and self.spin_ai_tree.value() != val:
+            self.spin_ai_tree.blockSignals(True)
+            self.spin_ai_tree.setValue(val)
+            self.spin_ai_tree.blockSignals(False)
         if val > 0 and hasattr(self, "manager"):
             if not hasattr(self, "_tree_prefetch_timer"):
                 self._tree_prefetch_timer = QTimer(self)
@@ -2716,6 +2712,12 @@ class MainWindow(QMainWindow):
             self.spin_tree_radius.setEnabled(checked)
         if hasattr(self, "combo_neighbor_mode"):
             self.combo_neighbor_mode.setEnabled(checked)
+        if hasattr(self, "chk_ai_neighbors") and self.chk_ai_neighbors.isChecked() != checked:
+            self.chk_ai_neighbors.blockSignals(True)
+            self.chk_ai_neighbors.setChecked(checked)
+            self.chk_ai_neighbors.blockSignals(False)
+        if hasattr(self, "spin_ai_radius"):
+            self.spin_ai_radius.setEnabled(checked)
 
     def _toggle_tree_measure(self, on: bool):
         """Ribbon Point-tab Measure toggle: click-to-click distances on the tree."""
@@ -2779,9 +2781,11 @@ class MainWindow(QMainWindow):
             return
         if hasattr(self, "sidebar_tabs"):
             self.sidebar_tabs.setCurrentIndex(1)
+        if hasattr(self, "btn_tab_ai") and hasattr(self, "ribbon_stack"):
+            self.btn_tab_ai.setChecked(True)
+            self.ribbon_stack.setCurrentIndex(5)
 
         radius = float(self.spin_tree_radius.value()) if (hasattr(self, "chk_tree_neighbors") and self.chk_tree_neighbors.isChecked()) else 0.0
-        n_mode = self.combo_neighbor_mode.currentData() if hasattr(self, "combo_neighbor_mode") else "canopy"
         g_rad = float(self.spin_tree_ground.value()) if (hasattr(self, "chk_tree_ground") and self.chk_tree_ground.isChecked()) else 0.0
         hint_x = f"{self._last_picked_x}" if (hasattr(self, "_last_picked_itc") and self._last_picked_itc == itc and hasattr(self, "_last_picked_x")) else "null"
         hint_y = f"{self._last_picked_y}" if (hasattr(self, "_last_picked_itc") and self._last_picked_itc == itc and hasattr(self, "_last_picked_y")) else "null"
@@ -3045,6 +3049,9 @@ class MainWindow(QMainWindow):
             if hasattr(self, "btn_confirm_segmentation"):
                 self.btn_confirm_segmentation.setEnabled(True)
                 self.btn_confirm_segmentation.setText(f"Confirm & Stage Split ({ff3d_trees} Trees)")
+            if hasattr(self, "btn_tab_ai") and hasattr(self, "ribbon_stack"):
+                self.btn_tab_ai.setChecked(True)
+                self.ribbon_stack.setCurrentIndex(5)
             if hasattr(self, "combo_tree_color"):
                 t_idx = self.combo_tree_color.findData("itc")
                 if t_idx >= 0:
@@ -3960,17 +3967,25 @@ class MainWindow(QMainWindow):
         self.btn_tab_filter.setProperty("class", "ribbonCategoryTab")
         self.btn_tab_filter.setVisible(False)  # Shown only while the Forestry sidebar tab is open
 
+        # AI category (active only while the Forestry sidebar tab is open, like Filter)
+        self.btn_tab_ai = QPushButton("AI")
+        self.btn_tab_ai.setCheckable(True)
+        self.btn_tab_ai.setProperty("class", "ribbonCategoryTab")
+        self.btn_tab_ai.setVisible(False)  # Shown only while the Forestry sidebar tab is open
+
         self.ribbon_tab_group.addButton(self.btn_tab_file, 0)
         self.ribbon_tab_group.addButton(self.btn_tab_point, 1)
         self.ribbon_tab_group.addButton(self.btn_tab_layers, 2)
         self.ribbon_tab_group.addButton(self.btn_tab_settings, 3)
         self.ribbon_tab_group.addButton(self.btn_tab_filter, 4)
+        self.ribbon_tab_group.addButton(self.btn_tab_ai, 5)
 
         h_tabs.addWidget(self.btn_tab_file)
         h_tabs.addWidget(self.btn_tab_point)
         h_tabs.addWidget(self.btn_tab_layers)
         h_tabs.addWidget(self.btn_tab_settings)
         h_tabs.addWidget(self.btn_tab_filter)
+        h_tabs.addWidget(self.btn_tab_ai)
         h_tabs.addStretch()
 
         v_main.addWidget(category_bar)
@@ -3985,12 +4000,14 @@ class MainWindow(QMainWindow):
         page_layers = self._create_ribbon_layers_page()
         page_settings = self._create_ribbon_settings_page()
         page_filter = self._create_ribbon_filter_page()
+        page_ai = self._create_ribbon_ai_page()
 
         self.ribbon_stack.addWidget(page_file)       # Index 0
         self.ribbon_stack.addWidget(page_point)      # Index 1
         self.ribbon_stack.addWidget(page_layers)     # Index 2
         self.ribbon_stack.addWidget(page_settings)   # Index 3
         self.ribbon_stack.addWidget(page_filter)     # Index 4 (Stand Filter)
+        self.ribbon_stack.addWidget(page_ai)         # Index 5 (AI Segmentation Toolset)
 
         self.ribbon_tab_group.idClicked.connect(self._on_ribbon_category_clicked)
         self.ribbon_stack.setCurrentIndex(1)
@@ -4613,13 +4630,196 @@ class MainWindow(QMainWindow):
         h_layout.addStretch()
         return page
 
+    # Category 6: AI Page (shown under the ribbon "AI" menu)
+    def _create_ribbon_ai_page(self) -> QWidget:
+        page = QFrame()
+        page.setFixedHeight(92)
+        h_layout = QHBoxLayout(page)
+        h_layout.setContentsMargins(8, 6, 8, 6)
+        h_layout.setSpacing(8)
+
+        # 1. AI Segmentation Toolset Group
+        grp_ai = QFrame()
+        grp_ai.setProperty("class", "ribbonGroup")
+        grp_ai.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
+        v_ai = QVBoxLayout(grp_ai)
+        v_ai.setContentsMargins(10, 7, 10, 7)
+        v_ai.setSpacing(3)
+
+        h_ai = QHBoxLayout()
+        h_ai.setSpacing(6)
+
+        # Tree ID selector
+        h_tid = QHBoxLayout()
+        h_tid.setSpacing(4)
+        lbl_tid = QLabel("Tree ID:")
+        lbl_tid.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        self.spin_ai_tree = QSpinBox()
+        self.spin_ai_tree.setRange(1, 999999)
+        self.spin_ai_tree.setValue(1)
+        self.spin_ai_tree.setStyleSheet("font-size: 11px; padding: 2px 4px; min-width: 60px;")
+        self.spin_ai_tree.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.spin_ai_tree.valueChanged.connect(self._on_ai_tree_spin_changed)
+        h_tid.addWidget(lbl_tid)
+        h_tid.addWidget(self.spin_ai_tree)
+        h_ai.addLayout(h_tid)
+
+        btn_ai_view = QPushButton("View Tree")
+        btn_ai_view.setProperty("class", "ribbonToolBtn")
+        btn_ai_view.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_ai_view.setToolTip("View full-density point cloud for the selected tree")
+        btn_ai_view.clicked.connect(self.view_tree_action)
+        h_ai.addWidget(btn_ai_view)
+
+        self.btn_segment_tree = QPushButton("Segment (ForestFormer3D)")
+        self.btn_segment_tree.setProperty("class", "ribbonToolBtn")
+        self.btn_segment_tree.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_segment_tree.setStyleSheet("font-weight: 600;")
+        self.btn_segment_tree.setToolTip("Run ForestFormer3D deep learning instance segmentation to split merged trees")
+        self.btn_segment_tree.clicked.connect(self.segment_tree_action)
+        h_ai.addWidget(self.btn_segment_tree)
+
+        self.btn_confirm_segmentation = QPushButton("Confirm & Stage Split Edits")
+        self.btn_confirm_segmentation.setProperty("class", "ribbonToolBtn")
+        self.btn_confirm_segmentation.setObjectName("btnSuccess")
+        self.btn_confirm_segmentation.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_confirm_segmentation.setEnabled(False)
+        self.btn_confirm_segmentation.setStyleSheet("""
+            QPushButton#btnSuccess {
+                background-color: #059669;
+                border: 1px solid #10b981;
+                color: #ffffff;
+                font-weight: 700;
+                padding: 4px 10px;
+                border-radius: 4px;
+            }
+            QPushButton#btnSuccess:hover {
+                background-color: #10b981;
+            }
+            QPushButton#btnSuccess:disabled {
+                background-color: #1e293b;
+                border-color: #334155;
+                color: #64748b;
+            }
+        """)
+        self.btn_confirm_segmentation.clicked.connect(self.confirm_segmentation_action)
+        h_ai.addWidget(self.btn_confirm_segmentation)
+
+        v_ai.addLayout(h_ai)
+        v_ai.addStretch()
+
+        lbl_ai_title = QLabel("AI SEGMENTATION TOOLSET")
+        lbl_ai_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lbl_ai_title.setProperty("class", "ribbonTitle")
+        v_ai.addWidget(lbl_ai_title)
+        h_layout.addWidget(grp_ai)
+
+        # 2. Stand & Neighbors Options Group
+        grp_stand = QFrame()
+        grp_stand.setProperty("class", "ribbonGroup")
+        grp_stand.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
+        v_stand = QVBoxLayout(grp_stand)
+        v_stand.setContentsMargins(10, 7, 10, 7)
+        v_stand.setSpacing(3)
+
+        h_stand = QHBoxLayout()
+        h_stand.setSpacing(6)
+
+        self.chk_ai_neighbors = QCheckBox("Neighbors")
+        self.chk_ai_neighbors.setStyleSheet("color: #e2e8f0; font-size: 11px; font-weight: 500;")
+        self.chk_ai_neighbors.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.chk_ai_neighbors.toggled.connect(self._on_ai_neighbors_toggled)
+        h_stand.addWidget(self.chk_ai_neighbors)
+
+        self.spin_ai_radius = QDoubleSpinBox()
+        self.spin_ai_radius.setRange(2.0, 100.0)
+        self.spin_ai_radius.setValue(5.0)
+        self.spin_ai_radius.setSingleStep(5.0)
+        self.spin_ai_radius.setSuffix(" m")
+        self.spin_ai_radius.setStyleSheet("font-size: 11px; padding: 2px 4px; max-width: 60px;")
+        self.spin_ai_radius.setEnabled(False)
+        self.spin_ai_radius.valueChanged.connect(self._on_ai_radius_changed)
+        h_stand.addWidget(self.spin_ai_radius)
+
+        v_stand.addLayout(h_stand)
+        v_stand.addStretch()
+
+        lbl_stand_title = QLabel("STAND CONTEXT")
+        lbl_stand_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lbl_stand_title.setProperty("class", "ribbonTitle")
+        v_stand.addWidget(lbl_stand_title)
+        h_layout.addWidget(grp_stand)
+
+        # 3. History & Audit Group
+        grp_hist = QFrame()
+        grp_hist.setProperty("class", "ribbonGroup")
+        grp_hist.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
+        v_hist = QVBoxLayout(grp_hist)
+        v_hist.setContentsMargins(10, 7, 10, 7)
+        v_hist.setSpacing(3)
+
+        h_hist = QHBoxLayout()
+        h_hist.setSpacing(4)
+        btn_hist = QPushButton("Edit History (Ctrl+H)...")
+        btn_hist.setProperty("class", "ribbonToolBtn")
+        btn_hist.setObjectName("btnSecondary")
+        btn_hist.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_hist.setToolTip("Open database log of edits and restore previous versions")
+        btn_hist.clicked.connect(self.open_edit_history_dialog)
+        h_hist.addWidget(btn_hist)
+        v_hist.addLayout(h_hist)
+        v_hist.addStretch()
+
+        lbl_hist_title = QLabel("HISTORY & REVERT")
+        lbl_hist_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lbl_hist_title.setProperty("class", "ribbonTitle")
+        v_hist.addWidget(lbl_hist_title)
+        h_layout.addWidget(grp_hist)
+
+        h_layout.addStretch()
+        return page
+
+    def _switch_to_ai_tab(self):
+        if hasattr(self, "btn_tab_ai"):
+            self.btn_tab_ai.setChecked(True)
+        if hasattr(self, "ribbon_stack"):
+            self.ribbon_stack.setCurrentIndex(5)
+
+    def _on_ai_tree_spin_changed(self, val: int):
+        if hasattr(self, "spin_tree_view") and self.spin_tree_view.value() != val:
+            self.spin_tree_view.blockSignals(True)
+            self.spin_tree_view.setValue(val)
+            self.spin_tree_view.blockSignals(False)
+        self._on_tree_spin_changed(val)
+
+    def _on_ai_neighbors_toggled(self, checked: bool):
+        if hasattr(self, "spin_ai_radius"):
+            self.spin_ai_radius.setEnabled(checked)
+        if hasattr(self, "chk_tree_neighbors") and self.chk_tree_neighbors.isChecked() != checked:
+            self.chk_tree_neighbors.blockSignals(True)
+            self.chk_tree_neighbors.setChecked(checked)
+            self.chk_tree_neighbors.blockSignals(False)
+            self._on_tree_neighbors_toggled(checked)
+
+    def _on_ai_radius_changed(self, val: float):
+        if hasattr(self, "spin_tree_radius") and abs(self.spin_tree_radius.value() - val) > 1e-4:
+            self.spin_tree_radius.blockSignals(True)
+            self.spin_tree_radius.setValue(val)
+            self.spin_tree_radius.blockSignals(False)
+
+    def _on_tree_radius_changed(self, val: float):
+        if hasattr(self, "spin_ai_radius") and abs(self.spin_ai_radius.value() - val) > 1e-4:
+            self.spin_ai_radius.blockSignals(True)
+            self.spin_ai_radius.setValue(val)
+            self.spin_ai_radius.blockSignals(False)
+
     # Ribbon Event Handlers
     def _on_ribbon_category_clicked(self, idx: int):
         self.ribbon_stack.setCurrentIndex(idx)
         if idx == 2:  # Layers tab
             if hasattr(self, "sidebar_tabs"):
                 self.sidebar_tabs.setCurrentIndex(0)
-        elif idx == 4:  # Filter tab (stand filter)
+        elif idx in (4, 5):  # Filter tab (4) or AI tab (5)
             if hasattr(self, "sidebar_tabs"):
                 self.sidebar_tabs.setCurrentIndex(1)
 
