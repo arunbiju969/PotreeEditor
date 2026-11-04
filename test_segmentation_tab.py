@@ -114,6 +114,14 @@ class TestSegmentationTab(unittest.TestCase):
             widget.setValue(value)
         self.win.chk_seg_roi.setChecked(False)
         self.win.btn_seg_load.setEnabled(False)
+        # Progress state is per run; clear leftovers from the previous test.
+        self.win._seg_mode_running = "single"
+        self.win._seg_tiles_total = 0
+        self.win._seg_tile_index = 0
+        self.win._seg_pct_logged = 0
+        self.win._seg_diag_n = 0
+        self.win.bar_seg_progress.setRange(0, 100)
+        self.win.bar_seg_progress.setValue(0)
 
     def _run_to_completion(self, timeout_ms=20000):
         deadline = QDeadlineTimer(timeout_ms)
@@ -219,14 +227,13 @@ class TestSegmentationTab(unittest.TestCase):
         self.win.txt_console.clear()
         self.win._on_seg_output("[tile_0_1] cylinder inference written in 12.3 s")
         self.win._on_seg_output("Processing regions (FAST): 44%|████ | 4/9 [00:01<00:01]")
-        self.win._on_seg_output("Processing regions (FAST): 100%|█████| 9/9 [00:02<00:00]")
         self.win._on_seg_output("Error: CUDA out of memory")
         text = self.win.txt_console.toPlainText()
         self.assertIn("[tile_0_1] cylinder inference written in 12.3 s", text)
         self.assertIn("CUDA out of memory", text)
-        # Progress-bar redraws collapse to the completed bar.
-        self.assertEqual(text.count("Processing regions (FAST):"), 1)
-        self.assertIn("100%", text)
+        # The region bar feeds the progress bar instead of the log.
+        self.assertEqual(self.win.bar_seg_progress.value(), 44)
+        self.assertEqual(text.count("Processing regions"), 0)
         # The label mirrors the most recent engine line.
         self.assertIn("CUDA out of memory", self.win.lbl_seg_status.text())
 
@@ -271,6 +278,46 @@ class TestSegmentationTab(unittest.TestCase):
             self.win.show()   # shared window for the remaining tests
         finally:
             ff3d_module.shutdown = real_shutdown
+
+    def test_region_bar_drives_percent_and_eta(self):
+        self.win._seg_mode_running = "single"
+        self.win._seg_tiles_total = 0
+        self.win._seg_pct_logged = 0
+        self.win._seg_diag_n = 0
+        self.win._seg_t0 = __import__("time").time() - 60
+        self.win.txt_console.clear()
+        self.win._on_seg_output("Processing regions (FAST): 50%|█████ | 5/10 [01:00<01:00, 1.02it/s]")
+        self.assertEqual(self.win.bar_seg_progress.value(), 50)
+        self.assertIn("50%", self.win.lbl_seg_status.text())
+        self.assertIn("left", self.win.lbl_seg_status.text())
+
+        self.win._on_seg_output("Processing regions (FAST): 60%|██████ | 6/10 [01:10<00:50, 1.01it/s]")
+        self.win._on_seg_output("Processing regions (FAST): 60%|██████ | 6/10 [01:12<00:48, 1.00it/s]")
+        text = self.win.txt_console.toPlainText()
+        self.assertEqual(text.count("Progress 50%"), 1)   # one line per decile
+        self.assertIn("Progress 60%", text)
+
+    def test_tract_percent_counts_tiles_and_regions(self):
+        self.win._seg_mode_running = "tract"
+        self.win._seg_tiles_total = 0
+        self.win._seg_tile_index = 0
+        self.win._seg_pct_logged = 100
+        self.win._seg_t0 = __import__("time").time() - 100
+        self.win._on_seg_output("[Tract Fast Grid] 4 active tiles contain points.")
+        self.win._on_seg_output("[2/4] Fast Processing Tile 002 [tile_002_x1_y1] (229,667 core points)")
+        self.assertEqual(self.win._seg_tiles_total, 4)
+        self.assertIn("Tile 002", self.win.txt_console.toPlainText())
+        self.win._on_seg_output("Processing regions (FAST): 33%|███ | 3/9 [00:02<00:05, 1.20it/s]")
+        # Tile 2 of 4 with a third of its regions: (1 + 3/9) / 4 = 33 %.
+        self.assertEqual(self.win.bar_seg_progress.value(), 33)
+        self.assertIn("tile 2/4", self.win.lbl_seg_status.text())
+
+    def test_verbose_diagnostics_are_thinned(self):
+        self.win._seg_diag_n = 0
+        self.win.txt_console.clear()
+        for i in range(16):
+            self.win._on_seg_output(f"[VRAM] regions {i*32}-{i*32+32}: peak 5.4 GB | masks {i}")
+        self.assertEqual(self.win.txt_console.toPlainText().count("[VRAM]"), 2)
 
     def test_run_opens_the_console_drawer(self):
         self.win._set_console_open(False)

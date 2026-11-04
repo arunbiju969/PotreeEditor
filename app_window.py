@@ -13,6 +13,7 @@ import sys
 import json
 import subprocess
 import threading
+import time
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
@@ -35,6 +36,18 @@ from server import HybridServer
 from settings_store import SettingsStore
 from workspace import Workspace
 from conversion_dialog import ConversionDialog, find_potree_converter
+
+
+def _fmt_duration(seconds: float) -> str:
+    """Seconds as a compact, readable duration for progress lines."""
+    total = max(0, int(round(seconds)))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours} h {minutes:02d} m"
+    if minutes:
+        return f"{minutes} m {secs:02d} s"
+    return f"{secs} s"
 
 
 class BridgeSignaler(QObject):
@@ -5700,6 +5713,13 @@ class MainWindow(QMainWindow):
 
         self._seg_run_dir = out_dir
         self._seg_tiles_logged = 0
+        self._seg_t0 = time.time()
+        self._seg_mode_running = mode
+        self._seg_tiles_total = 0
+        self._seg_tile_index = 0
+        self._seg_region_frac = 0.0
+        self._seg_pct_logged = 0
+        self._seg_diag_n = 0
         self.seg_worker = SegmentationWorker(
             module, in_las, out_dir, mode,
             self.spin_seg_tile.value(), self.spin_seg_overlap.value(), roi, model)
@@ -5729,17 +5749,69 @@ class MainWindow(QMainWindow):
         self.log_console("FF3D", msg, level="info")
 
     def _on_seg_output(self, line: str):
-        """A ForestFormer3D log line (model build, per-tile, merge, stitch)."""
+        """A ForestFormer3D log line: model build, per-region progress, tiles,
+        merge, stitch. Drives the progress bar, ETA and the console."""
         text = " ".join(str(line).split())
         if not text:
             return
-        # tqdm redraws a dozen times per tile; keep only the completed bar.
-        if text.startswith("Processing regions") and "100%" not in text:
+
+        # The per-region bar is the only line that carries k/n, so percent and
+        # time left come from it: "Processing regions (FAST): 44%|██ | 4/9 [...]".
+        m = re.search(r"Processing regions \(FAST\):\s*(\d+)%\|[^|]*\|\s*(\d+)/(\d+)", text)
+        if m:
+            self._seg_region_progress(int(m.group(2)), int(m.group(3)))
             return
+
+        m = re.search(r"(\d+) active tiles", text)
+        if m:
+            self._seg_tiles_total = int(m.group(1))
+        m = re.match(r"\[(\d+)/(\d+)\] Fast Processing Tile", text)
+        if m:
+            self._seg_tile_index = int(m.group(1))
+            self._seg_tiles_total = int(m.group(2))
+            self._seg_region_frac = 0.0
+
+        # Thin the engine's diagnostics so the log stays readable: VRAM stats
+        # every 8th report, mask-pruning every 20th.
+        self._seg_diag_n = getattr(self, "_seg_diag_n", 0) + 1
+        if text.startswith("[VRAM]") and self._seg_diag_n % 8:
+            return
+        if text.startswith("[MEM]") and self._seg_diag_n % 20:
+            return
+
         self.lbl_seg_status.setText(text[:110])
         self.status_bar.showMessage(text[:160])
         self.log_console("FF3D", text[:220],
                          level="error" if text[:6].lower() in ("error", "trace") else "info")
+
+    def _seg_region_progress(self, done: int, total: int):
+        """Percent, ETA and a 10%-milestone console line from region k/n."""
+        frac = max(0.0, min(1.0, done / total)) if total else 0.0
+        self._seg_region_frac = frac
+        tiles = getattr(self, "_seg_tiles_total", 0)
+        tract = getattr(self, "_seg_mode_running", "single") == "tract"
+        if tract and tiles:
+            overall = (max(0, self._seg_tile_index - 1) + frac) / tiles
+        else:
+            overall = frac
+        pct = int(overall * 100)
+
+        self.bar_seg_progress.setRange(0, 100)
+        self.bar_seg_progress.setValue(min(pct, 100))
+        elapsed = max(0.0, time.time() - getattr(self, "_seg_t0", time.time()))
+        eta = elapsed * (1 - overall) / overall if overall > 0.02 else 0.0
+        where = (f"tile {self._seg_tile_index}/{tiles}" if tract and tiles else "single pass")
+        self.lbl_seg_status.setText(
+            f"{pct}% · {where} · region {done}/{total} · "
+            f"{_fmt_duration(elapsed)} elapsed · ~{_fmt_duration(eta)} left")
+        self.status_bar.showMessage(self.lbl_seg_status.text())
+
+        if pct >= getattr(self, "_seg_pct_logged", 0) + 10:
+            self._seg_pct_logged = (pct // 10) * 10
+            self.log_console(
+                "FF3D", f"Progress {self._seg_pct_logged}% · {where} · region {done}/{total} · "
+                        f"{_fmt_duration(elapsed)} elapsed, ~{_fmt_duration(eta)} left",
+                level="info")
 
     def _on_seg_tick(self):
         """Live tile progress from ForestFormer3D's tract progress file."""
