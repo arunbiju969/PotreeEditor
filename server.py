@@ -28,6 +28,13 @@ class HybridRequestHandler(BaseHTTPRequestHandler):
     manager: Optional[PointCloudManager] = None
     on_event_callback: Optional[Callable[[str, Any], None]] = None
 
+    def _notify_event(self, event_name: str, data: Any):
+        if self.on_event_callback:
+            try:
+                self.on_event_callback(event_name, data)
+            except Exception as e:
+                print(f"[HybridRequestHandler] Error in event dispatch: {e}")
+
     def log_message(self, format, *args):
         # Suppress routine GET logging to keep terminal output clean
         pass
@@ -262,10 +269,29 @@ class HybridRequestHandler(BaseHTTPRequestHandler):
                 neighbor_mode = str(data.get("neighbor_mode", "trees_only"))
                 ground_radius = float(data.get("ground_radius", 0.0))
                 keep_tree_ids = data.get("keep_tree_ids")
+
+                target_str = f"Tree #{itc}" if (not keep_tree_ids or itc in [int(k) for k in keep_tree_ids]) else f"stand selection near Tree #{itc}"
+                self._notify_event("segmentation_step", {
+                    "step": 1, "total": 5, "stage": "query", "category": "QUERY",
+                    "msg": f"Extracting full-density points for {target_str} (radius={radius:.0f}m, mode={neighbor_mode})...",
+                    "itc": itc
+                })
+
+                t0 = time.time()
                 payload = self.manager.get_tree_points(itc, x=x, y=y, radius=radius,
                                                        neighbor_mode=neighbor_mode,
                                                        ground_radius=ground_radius)
-                if payload and payload.get("count", 0) > 0:
+                pts_cnt = payload.get("count", 0) if payload else 0
+                t_cnt = payload.get("target_count", 0) if payload else 0
+                n_cnt = payload.get("neighbor_count", 0) if payload else 0
+
+                self._notify_event("segmentation_step", {
+                    "step": 1, "total": 5, "stage": "query_done", "category": "QUERY",
+                    "msg": f"Extracted {pts_cnt:,} points from master LAS ({t_cnt:,} target, {n_cnt:,} neighbors) in {time.time()-t0:.2f}s.",
+                    "itc": itc
+                })
+
+                if payload and pts_cnt > 0:
                     import numpy as np
                     from ff3d_module import get_module
                     payload = dict(payload)
@@ -297,18 +323,77 @@ class HybridRequestHandler(BaseHTTPRequestHandler):
                                 payload["bbox_min"] = [float(val) for val in filtered_xyz.min(axis=0)]
                                 payload["bbox_max"] = [float(val) for val in filtered_xyz.max(axis=0)]
 
+                                self._notify_event("segmentation_step", {
+                                    "step": 2, "total": 5, "stage": "filter", "category": "STAND",
+                                    "msg": f"Stand Filter applied: isolated {payload['count']:,} points matching selection {list(keep)}.",
+                                    "itc": itc
+                                })
+                            else:
+                                self._notify_event("segmentation_step", {
+                                    "step": 2, "total": 5, "stage": "filter_warn", "category": "WARN",
+                                    "msg": f"Stand Filter {list(keep)} matched 0 points; using all {payload['count']:,} points.",
+                                    "itc": itc
+                                })
+                    else:
+                        self._notify_event("segmentation_step", {
+                            "step": 2, "total": 5, "stage": "filter", "category": "STAND",
+                            "msg": f"Stand Filter: No filter active — using all {payload['count']:,} points for AI segmentation.",
+                            "itc": itc
+                        })
+
                     xyz = np.asarray(payload["xyz"], dtype=np.float32)
                     if len(xyz) == 0:
+                        self._notify_event("segmentation_step", {
+                            "step": 3, "total": 5, "stage": "error", "category": "ERROR",
+                            "msg": "No points available for segmentation after applying filter.",
+                            "itc": itc
+                        })
                         self.send_error(400, "No points available for segmentation after applying filter.")
                         return
+
+                    self._notify_event("segmentation_step", {
+                        "step": 3, "total": 5, "stage": "inference", "category": "GPU",
+                        "msg": f"Executing ForestFormer3D 3D neural network inference on {len(xyz):,} points (GPU)...",
+                        "itc": itc
+                    })
+
+                    t_inf0 = time.time()
                     _sem, inst, _scores = get_module().predict(xyz)
+                    t_inf = time.time() - t_inf0
+                    n_trees = int(np.unique(inst[inst >= 0]).size)
+
                     ff_ids = np.where(inst < 0, 0, inst + 1).astype(np.float32)
                     scalars["itc"] = ff_ids          # JS colours from the itc scalar
                     payload["scalars"] = scalars
-                    payload["ff3d_trees"] = int(np.unique(inst[inst >= 0]).size)
+                    payload["ff3d_trees"] = n_trees
+
+                    self._notify_event("segmentation_step", {
+                        "step": 3, "total": 5, "stage": "inference_done", "category": "AI",
+                        "msg": f"Neural network inference complete in {t_inf:.2f}s: detected {n_trees} individual trees!",
+                        "itc": itc, "n_trees": n_trees
+                    })
+
+                    self._notify_event("segmentation_step", {
+                        "step": 4, "total": 5, "stage": "export", "category": "EXPORT",
+                        "msg": "Writing canonical split LAS with instance masks and metadata...",
+                        "itc": itc
+                    })
+
                     las_out = self._write_ff3d_las(itc, xyz, _sem, inst, _scores, payload)
                     if las_out:
                         payload["ff3d_las"] = las_out
+                        self._notify_event("segmentation_step", {
+                            "step": 4, "total": 5, "stage": "export_done", "category": "EXPORT",
+                            "msg": f"Canonical split LAS written: {os.path.basename(las_out)}",
+                            "itc": itc, "las_path": las_out
+                        })
+
+                    self._notify_event("segmentation_step", {
+                        "step": 5, "total": 5, "stage": "transmit", "category": "VIEWPORT",
+                        "msg": f"Streaming binary point buffer ({len(xyz):,} points, {n_trees} trees) to 3D viewport...",
+                        "itc": itc
+                    })
+
                 self._send_tree_binary(payload)
                 return
 

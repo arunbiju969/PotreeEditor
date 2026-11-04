@@ -2897,6 +2897,16 @@ window.viewTreeById = async function (itcValue, hintX, hintY, radius, neighborMo
             showToast(`Tree #${itcValue} — ${count.toLocaleString()} pts (full density)`);
         }
 
+        if (seg) {
+            postJSON('/api/event', {
+                event: 'segmentation_step',
+                step: 5, total: 5, stage: 'complete',
+                category: 'COMPLETE',
+                msg: `3D viewport rendered with ${ff3dTrees} tree instances (${count.toLocaleString()} points). Ready to confirm & split!`,
+                itc: num, trees: ff3dTrees
+            }).catch(() => {});
+        }
+
         postJSON('/api/event', {
             event: 'tree_loaded',
             itc: itcValue,

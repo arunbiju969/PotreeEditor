@@ -20,7 +20,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QLabel, QFileDialog, QMessageBox, QProgressBar, QSplitter,
     QFrame, QComboBox, QCheckBox, QSpinBox, QDoubleSpinBox, QSlider, QGroupBox, QStatusBar,
-    QListWidget, QListWidgetItem,
+    QListWidget, QListWidgetItem, QPlainTextEdit,
     QScrollArea, QStackedWidget, QButtonGroup, QTableWidget, QTableWidgetItem,
     QHeaderView, QAbstractItemView, QProgressDialog, QSizePolicy, QTabWidget, QGridLayout,
     QDialog
@@ -49,6 +49,8 @@ class BridgeSignaler(QObject):
     edit_removed = pyqtSignal(dict)
     edits_cleared = pyqtSignal(dict)
     indexing_event = pyqtSignal(dict)
+    segmentation_step = pyqtSignal(dict)
+    console_log = pyqtSignal(dict)
 
 
 class CommitWorker(QThread):
@@ -323,6 +325,7 @@ class EditHistoryDialog(QDialog):
             return
 
         try:
+            parent.log_console("OCTREE", f"Reverting Edit #{edit_id} ({target_desc}) in octree...", level="info")
             res = parent.manager.revert_potree_octree(potree_dir, rec)
             rev_pts = res.get("reverted_points", 0)
             self.settings_store.mark_edit_reverted(edit_id)
@@ -347,6 +350,9 @@ class EditHistoryDialog(QDialog):
             parent._run_js("window.reloadCurrentPointCloud();")
             if target_itc:
                 parent._run_js(f"window.viewTreeById({target_itc});")
+
+            parent.log_console("OCTREE", f"✓ Reverted {rev_pts:,} points in octree.bin for Edit #{edit_id}.", level="success")
+            parent.log_console("DB", f"✓ Marked Edit #{edit_id} as reverted in settings.db.", level="success")
 
             QMessageBox.information(
                 self,
@@ -400,6 +406,8 @@ class MainWindow(QMainWindow):
         self.signaler.edit_removed.connect(self.on_edit_removed)
         self.signaler.edits_cleared.connect(self.on_edits_cleared)
         self.signaler.indexing_event.connect(self.on_indexing_event)
+        self.signaler.segmentation_step.connect(self._on_segmentation_step)
+        self.signaler.console_log.connect(self._on_console_log_event)
 
         # Wire server events to Qt signals (thread-safe UI updates)
         self.server.on_event(self._on_server_event)
@@ -487,6 +495,10 @@ class MainWindow(QMainWindow):
             self.signaler.edit_removed.emit(data)
         elif event_name == "edits_cleared":
             self.signaler.edits_cleared.emit(data)
+        elif event_name == "segmentation_step":
+            self.signaler.segmentation_step.emit(data)
+        elif event_name == "console_log":
+            self.signaler.console_log.emit(data)
 
     def init_ui(self):
         self.setWindowTitle("Potree Hybrid Editor (LOD Streaming + Optimistic Visual Staging)")
@@ -839,24 +851,359 @@ class MainWindow(QMainWindow):
         # after the first relaunch).
         splitter.setSizes([450, 1200])
 
-        central_layout.addWidget(splitter, 1)
+        # Main vertical splitter: top is sidebar+webview, bottom is resizable console drawer
+        self.main_vsplitter = QSplitter(Qt.Orientation.Vertical)
+        self.main_vsplitter.setObjectName("mainVSplitter")
+        self.main_vsplitter.addWidget(splitter)
+
+        # Activity & Console Log Panel
+        self.console_panel = self._create_console_panel()
+        self.main_vsplitter.addWidget(self.console_panel)
+
+        self.main_vsplitter.setStretchFactor(0, 1)
+        self.main_vsplitter.setStretchFactor(1, 0)
+        self.main_vsplitter.setCollapsible(0, False)
+        self.main_vsplitter.setCollapsible(1, True)
+        self.console_panel.setVisible(False)
+
+        central_layout.addWidget(self.main_vsplitter, 1)
         central_layout.setStretchFactor(ribbon_bar, 0)
-        central_layout.setStretchFactor(splitter, 1)
+        central_layout.setStretchFactor(self.main_vsplitter, 1)
         self.setCentralWidget(central_widget)
 
         # Status Bar
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
-        self.status_bar.showMessage("Ready. Open a point cloud or Potree dataset to begin.")
 
-        # Permanent Indexing Indicator Pill
+        self.btn_toggle_console = QPushButton("▲ Console")
+        self.btn_toggle_console.setObjectName("btnToggleConsole")
+        self.btn_toggle_console.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_toggle_console.setToolTip("Show activity & AI segmentation console logs (resizable)")
+        self.btn_toggle_console.setStyleSheet("""
+            QPushButton#btnToggleConsole {
+                background-color: #1e293b;
+                color: #38bdf8;
+                border: 1px solid #334155;
+                border-radius: 4px;
+                padding: 2px 10px;
+                font-size: 11px;
+                font-weight: 700;
+            }
+            QPushButton#btnToggleConsole:hover {
+                background-color: #334155;
+                color: #f8fafc;
+                border-color: #0284c7;
+            }
+        """)
+        self.btn_toggle_console.clicked.connect(self.toggle_console_panel)
+        self.status_bar.addWidget(self.btn_toggle_console)
+
+        self.lbl_status_live_msg = QLabel("Ready. Open a point cloud or Potree dataset to begin.")
+        self.lbl_status_live_msg.setStyleSheet("color: #94a3b8; font-size: 11px; padding-left: 8px;")
+        self.status_bar.addWidget(self.lbl_status_live_msg, 1)
+
+        # Indexing Indicator Pill (only visible when actively indexing)
         self._init_indexing_pill()
+
+    # -------------------------------------------------------------------------
+    # Activity & AI Segmentation Console
+    # -------------------------------------------------------------------------
+    def _create_console_panel(self) -> QWidget:
+        panel = QFrame()
+        panel.setObjectName("consolePanel")
+        panel.setStyleSheet("""
+            QFrame#consolePanel {
+                background-color: #0b0f19;
+                border-top: 2px solid #1e293b;
+            }
+        """)
+        v = QVBoxLayout(panel)
+        v.setContentsMargins(8, 4, 8, 4)
+        v.setSpacing(4)
+
+        # Header toolbar
+        h_head = QHBoxLayout()
+        h_head.setContentsMargins(4, 2, 4, 2)
+        h_head.setSpacing(8)
+
+        lbl_icon = QLabel("📟")
+        lbl_icon.setStyleSheet("font-size: 13px; background: transparent;")
+
+        lbl_title = QLabel("Activity & AI Segmentation Console")
+        lbl_title.setStyleSheet("font-size: 12px; font-weight: 700; color: #f8fafc; background: transparent;")
+
+        self.lbl_console_status = QLabel("Ready")
+        self.lbl_console_status.setStyleSheet("""
+            background-color: #1e293b;
+            color: #38bdf8;
+            border-radius: 3px;
+            padding: 2px 6px;
+            font-size: 10px;
+            font-weight: 600;
+        """)
+
+        h_head.addWidget(lbl_icon)
+        h_head.addWidget(lbl_title)
+        h_head.addWidget(self.lbl_console_status)
+        h_head.addStretch()
+
+        btn_copy = QPushButton("Copy")
+        btn_copy.setToolTip("Copy entire console log to clipboard")
+        btn_copy.setStyleSheet("""
+            QPushButton {
+                background-color: #1e293b;
+                color: #94a3b8;
+                border: 1px solid #334155;
+                border-radius: 3px;
+                padding: 2px 8px;
+                font-size: 11px;
+            }
+            QPushButton:hover {
+                background-color: #334155;
+                color: #f8fafc;
+            }
+        """)
+        btn_copy.clicked.connect(self._copy_console_logs)
+
+        btn_clear = QPushButton("Clear")
+        btn_clear.setToolTip("Clear console history")
+        btn_clear.setStyleSheet("""
+            QPushButton {
+                background-color: #1e293b;
+                color: #94a3b8;
+                border: 1px solid #334155;
+                border-radius: 3px;
+                padding: 2px 8px;
+                font-size: 11px;
+            }
+            QPushButton:hover {
+                background-color: #334155;
+                color: #f8fafc;
+            }
+        """)
+        btn_clear.clicked.connect(self._clear_console_logs)
+
+        self.chk_autoscroll = QCheckBox("Auto-scroll")
+        self.chk_autoscroll.setChecked(True)
+        self.chk_autoscroll.setStyleSheet("color: #94a3b8; font-size: 11px;")
+
+        btn_expand = QPushButton("⤢")
+        btn_expand.setToolTip("Expand console height")
+        btn_expand.setStyleSheet("""
+            QPushButton {
+                background: transparent;
+                color: #94a3b8;
+                font-size: 13px;
+                font-weight: bold;
+                border: none;
+                padding: 0 4px;
+            }
+            QPushButton:hover {
+                color: #38bdf8;
+            }
+        """)
+        btn_expand.clicked.connect(self._toggle_console_expand)
+
+        btn_close = QPushButton("✕")
+        btn_close.setToolTip("Collapse console panel (drag splitter or click ▲ Console to restore)")
+        btn_close.setStyleSheet("""
+            QPushButton {
+                background: transparent;
+                color: #94a3b8;
+                font-size: 13px;
+                font-weight: bold;
+                border: none;
+                padding: 0 4px;
+            }
+            QPushButton:hover {
+                color: #ef4444;
+            }
+        """)
+        btn_close.clicked.connect(self.toggle_console_panel)
+
+        h_head.addWidget(self.chk_autoscroll)
+        h_head.addWidget(btn_copy)
+        h_head.addWidget(btn_clear)
+        h_head.addWidget(btn_expand)
+        h_head.addWidget(btn_close)
+        v.addLayout(h_head)
+
+        # Log Text Area
+        self.txt_console = QPlainTextEdit()
+        self.txt_console.setReadOnly(True)
+        self.txt_console.setMaximumBlockCount(2000)
+        self.txt_console.setStyleSheet("""
+            QPlainTextEdit {
+                background-color: #060911;
+                color: #e2e8f0;
+                border: 1px solid #1e293b;
+                border-radius: 4px;
+                font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', 'Courier New', monospace;
+                font-size: 11px;
+                padding: 4px 6px;
+            }
+        """)
+        v.addWidget(self.txt_console)
+
+        return panel
+
+    def toggle_console_panel(self):
+        """Toggle bottom activity console panel visibility."""
+        if not hasattr(self, "console_panel"):
+            return
+        is_visible = self.console_panel.isVisible()
+        self.console_panel.setVisible(not is_visible)
+        self._unread_logs = 0
+        if not is_visible:
+            self.btn_toggle_console.setText("▼ Hide Console")
+            self.btn_toggle_console.setStyleSheet("""
+                QPushButton#btnToggleConsole {
+                    background-color: #334155;
+                    color: #f8fafc;
+                    border: 1px solid #64748b;
+                    border-radius: 4px;
+                    padding: 2px 10px;
+                    font-size: 11px;
+                    font-weight: 700;
+                }
+            """)
+            if hasattr(self, "main_vsplitter"):
+                sizes = self.main_vsplitter.sizes()
+                if len(sizes) >= 2 and sizes[1] < 80:
+                    total_h = sum(sizes) or 800
+                    self.main_vsplitter.setSizes([total_h - 160, 160])
+        else:
+            self.btn_toggle_console.setText("▲ Console")
+            self.btn_toggle_console.setStyleSheet("""
+                QPushButton#btnToggleConsole {
+                    background-color: #1e293b;
+                    color: #38bdf8;
+                    border: 1px solid #334155;
+                    border-radius: 4px;
+                    padding: 2px 10px;
+                    font-size: 11px;
+                    font-weight: 700;
+                }
+                QPushButton#btnToggleConsole:hover {
+                    background-color: #334155;
+                    color: #f8fafc;
+                    border-color: #0284c7;
+                }
+            """)
+
+    def _toggle_console_expand(self):
+        if not hasattr(self, "main_vsplitter"):
+            return
+        sizes = self.main_vsplitter.sizes()
+        if len(sizes) >= 2:
+            total_h = sum(sizes) or 800
+            current_h = sizes[1]
+            new_h = 320 if current_h < 220 else 140
+            self.main_vsplitter.setSizes([total_h - new_h, new_h])
+
+    def _copy_console_logs(self):
+        if hasattr(self, "txt_console"):
+            text = self.txt_console.toPlainText()
+            QApplication.clipboard().setText(text)
+            self.status_bar.showMessage("Copied console logs to clipboard.", 3000)
+
+    def _clear_console_logs(self):
+        if hasattr(self, "txt_console"):
+            self.txt_console.clear()
+            self.lbl_console_status.setText("Ready")
+            self.lbl_console_status.setStyleSheet("background-color: #1e293b; color: #94a3b8; border-radius: 3px; padding: 2px 6px; font-size: 10px; font-weight: 600;")
+
+    def log_console(self, category: str, message: str, level: str = "info", step: Optional[int] = None, total: Optional[int] = None):
+        """Append a formatted entry to the Activity & Segmentation Console and update the bottom bar."""
+        from datetime import datetime
+        now_str = datetime.now().strftime("%H:%M:%S")
+
+        color_map = {
+            "QUERY": "#38bdf8",     # sky blue
+            "STAND": "#06b6d4",     # cyan
+            "AI": "#a855f7",        # purple
+            "GPU": "#f59e0b",       # amber
+            "EXPORT": "#10b981",    # emerald
+            "OCTREE": "#0284c7",    # blue
+            "DB": "#6366f1",        # indigo
+            "INDEX": "#3b82f6",     # royal blue
+            "COMPLETE": "#10b981",  # emerald
+            "WARN": "#fbbf24",      # amber
+            "ERROR": "#ef4444",     # red
+            "SUCCESS": "#10b981",   # emerald
+            "SYSTEM": "#94a3b8",    # slate
+            "INFO": "#94a3b8"       # slate
+        }
+        badge_color = color_map.get(category.upper(), "#94a3b8")
+        step_str = f"[{step}/{total}] " if (step and total) else ""
+        line = f"[{now_str}] [{category.upper()}] {step_str}{message}"
+
+        if hasattr(self, "txt_console"):
+            self.txt_console.appendPlainText(line)
+            if hasattr(self, "chk_autoscroll") and self.chk_autoscroll.isChecked():
+                self.txt_console.verticalScrollBar().setValue(
+                    self.txt_console.verticalScrollBar().maximum()
+                )
+
+        if hasattr(self, "lbl_console_status"):
+            short_msg = message if len(message) <= 60 else f"{message[:57]}..."
+            self.lbl_console_status.setText(f"{category.upper()}: {step_str}{short_msg}")
+            self.lbl_console_status.setStyleSheet(f"""
+                background-color: rgba(30, 41, 59, 0.9);
+                color: {badge_color};
+                border: 1px solid {badge_color};
+                border-radius: 3px;
+                padding: 2px 6px;
+                font-size: 10px;
+                font-weight: 600;
+            """)
+
+        # Update bottom status bar live step message
+        if hasattr(self, "lbl_status_live_msg"):
+            self.lbl_status_live_msg.setText(f"<b><span style='color:{badge_color}'>[{category.upper()}]</span></b> {step_str}{message}")
+        elif hasattr(self, "status_bar"):
+            self.status_bar.showMessage(f"[{category.upper()}] {step_str}{message}", 8000)
+
+        # Notify unread count on toggle button if console panel is closed
+        if hasattr(self, "console_panel") and not self.console_panel.isVisible():
+            if hasattr(self, "btn_toggle_console"):
+                self._unread_logs = getattr(self, "_unread_logs", 0) + 1
+                self.btn_toggle_console.setText(f"▲ Console ({self._unread_logs})")
+                self.btn_toggle_console.setStyleSheet("""
+                    QPushButton#btnToggleConsole {
+                        background-color: #0284c7;
+                        color: white;
+                        border: 1px solid #38bdf8;
+                        border-radius: 4px;
+                        padding: 2px 10px;
+                        font-size: 11px;
+                        font-weight: 700;
+                    }
+                    QPushButton#btnToggleConsole:hover {
+                        background-color: #0369a1;
+                    }
+                """)
+
+    def _on_segmentation_step(self, data: dict):
+        step = data.get("step")
+        total = data.get("total")
+        cat = data.get("category", "AI")
+        msg = data.get("msg", "")
+        stage = data.get("stage", "")
+        level = "error" if stage == "error" else ("success" if stage in ("inference_done", "complete", "export_done") else "info")
+        self.log_console(cat, msg, level=level, step=step, total=total)
+
+    def _on_console_log_event(self, data: dict):
+        cat = data.get("category", "INFO")
+        msg = data.get("msg", "")
+        level = data.get("level", "info")
+        self.log_console(cat, msg, level=level)
 
     # -------------------------------------------------------------------------
     # Background Indexing UI Notification & Status Indicator
     # -------------------------------------------------------------------------
     def _init_indexing_pill(self):
-        """Create permanent background indexing status badge in the status bar."""
+        """Create background indexing status badge in the status bar (only visible when indexing)."""
         self.indexing_pill = QFrame()
         self.indexing_pill.setObjectName("indexingPill")
         self.indexing_pill.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -896,6 +1243,8 @@ class MainWindow(QMainWindow):
         self._set_indexing_pill_tooltip()
         self.status_bar.addPermanentWidget(self.indexing_pill)
         self._update_indexing_pill_style("idle", "Spatial Index: Ready")
+        # Hidden by default - only shown when actively indexing!
+        self.indexing_pill.setVisible(False)
 
     def _set_indexing_pill_tooltip(self, extra_info: str = ""):
         tip = (
@@ -975,20 +1324,17 @@ class MainWindow(QMainWindow):
             pass
 
         if ev_type == "started":
+            self.indexing_pill.setVisible(True)
             if stage == "chunks":
                 self._update_indexing_pill_style("indexing", "⚡ Indexing Spatial Layout (0%)...", 0)
-                self.status_bar.showMessage(
-                    "⚡ Automatic Background Indexing started: scanning spatial chunks (streaming fallback active)...",
-                    6000
-                )
-                self._run_js(
-                    "window.showToast('⚡ Automatic Background Indexing: Building spatial & tree index sidecars in background (streaming fallback active)...', 4500);"
-                )
+                self.log_console("INDEX", "Automatic Background Indexing started: scanning spatial chunks (streaming fallback active)...", level="info")
             elif stage == "trees":
                 self._update_indexing_pill_style("indexing", "🌲 Indexing Tree Layout...", 0)
+                self.log_console("INDEX", "Automatic Background Indexing: scanning tree boundaries...", level="info")
             self._set_indexing_pill_tooltip(msg)
 
         elif ev_type == "progress":
+            self.indexing_pill.setVisible(True)
             pct = data.get("percent", 0)
             curr = data.get("current", 0)
             tot = data.get("total", 1)
@@ -1009,18 +1355,28 @@ class MainWindow(QMainWindow):
             self._update_indexing_pill_style("ready", ready_text)
             self._set_indexing_pill_tooltip(msg)
             if ev_type == "completed":
-                self.status_bar.showMessage(
-                    f"✓ Automatic Background Indexing complete — {trees:,} trees indexed for instant stand queries.",
-                    7000
-                )
-                self._run_js(
-                    f"window.showToast('✓ Automatic Background Indexing complete ({trees:,} trees) — stand queries are now instant!', 4500);"
-                )
+                self.indexing_pill.setVisible(True)
+                self.log_console("INDEX", f"✓ Background indexing complete — {trees:,} trees indexed for instant queries.", level="success")
+                # Auto-hide the pill after 5 seconds so it does not permanently clutter the bottom bar!
+                QTimer.singleShot(5000, self._hide_indexing_pill_if_idle)
+            elif ev_type == "ready":
+                # Precomputed sidecar was loaded at start, stay hidden unless indexing is happening
+                self.indexing_pill.setVisible(False)
 
         elif ev_type == "error":
+            self.indexing_pill.setVisible(True)
             err = data.get("error", "Unknown")
             self._update_indexing_pill_style("error", "⚠ Streaming Fallback Active")
             self._set_indexing_pill_tooltip(f"Indexing Warning: {err}\nStand queries continue using zero-dependency streaming fallback.")
+            self.log_console("INDEX", f"Indexing Warning: {err} — streaming fallback active.", level="warn")
+
+    def _hide_indexing_pill_if_idle(self):
+        """Hide the indexing indicator badge when no indexing is in progress."""
+        if not hasattr(self, "indexing_pill"):
+            return
+        status = self.manager.get_indexing_status() if hasattr(self, "manager") and self.manager else {}
+        if not status.get("is_indexing", False):
+            self.indexing_pill.setVisible(False)
 
     def show_indexing_details_dialog(self):
         """Show information dialog explaining Automatic Background Indexing and streaming fallback."""
@@ -2825,6 +3181,15 @@ class MainWindow(QMainWindow):
         status_target = f"Tree #{itc}" if (keep_ids is None or itc in keep_ids) else f"selected stand points near Tree #{itc}"
         self.lbl_tree_view_status.setText(f"ForestFormer3D segmenting {status_target}... (first run loads the model, ~15 s)")
         self.status_bar.showMessage(f"ForestFormer3D segmentation running on {status_target} (~10 s)...", 15000)
+
+        # Open activity console so the user sees live steps streaming
+        if hasattr(self, "console_panel") and not self.console_panel.isVisible():
+            self.toggle_console_panel()
+
+        self.log_console("AI", f"Initiating ForestFormer3D AI segmentation for {status_target} (radius={radius:.0f}m, mode={n_mode})...", level="info")
+        if keep_ids:
+            self.log_console("STAND", f"Stand Filter active: isolating {len(keep_ids)} selected IDs: {keep_ids}", level="info")
+
         keep_json = json.dumps(keep_ids) if keep_ids is not None else "null"
         self._run_js(f"window.segmentTreeById({itc}, {hint_x}, {hint_y}, {radius:.1f}, '{n_mode}', {g_rad:.1f}, {keep_json});")
 
@@ -2945,6 +3310,7 @@ class MainWindow(QMainWindow):
                 return
 
             self.status_bar.showMessage(f"Patching Potree 2.0 octree in place for {edit_label}...", 10000)
+            self.log_console("OCTREE", f"Starting in-place commit to Potree octree for {edit_label}...", level="info")
             QApplication.processEvents()
             try:
                 res = self.manager.patch_potree_octree(potree_dir, [staged_edit])
@@ -3004,6 +3370,9 @@ class MainWindow(QMainWindow):
                     self._run_js(f"if (window.invalidateTreeCache) window.invalidateTreeCache({int(assigned_id)});")
 
                 self.status_bar.showMessage(f"Patched Potree octree ({pts_changed:,} points) and logged to database!", 8000)
+                self.log_console("OCTREE", f"✓ Patched octree.bin: {pts_changed:,} points modified across ({', '.join(res.get('touched_attributes', []))}).", level="success")
+                self.log_console("DB", f"✓ Logged transaction #{db_id} to settings.db history.", level="success")
+                self.log_console("VIEWPORT", f"✓ Reloaded 3D octree point cloud.", level="success")
                 self._run_js("window.reloadCurrentPointCloud();")
                 # Refresh the tree view
                 if is_target_included:
@@ -3036,6 +3405,7 @@ class MainWindow(QMainWindow):
 
         # 2. Commit to Both (Streaming LAS/LAZ + In-place Octree Patch)
         elif dlg.action_choice in ("both", "commit"):
+            self.log_console("LAS", f"Committing staged edits to LAS/LAZ and updating octree...", level="info")
             self.manager.add_staged_edit(staged_edit)
             self.refresh_staged_edits_table()
             self.commit_staged_edits_action()
@@ -3044,6 +3414,7 @@ class MainWindow(QMainWindow):
         else:
             self.manager.add_staged_edit(staged_edit)
             self.refresh_staged_edits_table()
+            self.log_console("STAGE", f"✓ Staged {edit_label} for subsequent LAS commit.", level="success")
             # Register in-memory so Forestry view displays the single tree while staged
             try:
                 import laspy
