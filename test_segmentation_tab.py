@@ -272,6 +272,16 @@ class TestSegmentationTab(unittest.TestCase):
         finally:
             ff3d_module.shutdown = real_shutdown
 
+    def test_run_opens_the_console_drawer(self):
+        self.win._set_console_open(False)
+        self.win.seg_edit_input.setText(MASTER)
+        self.win.run_segmentation_action()
+        self.assertTrue(self.win.console_panel.isVisible(),
+                        "a run should open the console drawer")
+        self.assertIn("Hide Console", self.win.btn_toggle_console.text())
+        self.assertTrue(self._run_to_completion())
+        self.assertIn("Pipeline run started", self.win.txt_console.toPlainText())
+
     def test_parameters_persist_to_the_workspace(self):
         self.win.spin_seg_radius.setValue(22.5)
         self.win.combo_seg_mode.setCurrentIndex(1)

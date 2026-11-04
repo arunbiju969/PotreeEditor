@@ -8,6 +8,7 @@ import tempfile
 from PyQt6.QtWidgets import QApplication
 
 from pointcloud_manager import PointCloudManager
+from settings_store import SettingsStore
 from server import HybridServer
 from app_window import MainWindow
 
@@ -84,11 +85,17 @@ def test_console_and_indexing_pill():
         assert hasattr(win, "btn_toggle_console"), "MainWindow must have btn_toggle_console in status bar"
         assert hasattr(win, "lbl_status_live_msg"), "MainWindow must have lbl_status_live_msg in status bar"
 
-        # Initially console panel is collapsed
-        assert not win.console_panel.isVisible(), "Console panel should start collapsed"
+        # The console is the window into long-running processes, so it opens
+        # with the app at a useful height.
+        assert win.console_panel.isVisible(), "Console panel should start open"
+        assert "▼ Hide Console" in win.btn_toggle_console.text()
+        assert win.main_vsplitter.sizes()[1] >= 200, "Console starts tall enough to read"
+
+        # Collapse and restore from the status bar button
+        win.toggle_console_panel()
+        assert not win.console_panel.isVisible(), "Console panel should collapse on toggle"
         assert "▲ Console" in win.btn_toggle_console.text()
 
-        # Toggle console open
         win.toggle_console_panel()
         assert win.console_panel.isVisible(), "Console panel should be visible after toggle_console_panel()"
         assert "▼ Hide Console" in win.btn_toggle_console.text()
@@ -109,6 +116,14 @@ def test_console_and_indexing_pill():
         win._toggle_console_expand()
         restored_h = win.main_vsplitter.sizes()[1]
         assert restored_h < expanded_h, "Splitter size should decrease on restore"
+
+        # Open/closed state and drawer height are remembered with the settings
+        win._save_settings()
+        stored = SettingsStore(win.settings_store.path)
+        assert stored.get("console_open") is True, "Open console is persisted"
+        assert list(stored.get("console_split")) == list(win.main_vsplitter.sizes()), \
+            "Drawer height is persisted"
+        stored.close()
 
         # Clear console
         win._clear_console_logs()

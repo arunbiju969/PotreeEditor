@@ -976,7 +976,10 @@ class MainWindow(QMainWindow):
         self.main_vsplitter.setStretchFactor(1, 0)
         self.main_vsplitter.setCollapsible(0, False)
         self.main_vsplitter.setCollapsible(1, True)
-        self.console_panel.setVisible(False)
+        # The console is the window into long-running processes (indexing, AI
+        # segmentation), so it opens with the app; the drawer keeps its height.
+        self.console_panel.setVisible(True)
+        self.main_vsplitter.setSizes([780, 200])
 
         central_layout.addWidget(self.main_vsplitter, 1)
         central_layout.setStretchFactor(ribbon_bar, 0)
@@ -1009,6 +1012,7 @@ class MainWindow(QMainWindow):
         """)
         self.btn_toggle_console.clicked.connect(self.toggle_console_panel)
         self.status_bar.addWidget(self.btn_toggle_console)
+        self._set_console_open(True)     # starts open; the saved choice wins later
 
         self.lbl_status_live_msg = QLabel("Ready. Open a point cloud or Potree dataset to begin.")
         self.lbl_status_live_msg.setStyleSheet("color: #94a3b8; font-size: 11px; padding-left: 8px;")
@@ -1159,14 +1163,13 @@ class MainWindow(QMainWindow):
 
         return panel
 
-    def toggle_console_panel(self):
-        """Toggle bottom activity console panel visibility."""
+    def _set_console_open(self, is_open: bool):
+        """Show/hide the console drawer and keep the status-bar button in sync."""
         if not hasattr(self, "console_panel"):
             return
-        is_visible = self.console_panel.isVisible()
-        self.console_panel.setVisible(not is_visible)
+        self.console_panel.setVisible(bool(is_open))
         self._unread_logs = 0
-        if not is_visible:
+        if is_open:
             self.btn_toggle_console.setText("▼ Hide Console")
             self.btn_toggle_console.setStyleSheet("""
                 QPushButton#btnToggleConsole {
@@ -1179,11 +1182,10 @@ class MainWindow(QMainWindow):
                     font-weight: 700;
                 }
             """)
-            if hasattr(self, "main_vsplitter"):
-                sizes = self.main_vsplitter.sizes()
-                if len(sizes) >= 2 and sizes[1] < 80:
-                    total_h = sum(sizes) or 800
-                    self.main_vsplitter.setSizes([total_h - 160, 160])
+            sizes = self.main_vsplitter.sizes()
+            if len(sizes) >= 2 and sizes[1] < 140:
+                total = sum(sizes) or 900
+                self.main_vsplitter.setSizes([max(total - 200, 200), 200])
         else:
             self.btn_toggle_console.setText("▲ Console")
             self.btn_toggle_console.setStyleSheet("""
@@ -1202,6 +1204,13 @@ class MainWindow(QMainWindow):
                     border-color: #0284c7;
                 }
             """)
+
+    def toggle_console_panel(self):
+        """Toggle the console drawer; the choice is remembered with the settings."""
+        if not hasattr(self, "console_panel"):
+            return
+        self._set_console_open(not self.console_panel.isVisible())
+        self._schedule_save_settings()
 
     def _toggle_console_expand(self):
         if not hasattr(self, "main_vsplitter"):
@@ -4344,6 +4353,8 @@ class MainWindow(QMainWindow):
             "seg_ymin": self.spin_seg_ymin.value(),
             "seg_ymax": self.spin_seg_ymax.value(),
             "seg_advanced": dict(getattr(self, "_seg_advanced", {})),
+            "console_open": self.console_panel.isVisible(),
+            "console_split": list(self.main_vsplitter.sizes()),
         }
         return settings
 
@@ -4447,6 +4458,14 @@ class MainWindow(QMainWindow):
         adv = s.get("seg_advanced")
         if isinstance(adv, dict):
             self._seg_advanced = dict(adv)
+
+        # Console drawer: remembered height and open/collapsed state.
+        split = s.get("console_split")
+        if isinstance(split, (list, tuple)) and len(split) == 2 and sum(split) > 0:
+            self.main_vsplitter.setSizes([int(v) for v in split])
+        console_open = s.get("console_open")
+        if console_open is not None:
+            self._set_console_open(bool(console_open))
 
         geometry = s.get("geometry")
         if geometry:
@@ -5701,6 +5720,8 @@ class MainWindow(QMainWindow):
                                  + (f", tile={self.spin_seg_tile.value():.0f}m/overlap={self.spin_seg_overlap.value():.0f}m"
                                     if mode == "tract" else f", ROI={roi}") + ")", level="info")
         self._seg_timer.start()
+        # Watching the pipeline narrate itself is the point of the run.
+        self._set_console_open(True)
 
     def _on_seg_progress(self, msg: str):
         self.lbl_seg_status.setText(msg)
