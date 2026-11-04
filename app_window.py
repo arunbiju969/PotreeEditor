@@ -1882,7 +1882,7 @@ class MainWindow(QMainWindow):
         self.btn_extract_tree.clicked.connect(self.extract_tree_view_action)
         v_tree.addWidget(self.btn_extract_tree)
 
-        btn_close_tree = QPushButton("Close Tree View & Back to Layers")
+        btn_close_tree = QPushButton("Close Tree View")
         btn_close_tree.setObjectName("btnSecondary")
         btn_close_tree.setStyleSheet("padding: 5px 10px; font-size: 11px;")
         btn_close_tree.setCursor(Qt.CursorShape.PointingHandCursor)

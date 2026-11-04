@@ -2567,13 +2567,17 @@ window.showTreeOverlayContext = function () {
     if (inspectCard) inspectCard.style.display = 'none';
     if (pickedPointMarker) pickedPointMarker.visible = false;
 
+    // The Forestry tab owns the individual-tree overlay; the full-density main
+    // cloud belongs to the Layers tab. Hide it whether or not a tree is loaded,
+    // so closing a tree view leaves the Forestry tab empty instead of showing
+    // the whole point cloud again.
+    hideTreeContext();
     if (treeOverlayPoints) {
-        hideTreeContext();
         treeOverlayPoints.visible = true;
         updateTreeColors();
-        updateStandFilterHud();
-        viewer.render();
     }
+    updateStandFilterHud();
+    viewer.render();
 };
 
 window.closeTreeOverlay = function () {
