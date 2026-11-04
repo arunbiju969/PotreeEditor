@@ -383,5 +383,31 @@ class TestEngineProcess(unittest.TestCase):
             ff3d_module.FF3D_REPO, ff3d_module.FF3D_PYTHON = real_repo, real_py
 
 
+    def test_engine_death_reports_exit_code_and_last_line(self):
+        """A killed engine must say why, not just that the pipe closed."""
+        tmp = tempfile.mkdtemp(prefix="ff3d_dying_")
+        with open(os.path.join(tmp, "ff3d_api.py"), "w", encoding="utf-8") as f:
+            f.write(
+                "import os\n"
+                "class ForestFormer3D:\n"
+                "    def __init__(self, **kw):\n"
+                "        self.kw = kw\n"
+                "    def predict_points(self, xyz):\n"
+                "        print('[fake] decoding 41k masks', flush=True)\n"
+                "        os._exit(9)\n")
+        real_repo, real_py = ff3d_module.FF3D_REPO, ff3d_module.FF3D_PYTHON
+        ff3d_module.FF3D_REPO, ff3d_module.FF3D_PYTHON = tmp, sys.executable
+        try:
+            with self.assertRaises(ff3d_module.ForestFormer3DError) as ctx:
+                ff3d_module.ForestFormer3DModule().predict(np.zeros((4, 3), dtype=np.float32))
+            msg = str(ctx.exception)
+            self.assertEqual(ctx.exception.exit_code, 9)
+            self.assertIn("exit 9", msg)
+            self.assertIn("Tiled Tract", msg)          # the actionable hint
+            self.assertIn("decoding 41k masks", msg)   # the last thing it printed
+        finally:
+            ff3d_module.FF3D_REPO, ff3d_module.FF3D_PYTHON = real_repo, real_py
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

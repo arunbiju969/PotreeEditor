@@ -23,10 +23,28 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections import deque
 
 import numpy as np
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
+
+# Exit codes that explain themselves once you know the cause.
+_EXIT_HINTS = {
+    -9: "SIGKILL, typically the kernel reclaiming memory — try Tiled Tract mode",
+    -11: "segmentation fault in the CUDA path",
+    9: "typically out of memory — try Tiled Tract mode",
+    137: "SIGKILL (128+9), typically the kernel reclaiming memory — try Tiled Tract mode",
+    139: "segmentation fault (128+11) in the CUDA path",
+}
+
+
+class ForestFormer3DError(RuntimeError):
+    """Engine failure; `exit_code` is the child's status when it died outright."""
+
+    def __init__(self, message: str, exit_code=None):
+        super().__init__(message)
+        self.exit_code = exit_code
 
 
 def _candidates(paths):
@@ -135,19 +153,32 @@ for line in sys.stdin:
 '''
 
 
-def _read_tagged(stdout, on_line=None):
+def _read_tagged(stdout, on_line=None, proc=None):
     """Read stdout lines until one carries our tag.
 
     Everything else is the engine's own chatter (model build, per-tile lines,
     merge/stitch notes); `on_line` forwards it so a UI can show live progress.
+    When the child dies, the message carries its exit code and the last line
+    it printed — a bare "closed the pipe" is not actionable.
     """
+    tail = deque(maxlen=2)
     for line in stdout:
         line = line.strip()
         if line.startswith("##FF3D## "):
             return json.loads(line[9:])
-        if on_line is not None and line:
-            on_line(line)
-    raise RuntimeError("ForestFormer3D worker closed the pipe")
+        if line:
+            tail.append(line)
+            if on_line is not None:
+                on_line(line)
+    code = proc.poll() if proc is not None else None
+    hint = _EXIT_HINTS.get(code)
+    detail = ""
+    if code is not None:
+        detail = f" (exit {code}" + (f": {hint}" if hint else "") + ")"
+    last = tail[-1] if tail else ""
+    raise ForestFormer3DError(
+        f"ForestFormer3D engine stopped{detail}"
+        + (f" — last line: {last[:150]}" if last else ""), exit_code=code)
 
 
 class ForestFormer3DModule:
@@ -182,7 +213,7 @@ class ForestFormer3DModule:
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, text=True, env=env,
             cwd=FF3D_REPO)
-        ready = _read_tagged(self._proc.stdout)   # blocks through model load (~6 s)
+        ready = _read_tagged(self._proc.stdout, proc=self._proc)   # blocks through model load (~6 s)
         if not ready.get("ready"):
             raise RuntimeError("ForestFormer3D worker died on startup")
 
@@ -195,7 +226,7 @@ class ForestFormer3DModule:
         np.savez(in_path, xyz=np.asarray(xyz, dtype=np.float32))
         self._proc.stdin.write(json.dumps({"in": in_path, "out": out_path}) + "\n")
         self._proc.stdin.flush()
-        res = _read_tagged(self._proc.stdout, on_output)
+        res = _read_tagged(self._proc.stdout, on_output, proc=self._proc)
         if not res.get("ok"):
             raise RuntimeError(f"ForestFormer3D failed: {res}")
         d = np.load(out_path)
@@ -233,9 +264,9 @@ class ForestFormer3DModule:
                 payload[k] = v
         self._proc.stdin.write(json.dumps(payload) + "\n")
         self._proc.stdin.flush()
-        res = _read_tagged(self._proc.stdout, on_output)
+        res = _read_tagged(self._proc.stdout, on_output, proc=self._proc)
         if not res.get("ok"):
-            raise RuntimeError(f"ForestFormer3D {mode} run failed: {res}")
+            raise ForestFormer3DError(f"ForestFormer3D {mode} run failed: {res.get('error') or res}")
         return res
 
     def close(self):
