@@ -148,7 +148,11 @@ for line in sys.stdin:
             ForestFormer3D.save_las(req["in"], res, las_out)
             out = {"ok": True, "out_las": las_out, "n_trees": int(res.n_trees)}
     except Exception as e:
-        out = {"ok": False, "error": str(e)}
+        # str(e) alone hides which frame broke; keep the last frames so the
+        # console message is actionable.
+        import traceback
+        tail = " | ".join(traceback.format_exc().strip().splitlines()[-4:])
+        out = {"ok": False, "error": tail}
     print("##FF3D## " + json.dumps(out), flush=True)
 '''
 
