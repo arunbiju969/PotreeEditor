@@ -39,6 +39,9 @@ class PointCloudManager:
         self.staged_edits: List[Dict[str, Any]] = []
         self.current_selection: Optional[Dict[str, Any]] = None
         self._tree_cache: Dict[int, Dict[str, Any]] = {}
+        self._tree_edits_index: Dict[int, Dict[str, Any]] = {}
+        self.settings_store = None
+        self.potree_dir: Optional[str] = None
         self._chunk_index: Optional[List[Dict[str, Any]]] = None
         self._tree_index: Optional[Dict[int, List[int]]] = None
         self._indexing_callbacks: List[Callable[[Dict[str, Any]], None]] = []
@@ -1031,6 +1034,204 @@ class PointCloudManager:
         self.has_unsaved_changes = True
         return del_count
 
+    # -------------------------------------------------------------------------
+    # Tree Edits Overlay & Fast Single-Tree Querying
+    # -------------------------------------------------------------------------
+    def set_settings_store(self, store):
+        """Bind persistent settings store and sync active tree edits."""
+        self.settings_store = store
+        self.sync_tree_edits_from_db(store)
+
+    def sync_tree_edits_from_db(self, store=None):
+        """Load all active tree edits from settings.db into the in-memory routing table."""
+        s = store or self.settings_store
+        if not s:
+            return
+        try:
+            active_edits = s.get_all_active_tree_edits()
+            self._tree_edits_index.update(active_edits)
+            print(f"[PointCloudManager] Synced {len(active_edits)} tree edit routes from database.")
+        except Exception as e:
+            print(f"[PointCloudManager] Error syncing tree edits from database: {e}")
+
+    def register_tree_edit(self, itc_id: int, parent_itc: int, cluster_idx: int,
+                           edit_id: int, las_path: str, point_count: int,
+                           id_mapping: Optional[Dict[str, Any]] = None):
+        """Register a tree edit route in memory and invalidate cache."""
+        self._tree_edits_index[int(itc_id)] = {
+            "itc_id": int(itc_id),
+            "parent_itc": int(parent_itc),
+            "cluster_idx": int(cluster_idx),
+            "edit_id": int(edit_id),
+            "las_path": str(las_path),
+            "point_count": int(point_count),
+            "id_mapping": id_mapping or {},
+            "status": "active"
+        }
+        self.clear_tree_cache(int(itc_id))
+        self.clear_tree_cache(int(parent_itc))
+
+    def clear_tree_cache(self, itc_value: Optional[int] = None):
+        """Clear cached tree queries from memory."""
+        if itc_value is None:
+            self._tree_cache.clear()
+            return
+        itc_int = int(itc_value)
+        keys_to_del = [k for k in self._tree_cache if (k == itc_int or (isinstance(k, tuple) and k[0] == itc_int))]
+        for k in keys_to_del:
+            self._tree_cache.pop(k, None)
+
+    def get_edited_tree_info(self, itc_val: int) -> Optional[Dict[str, Any]]:
+        """Check if an ITC has been modified by an active split or octree patch."""
+        # 1. Check in-memory staged edits first (immediate feedback before or after commit)
+        for edit in self.staged_edits:
+            if edit.get("type") == "ff3d_split" and "segmented_las" in edit:
+                id_map = edit.get("id_mapping", {})
+                for c_idx, assigned in id_map.items():
+                    if int(assigned) == itc_val:
+                        return {
+                            "itc_id": itc_val,
+                            "parent_itc": int(edit.get("target_itc", itc_val)),
+                            "cluster_idx": int(c_idx),
+                            "las_path": edit.get("segmented_las"),
+                            "id_mapping": id_map,
+                            "edit_id": edit.get("db_edit_id", 0)
+                        }
+
+        # 2. Check in-memory tree edits table
+        if itc_val in self._tree_edits_index:
+            info = self._tree_edits_index[itc_val]
+            if info.get("status") == "active":
+                return info
+
+        # 3. Check persistent SQLite database
+        if self.settings_store:
+            try:
+                rec = self.settings_store.get_tree_edit(itc_val)
+                if rec:
+                    self._tree_edits_index[itc_val] = rec
+                    return rec
+            except Exception:
+                pass
+
+        return None
+
+    def _get_edited_tree_points(self, edit_info: Dict[str, Any], itc_val: int,
+                                rad_val: float, n_mode: str, g_rad_val: float) -> Optional[Dict[str, Any]]:
+        las_file = edit_info.get("las_path")
+        if not las_file or not os.path.exists(las_file):
+            return None
+
+        seg_data = laspy.read(las_file)
+        extra_dims = [d.name for d in seg_data.point_format.dimensions]
+
+        if "ff3d_tree_id" in extra_dims:
+            cids = np.asarray(seg_data.ff3d_tree_id, dtype=np.int32)
+        elif "tree_id" in extra_dims:
+            cids = np.asarray(seg_data.tree_id, dtype=np.int32)
+        else:
+            cids = np.zeros(len(seg_data), dtype=np.int32)
+
+        target_cluster = edit_info.get("cluster_idx", 0)
+        target_mask = (cids == target_cluster)
+        if not target_mask.any():
+            if hasattr(seg_data, "itc"):
+                target_mask = (np.asarray(seg_data.itc) == itc_val)
+        if not target_mask.any():
+            return None
+
+        target_count = int(target_mask.sum())
+        all_x_raw = np.asarray(seg_data.x, dtype=np.float64)
+        all_y_raw = np.asarray(seg_data.y, dtype=np.float64)
+        all_z_raw = np.asarray(seg_data.z, dtype=np.float64)
+
+        t_x = all_x_raw[target_mask]
+        t_y = all_y_raw[target_mask]
+        t_z = all_z_raw[target_mask]
+
+        t_cx, t_cy, t_cz = float(t_x.mean()), float(t_y.mean()), float(t_z.mean())
+        centroid = np.array([t_cx, t_cy, t_cz], dtype=np.float64)
+
+        has_rgb = "red" in extra_dims
+        has_int = "intensity" in extra_dims
+        has_cls = "classification" in extra_dims
+
+        # Sibling neighbors and ground from seg_data if radius > 0
+        neighbor_count = 0
+        combined_idx = np.flatnonzero(target_mask)
+
+        if rad_val > 0.0 or g_rad_val > 0.0:
+            dx = all_x_raw - t_cx
+            dy = all_y_raw - t_cy
+            d2 = dx * dx + dy * dy
+
+            n_mask = np.zeros(len(seg_data), dtype=bool)
+            if rad_val > 0.0:
+                in_rad = d2 <= (rad_val * rad_val)
+                # Siblings are other trees in this split
+                is_sibling = (cids >= 0) & (cids != target_cluster)
+                n_mask = n_mask | (in_rad & is_sibling)
+
+            if g_rad_val > 0.0:
+                in_g = d2 <= (g_rad_val * g_rad_val)
+                is_ground = (cids < 0)
+                n_mask = n_mask | (in_g & is_ground)
+
+            if n_mask.any():
+                n_idx = np.flatnonzero(n_mask)
+                neighbor_count = len(n_idx)
+                combined_idx = np.concatenate([combined_idx, n_idx])
+
+        xyz_f64 = np.column_stack((all_x_raw[combined_idx], all_y_raw[combined_idx], all_z_raw[combined_idx]))
+
+        rgb = None
+        if has_rgb:
+            rr = (np.asarray(seg_data.red[combined_idx]) >> 8).astype(np.uint8)
+            gg = (np.asarray(seg_data.green[combined_idx]) >> 8).astype(np.uint8)
+            bb = (np.asarray(seg_data.blue[combined_idx]) >> 8).astype(np.uint8)
+            rgb = np.column_stack((rr, gg, bb))
+
+        intensity = np.asarray(seg_data.intensity[combined_idx], dtype=np.uint16) if has_int else None
+        classification = np.asarray(seg_data.classification[combined_idx], dtype=np.uint8) if has_cls else None
+
+        # Build scalars
+        scalars = {}
+        id_mapping = edit_info.get("id_mapping") or {}
+        assigned_itcs = np.zeros(len(combined_idx), dtype=np.float32)
+        assigned_itcs[:target_count] = float(itc_val)
+        if neighbor_count > 0:
+            neigh_cids = cids[combined_idx[target_count:]]
+            for c_id, map_val in id_mapping.items():
+                assigned_itcs[target_count:][neigh_cids == int(c_id)] = float(map_val)
+        scalars["itc"] = assigned_itcs
+        scalars["tree_id"] = np.where(assigned_itcs > 0, assigned_itcs - 1, -1.0).astype(np.float32)
+
+        if "semantic_pred" in extra_dims:
+            scalars["semantic_pred"] = np.asarray(seg_data.semantic_pred[combined_idx], dtype=np.float32)
+
+        count = int(xyz_f64.shape[0])
+        centered = (xyz_f64 - centroid).astype(np.float32)
+        lo = centered.min(axis=0)
+        hi = centered.max(axis=0)
+
+        return {
+            "itc": itc_val,
+            "count": count,
+            "target_count": target_count,
+            "neighbor_count": neighbor_count,
+            "radius": rad_val,
+            "neighbor_mode": n_mode,
+            "indexing_active": getattr(self, "_is_indexing", False),
+            "centroid": [float(centroid[0]), float(centroid[1]), float(centroid[2])],
+            "xyz": np.ascontiguousarray(centered, dtype=np.float32),
+            "rgb": np.ascontiguousarray(rgb, dtype=np.uint8) if rgb is not None else None,
+            "intensity": np.ascontiguousarray(intensity, dtype=np.uint16) if intensity is not None else None,
+            "classification": np.ascontiguousarray(classification, dtype=np.uint8) if classification is not None else None,
+            "scalars": scalars,
+            "bbox_min": [float(lo[0]), float(lo[1]), float(lo[2])],
+            "bbox_max": [float(hi[0]), float(hi[1]), float(hi[2])],
+        }
+
     @_synchronized
     def get_tree_points(self, itc_value: int, x: Optional[float] = None, y: Optional[float] = None,
                         radius: float = 0.0, neighbor_mode: str = "trees_only",
@@ -1052,6 +1253,14 @@ class PointCloudManager:
             return self._tree_cache[cache_key]
         if rad_val == 0.0 and g_rad_val == 0.0 and itc_val in self._tree_cache:
             return self._tree_cache[itc_val]
+
+        # Check if this tree is part of an active / committed split edit
+        edited_tree = self.get_edited_tree_info(itc_val)
+        if edited_tree:
+            res = self._get_edited_tree_points(edited_tree, itc_val, rad_val, n_mode, g_rad_val)
+            if res:
+                self._tree_cache[cache_key] = res
+                return res
 
         if self.las_data is None and not self.las_path:
             return None

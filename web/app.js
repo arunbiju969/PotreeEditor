@@ -2615,6 +2615,22 @@ async function prefetchTree(itcValue, hintX, hintY) {
 }
 window.prefetchTree = prefetchTree;
 
+window.invalidateTreeCache = function (itcValue) {
+    if (itcValue === undefined || itcValue === null) {
+        treeBufferCache.clear();
+        console.log('[PotreeHybrid] Cleared all treeBufferCache entries');
+        return;
+    }
+    const num = Number(itcValue);
+    const prefix = `${num}_`;
+    for (const key of Array.from(treeBufferCache.keys())) {
+        if (key === num || (typeof key === 'string' && key.startsWith(prefix))) {
+            treeBufferCache.delete(key);
+        }
+    }
+    console.log(`[PotreeHybrid] Invalidated treeBufferCache for Tree #${num}`);
+};
+
 window.viewTreeById = async function (itcValue, hintX, hintY, radius, neighborMode, groundRadius, endpoint) {
     if (itcValue === null || itcValue === undefined) return;
     const num = Number(itcValue);

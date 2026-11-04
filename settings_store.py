@@ -40,6 +40,17 @@ class SettingsStore:
             " reverted_at DATETIME"
             ")"
         )
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS tree_edits_index ("
+            " itc_id INTEGER PRIMARY KEY,"
+            " parent_itc INTEGER NOT NULL,"
+            " cluster_idx INTEGER NOT NULL,"
+            " edit_id INTEGER NOT NULL,"
+            " las_path TEXT NOT NULL,"
+            " point_count INTEGER NOT NULL,"
+            " status TEXT DEFAULT 'active'"
+            ")"
+        )
         self._conn.commit()
 
     def get(self, key: str, default=None):
@@ -175,6 +186,95 @@ class SettingsStore:
             except Exception:
                 pass
             return item
+
+    # -------------------------------------------------------------------------
+    # Tree Edits Overlay Index
+    # -------------------------------------------------------------------------
+    def register_tree_edit(self, itc_id: int, parent_itc: int, cluster_idx: int,
+                           edit_id: int, las_path: str, point_count: int = 0):
+        """Register an edited / split tree in the fast overlay index."""
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                "INSERT INTO tree_edits_index ("
+                " itc_id, parent_itc, cluster_idx, edit_id, las_path, point_count, status"
+                ") VALUES (?, ?, ?, ?, ?, ?, 'active')"
+                " ON CONFLICT(itc_id) DO UPDATE SET"
+                "  parent_itc = excluded.parent_itc,"
+                "  cluster_idx = excluded.cluster_idx,"
+                "  edit_id = excluded.edit_id,"
+                "  las_path = excluded.las_path,"
+                "  point_count = excluded.point_count,"
+                "  status = 'active'",
+                (int(itc_id), int(parent_itc), int(cluster_idx), int(edit_id), str(las_path), int(point_count))
+            )
+            self._conn.commit()
+
+    def get_tree_edit(self, itc_id: int):
+        """Lookup an active tree edit by Tree ID (ITC)."""
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                "SELECT itc_id, parent_itc, cluster_idx, edit_id, las_path, point_count, status "
+                "FROM tree_edits_index WHERE itc_id = ? AND status = 'active'",
+                (int(itc_id),)
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            return {
+                "itc_id": row[0],
+                "parent_itc": row[1],
+                "cluster_idx": row[2],
+                "edit_id": row[3],
+                "las_path": row[4],
+                "point_count": row[5],
+                "status": row[6]
+            }
+
+    def get_all_active_tree_edits(self) -> dict:
+        """Return a mapping of all active edited Tree IDs -> edit info."""
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                "SELECT itc_id, parent_itc, cluster_idx, edit_id, las_path, point_count, status "
+                "FROM tree_edits_index WHERE status = 'active'"
+            )
+            rows = cur.fetchall()
+            mapping = {}
+            for r in rows:
+                mapping[r[0]] = {
+                    "itc_id": r[0],
+                    "parent_itc": r[1],
+                    "cluster_idx": r[2],
+                    "edit_id": r[3],
+                    "las_path": r[4],
+                    "point_count": r[5],
+                    "status": r[6]
+                }
+            return mapping
+
+    def revert_tree_edits_by_edit_id(self, edit_id: int) -> int:
+        """Mark tree edits for a given edit transaction as reverted."""
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                "UPDATE tree_edits_index SET status = 'reverted' WHERE edit_id = ?",
+                (int(edit_id),)
+            )
+            self._conn.commit()
+            return cur.rowcount
+
+    def revert_tree_edits_by_parent_itc(self, parent_itc: int) -> int:
+        """Mark tree edits for a given parent ITC as reverted."""
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                "UPDATE tree_edits_index SET status = 'reverted' WHERE parent_itc = ?",
+                (int(parent_itc),)
+            )
+            self._conn.commit()
+            return cur.rowcount
 
     def close(self):
         with self._lock:

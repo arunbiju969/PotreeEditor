@@ -310,9 +310,18 @@ class EditHistoryDialog(QDialog):
             return
 
         try:
-            res = parent.manager.revert_potree_octree(potree_dir, rec)
+            parent.manager.revert_potree_octree(potree_dir, rec)
             rev_pts = res.get("reverted_points", 0)
             self.settings_store.mark_edit_reverted(edit_id)
+            self.settings_store.revert_tree_edits_by_parent_itc(target_itc)
+
+            # Invalidate caches in Python and JavaScript
+            parent.manager.clear_tree_cache(target_itc)
+            parent._run_js(f"if (window.invalidateTreeCache) window.invalidateTreeCache({target_itc});")
+            for a_id in rec.get("assigned_itcs", []):
+                parent.manager.clear_tree_cache(int(a_id))
+                parent._run_js(f"if (window.invalidateTreeCache) window.invalidateTreeCache({int(a_id)});")
+            parent.manager.sync_tree_edits_from_db(self.settings_store)
 
             # Remove from staged edits if currently present
             parent.manager.staged_edits = [
@@ -321,6 +330,7 @@ class EditHistoryDialog(QDialog):
             ]
             parent.refresh_staged_edits_table()
             parent._run_js("window.reloadCurrentPointCloud();")
+            parent._run_js(f"window.viewTreeById({target_itc});")
 
             QMessageBox.information(
                 self,
@@ -380,6 +390,7 @@ class MainWindow(QMainWindow):
 
         # Register manager background indexing callback
         self.manager.add_indexing_callback(lambda data: self.signaler.indexing_event.emit(data))
+        self.manager.set_settings_store(self.settings_store)
 
         self.init_ui()
         self._wire_settings_persistence()
@@ -2853,6 +2864,21 @@ class MainWindow(QMainWindow):
             return
 
         id_map = dlg.get_id_mapping()
+
+        # Ensure local edits directory exists and copy canonical split file
+        potree_dir = getattr(self, "current_potree_dir", None) or self.potree_dir
+        base_dir = os.path.dirname(os.path.abspath(potree_dir)) if potree_dir else os.getcwd()
+        edits_dir = os.path.join(base_dir, "edits", "trees")
+        os.makedirs(edits_dir, exist_ok=True)
+        canonical_las = os.path.join(edits_dir, f"tree_{itc}_split.las")
+        if seg_las and os.path.exists(seg_las) and os.path.abspath(seg_las) != os.path.abspath(canonical_las):
+            try:
+                import shutil
+                shutil.copy2(seg_las, canonical_las)
+                seg_las = canonical_las
+            except Exception as ce:
+                print(f"[MainWindow] Error copying split LAS to edits dir: {ce}")
+
         # Stage the edit in PointCloudManager
         staged_edit = {
             "type": "ff3d_split",
@@ -2865,7 +2891,6 @@ class MainWindow(QMainWindow):
         }
         # 1. Instant Octree Commit (In-place patch)
         if dlg.action_choice == "octree":
-            potree_dir = getattr(self, "current_potree_dir", None)
             if not potree_dir or not os.path.isdir(potree_dir):
                 QMessageBox.warning(self, "No Potree Octree Loaded",
                                     "No Potree converted octree folder is currently loaded to patch.\n"
@@ -2902,8 +2927,40 @@ class MainWindow(QMainWindow):
                 self.manager.add_staged_edit(staged_edit)
                 self.refresh_staged_edits_table()
 
+                # 3. Register tree edits in database index and manager routing
+                try:
+                    import laspy
+                    import numpy as np
+                    s_las = laspy.read(seg_las)
+                    extra_d = [d.name for d in s_las.point_format.dimensions]
+                    if "ff3d_tree_id" in extra_d:
+                        c_arr = np.asarray(s_las.ff3d_tree_id, dtype=np.int32)
+                    elif "tree_id" in extra_d:
+                        c_arr = np.asarray(s_las.tree_id, dtype=np.int32)
+                    else:
+                        c_arr = np.zeros(len(s_las), dtype=np.int32)
+
+                    for c_idx, assigned_id in id_map.items():
+                        c_int = int(c_idx)
+                        a_int = int(assigned_id)
+                        pt_cnt = int((c_arr == c_int).sum())
+                        self.settings_store.register_tree_edit(a_int, itc, c_int, db_id, seg_las, pt_cnt)
+                        self.manager.register_tree_edit(a_int, itc, c_int, db_id, seg_las, pt_cnt, id_map)
+                except Exception as reg_err:
+                    print(f"[MainWindow] Error registering tree edits: {reg_err}")
+
+                # 4. Invalidate caches so next query fetches the new single tree
+                self.manager.clear_tree_cache(itc)
+                self._run_js(f"if (window.invalidateTreeCache) window.invalidateTreeCache({itc});")
+                for assigned_id in id_map.values():
+                    self.manager.clear_tree_cache(int(assigned_id))
+                    self._run_js(f"if (window.invalidateTreeCache) window.invalidateTreeCache({int(assigned_id)});")
+
                 self.status_bar.showMessage(f"Patched Potree octree ({pts_changed:,} points) and logged to database!", 8000)
                 self._run_js("window.reloadCurrentPointCloud();")
+                # Immediately refresh the tree view so Forestry displays ONLY the single tree!
+                self._run_js(f"window.viewTreeById({itc});")
+
                 if hasattr(self, "btn_confirm_segmentation"):
                     self.btn_confirm_segmentation.setEnabled(False)
                 QMessageBox.information(
@@ -2916,7 +2973,7 @@ class MainWindow(QMainWindow):
                     f"• Octree Folder: {os.path.basename(potree_dir)}\n"
                     f"• Database History ID: #{db_id}\n\n"
                     "The edit has been automatically staged and logged into settings.db.\n"
-                    "You can revert this change anytime via 'Edit History & Undo / Revert'."
+                    "The Forestry tree view has refreshed to show only Tree #{itc}."
                 )
             except Exception as e:
                 QMessageBox.critical(self, "Octree Patch Failed", f"Failed to patch Potree octree in place:\n\n{e}")
@@ -2932,6 +2989,33 @@ class MainWindow(QMainWindow):
         else:
             self.manager.add_staged_edit(staged_edit)
             self.refresh_staged_edits_table()
+            # Register in-memory so Forestry view displays the single tree while staged
+            try:
+                import laspy
+                import numpy as np
+                s_las = laspy.read(seg_las)
+                extra_d = [d.name for d in s_las.point_format.dimensions]
+                if "ff3d_tree_id" in extra_d:
+                    c_arr = np.asarray(s_las.ff3d_tree_id, dtype=np.int32)
+                elif "tree_id" in extra_d:
+                    c_arr = np.asarray(s_las.tree_id, dtype=np.int32)
+                else:
+                    c_arr = np.zeros(len(s_las), dtype=np.int32)
+
+                for c_idx, assigned_id in id_map.items():
+                    c_int = int(c_idx)
+                    a_int = int(assigned_id)
+                    pt_cnt = int((c_arr == c_int).sum())
+                    self.manager.register_tree_edit(a_int, itc, c_int, 0, seg_las, pt_cnt, id_map)
+            except Exception:
+                pass
+            self.manager.clear_tree_cache(itc)
+            self._run_js(f"if (window.invalidateTreeCache) window.invalidateTreeCache({itc});")
+            for assigned_id in id_map.values():
+                self.manager.clear_tree_cache(int(assigned_id))
+                self._run_js(f"if (window.invalidateTreeCache) window.invalidateTreeCache({int(assigned_id)});")
+            self._run_js(f"window.viewTreeById({itc});")
+
             if hasattr(self, "btn_confirm_segmentation"):
                 self.btn_confirm_segmentation.setEnabled(False)
             self.status_bar.showMessage(f"Staged ForestFormer3D split for Tree #{itc} -> IDs {list(id_map.values())}", 8000)
@@ -3441,10 +3525,20 @@ class MainWindow(QMainWindow):
                     try:
                         self.manager.revert_potree_octree(potree_dir, edit)
                         db_id = edit.get("db_edit_id")
+                        target_itc = edit.get("target_itc")
                         if db_id:
                             self.settings_store.mark_edit_reverted(db_id)
+                        if target_itc:
+                            self.settings_store.revert_tree_edits_by_parent_itc(target_itc)
+                            self.manager.clear_tree_cache(target_itc)
+                            self._run_js(f"if (window.invalidateTreeCache) window.invalidateTreeCache({target_itc});")
+                            for a_id in edit.get("id_mapping", {}).values():
+                                self.manager.clear_tree_cache(int(a_id))
+                                self._run_js(f"if (window.invalidateTreeCache) window.invalidateTreeCache({int(a_id)});")
+                            self.manager.sync_tree_edits_from_db(self.settings_store)
+                            self._run_js(f"window.viewTreeById({target_itc});")
                         self._run_js("window.reloadCurrentPointCloud();")
-                        self.status_bar.showMessage(f"Reverted octree edit for Tree #{edit.get('target_itc')}", 6000)
+                        self.status_bar.showMessage(f"Reverted octree edit for Tree #{target_itc}", 6000)
                     except Exception as e:
                         QMessageBox.critical(self, "Revert Failed", f"Failed to revert octree edit:\n\n{e}")
                         return
@@ -3569,6 +3663,24 @@ class MainWindow(QMainWindow):
                             e["db_edit_id"] = db_id
                         except Exception as log_err:
                             print(f"[MainWindow] Error logging edit: {log_err}")
+
+                    if e.get("type") == "ff3d_split" and e.get("segmented_las"):
+                        try:
+                            import laspy
+                            import numpy as np
+                            s_las = laspy.read(e["segmented_las"])
+                            extra_d = [d.name for d in s_las.point_format.dimensions]
+                            c_arr = np.asarray(s_las.ff3d_tree_id if "ff3d_tree_id" in extra_d else (s_las.tree_id if "tree_id" in extra_d else np.zeros(len(s_las))), dtype=np.int32)
+                            p_itc = int(e.get("target_itc", 0))
+                            id_map = e.get("id_mapping", {})
+                            for c_idx, assigned_id in id_map.items():
+                                c_int = int(c_idx)
+                                a_int = int(assigned_id)
+                                pt_cnt = int((c_arr == c_int).sum())
+                                self.settings_store.register_tree_edit(a_int, p_itc, c_int, e.get("db_edit_id", 0), e["segmented_las"], pt_cnt)
+                                self.manager.register_tree_edit(a_int, p_itc, c_int, e.get("db_edit_id", 0), e["segmented_las"], pt_cnt, id_map)
+                        except Exception as tree_err:
+                            print(f"[MainWindow] Error registering tree edit on commit: {tree_err}")
                 self._run_js("window.reloadCurrentPointCloud();")
             except Exception as pe:
                 print(f"[MainWindow] Warning: Failed to patch Potree octree after LAS commit: {pe}")
