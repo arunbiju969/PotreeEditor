@@ -753,8 +753,23 @@ class PointCloudManager:
             "total_points": processed_points,
             "modified_points": total_modified,
             "edits_count": len(edits),
-            "elapsed_seconds": elapsed
+            "elapsed_seconds": elapsed,
+            "committed_edits": edits
         }
+
+    def patch_potree_octree(self, octree_dir: str, edits: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+        """Apply staged edits directly to a Potree 2.0 octree in place in seconds."""
+        if edits is None:
+            edits = list(self.staged_edits)
+        if not edits:
+            raise ValueError("No staged edits to patch.")
+
+        from pathlib import Path
+        from potree2_patch import Potree2Cloud
+        cloud = Potree2Cloud(Path(octree_dir))
+        res = cloud.patch_edits(edits)
+        print(f"[PointCloudManager] Successfully patched Potree octree {octree_dir}: {res}")
+        return res
 
     # -------------------------------------------------------------------------
     # Spatial Queries & In-Memory Fallbacks

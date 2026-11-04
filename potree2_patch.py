@@ -260,6 +260,181 @@ class Potree2Cloud:
             raise
         return path
 
+    def patch_edits(self, edits: list) -> dict:
+        """Apply a list of staged edits (ff3d_split, polygon, box) directly to octree.bin in place."""
+        if not edits:
+            return {"changed_points": 0, "touched_attributes": []}
+
+        mm = self.records("r+")
+        touched_attrs = set()
+        total_changed = 0
+
+        try:
+            has_itc = "itc" in self.dtype.names
+            has_tree_id = "tree_id" in self.dtype.names or "treeID" in self.dtype.names
+            tree_id_field = "tree_id" if "tree_id" in self.dtype.names else ("treeID" if "treeID" in self.dtype.names else None)
+            has_cls = "classification" in self.dtype.names
+            has_sem = "semantic_pred" in self.dtype.names
+
+            sc = np.asarray(self.scale, np.float64)
+            of = np.asarray(self.offset, np.float64)
+
+            for edit in edits:
+                etype = edit.get("type", "polygon")
+                action = edit.get("action", "assign_itc")
+
+                if etype == "ff3d_split" and "segmented_las" in edit and os.path.exists(edit["segmented_las"]):
+                    import laspy
+                    from scipy.spatial import cKDTree
+
+                    seg_data = laspy.read(edit["segmented_las"])
+                    seg_xyz = np.column_stack([
+                        np.asarray(seg_data.x, dtype=np.float64),
+                        np.asarray(seg_data.y, dtype=np.float64),
+                        np.asarray(seg_data.z, dtype=np.float64)
+                    ])
+                    extra_names = [d.name for d in seg_data.point_format.extra_dimensions]
+                    if "ff3d_tree_id" in extra_names:
+                        seg_tree_ids = np.asarray(seg_data.ff3d_tree_id, dtype=np.int32)
+                    elif "tree_id" in extra_names:
+                        seg_tree_ids = np.asarray(seg_data.tree_id, dtype=np.int32)
+                    else:
+                        seg_tree_ids = np.zeros(len(seg_data), dtype=np.int32)
+
+                    if "ff3d_semantic" in extra_names:
+                        seg_sem = np.asarray(seg_data.ff3d_semantic, dtype=np.int32)
+                    elif "semantic_pred" in extra_names:
+                        seg_sem = np.asarray(seg_data.semantic_pred, dtype=np.int32)
+                    else:
+                        seg_sem = None
+
+                    id_mapping = edit.get("id_mapping", {})
+                    mapped_itc = np.zeros(len(seg_data), dtype=np.int32)
+                    for raw_id, target_id in id_mapping.items():
+                        mapped_itc[seg_tree_ids == int(raw_id)] = int(target_id)
+
+                    target_itc = edit.get("target_itc")
+                    min_x, max_x = float(np.min(seg_xyz[:, 0])), float(np.max(seg_xyz[:, 0]))
+                    min_y, max_y = float(np.min(seg_xyz[:, 1])), float(np.max(seg_xyz[:, 1]))
+                    min_z, max_z = float(np.min(seg_xyz[:, 2])), float(np.max(seg_xyz[:, 2]))
+
+                    rx0, rx1 = int(np.floor((min_x - of[0]) / sc[0])), int(np.ceil((max_x - of[0]) / sc[0]))
+                    ry0, ry1 = int(np.floor((min_y - of[1]) / sc[1])), int(np.ceil((max_y - of[1]) / sc[1]))
+                    rz0, rz1 = int(np.floor((min_z - of[2]) / sc[2])), int(np.ceil((max_z - of[2]) / sc[2]))
+
+                    bmask = ((mm["x"] >= rx0) & (mm["x"] <= rx1) &
+                             (mm["y"] >= ry0) & (mm["y"] <= ry1) &
+                             (mm["z"] >= rz0) & (mm["z"] <= rz1))
+
+                    if target_itc is not None and has_itc:
+                        bmask |= (mm["itc"] == int(target_itc))
+
+                    cands = np.flatnonzero(bmask)
+                    if len(cands) == 0:
+                        continue
+
+                    cand_xyz = np.column_stack([
+                        mm["x"][cands].astype(np.float64) * sc[0] + of[0],
+                        mm["y"][cands].astype(np.float64) * sc[1] + of[1],
+                        mm["z"][cands].astype(np.float64) * sc[2] + of[2]
+                    ])
+
+                    kdtree = cKDTree(seg_xyz)
+                    dists, indices = kdtree.query(cand_xyz, distance_upper_bound=0.03)
+                    valid = dists < 0.03
+
+                    if valid.any():
+                        cand_matched = cands[valid]
+                        matched_seg_idx = indices[valid]
+                        new_itcs = mapped_itc[matched_seg_idx]
+
+                        if has_itc:
+                            mm["itc"][cand_matched] = new_itcs
+                            touched_attrs.add("itc")
+
+                        if has_tree_id and tree_id_field:
+                            new_tids = np.where(new_itcs > 0, new_itcs - 1, -1).astype(np.int32)
+                            mm[tree_id_field][cand_matched] = new_tids
+                            touched_attrs.add(tree_id_field)
+
+                        is_ground = (seg_tree_ids[matched_seg_idx] < 0) | (new_itcs == 0)
+                        if has_cls and is_ground.any():
+                            mm["classification"][cand_matched[is_ground]] = 2
+                            touched_attrs.add("classification")
+
+                        if has_sem and seg_sem is not None:
+                            mm["semantic_pred"][cand_matched] = seg_sem[matched_seg_idx]
+                            touched_attrs.add("semantic_pred")
+
+                        total_changed += int(valid.sum())
+
+                elif etype in ("polygon", "box"):
+                    from matplotlib.path import Path as MplPath
+                    val = edit.get("value", 0)
+                    if etype == "polygon" and "coords" in edit and len(edit["coords"]) >= 3:
+                        pts = np.array(edit["coords"])
+                        min_x, max_x = float(np.min(pts[:, 0])), float(np.max(pts[:, 0]))
+                        min_y, max_y = float(np.min(pts[:, 1])), float(np.max(pts[:, 1]))
+                        rx0, rx1 = int(np.floor((min_x - of[0]) / sc[0])), int(np.ceil((max_x - of[0]) / sc[0]))
+                        ry0, ry1 = int(np.floor((min_y - of[1]) / sc[1])), int(np.ceil((max_y - of[1]) / sc[1]))
+                        bmask = ((mm["x"] >= rx0) & (mm["x"] <= rx1) &
+                                 (mm["y"] >= ry0) & (mm["y"] <= ry1))
+                        cands = np.flatnonzero(bmask)
+                        if len(cands) > 0:
+                            cand_pts = np.column_stack((
+                                mm["x"][cands].astype(np.float64) * sc[0] + of[0],
+                                mm["y"][cands].astype(np.float64) * sc[1] + of[1]
+                            ))
+                            inside = MplPath(pts[:, :2]).contains_points(cand_pts)
+                            matched = cands[inside]
+                        else:
+                            matched = np.array([], dtype=int)
+                    elif etype == "box" and "min" in edit and "max" in edit:
+                        min_b, max_b = edit["min"], edit["max"]
+                        rx0, rx1 = int(np.floor((min_b[0] - of[0]) / sc[0])), int(np.ceil((max_b[0] - of[0]) / sc[0]))
+                        ry0, ry1 = int(np.floor((min_b[1] - of[1]) / sc[1])), int(np.ceil((max_b[1] - of[1]) / sc[1]))
+                        rz0, rz1 = int(np.floor((min_b[2] - of[2]) / sc[2])), int(np.ceil((max_b[2] - of[2]) / sc[2]))
+                        bmask = ((mm["x"] >= rx0) & (mm["x"] <= rx1) &
+                                 (mm["y"] >= ry0) & (mm["y"] <= ry1) &
+                                 (mm["z"] >= rz0) & (mm["z"] <= rz1))
+                        matched = np.flatnonzero(bmask)
+                    else:
+                        matched = np.array([], dtype=int)
+
+                    if len(matched) > 0:
+                        total_changed += len(matched)
+                        if action == "assign_itc":
+                            if has_itc:
+                                mm["itc"][matched] = int(val)
+                                touched_attrs.add("itc")
+                            if has_tree_id and tree_id_field:
+                                mm[tree_id_field][matched] = int(val) - 1 if int(val) > 0 else -1
+                                touched_attrs.add(tree_id_field)
+                        elif action == "mark_noise":
+                            if has_cls:
+                                mm["classification"][matched] = 7
+                                touched_attrs.add("classification")
+                            if has_itc:
+                                mm["itc"][matched] = int(val) if val is not None else 9999
+                                touched_attrs.add("itc")
+                        elif action == "set_classification":
+                            if has_cls:
+                                mm["classification"][matched] = int(val)
+                                touched_attrs.add("classification")
+
+            mm.flush()
+            for attr_name in touched_attrs:
+                self.refresh_statistics(attr_name, mm)
+            self.write_metadata()
+
+            return {
+                "success": True,
+                "changed_points": total_changed,
+                "touched_attributes": list(touched_attrs)
+            }
+        finally:
+            del mm
+
     def summary(self) -> str:
         ranges = self.record_ranges()
         proxies = sum(1 for n in self.nodes if n[0] == PROXY)

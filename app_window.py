@@ -135,21 +135,29 @@ class ConfirmSplitDialog(QDialog):
 
         h_btns = QHBoxLayout()
         btn_cancel = QPushButton("Cancel")
-        btn_cancel.setStyleSheet("padding: 6px 14px;")
+        btn_cancel.setStyleSheet("padding: 6px 12px; font-size: 11px;")
         btn_cancel.clicked.connect(self.reject)
 
-        self.btn_stage = QPushButton("Stage Edits Only")
-        self.btn_stage.setStyleSheet("padding: 6px 14px; background-color: #0284c7; color: white; font-weight: 600; border-radius: 4px;")
+        self.btn_stage = QPushButton("Stage for LAS Commit")
+        self.btn_stage.setStyleSheet("padding: 6px 12px; background-color: #334155; color: #e2e8f0; font-size: 11px; border-radius: 4px;")
+        self.btn_stage.setToolTip("Add this split to the Staged Edits list to review and commit later.")
         self.btn_stage.clicked.connect(lambda: self._finish("stage"))
 
-        self.btn_commit = QPushButton("Stage & Commit Now...")
-        self.btn_commit.setStyleSheet("padding: 6px 14px; background-color: #059669; color: white; font-weight: 700; border-radius: 4px;")
-        self.btn_commit.clicked.connect(lambda: self._finish("commit"))
+        self.btn_commit_octree = QPushButton("Commit to Octree Now (Instant)")
+        self.btn_commit_octree.setStyleSheet("padding: 6px 14px; background-color: #0284c7; color: white; font-weight: 700; font-size: 11px; border-radius: 4px;")
+        self.btn_commit_octree.setToolTip("Patch octree.bin and metadata.json in place immediately (~2s) and refresh viewer.")
+        self.btn_commit_octree.clicked.connect(lambda: self._finish("octree"))
+
+        self.btn_commit_both = QPushButton("Commit to File & Octree...")
+        self.btn_commit_both.setStyleSheet("padding: 6px 14px; background-color: #059669; color: white; font-weight: 700; font-size: 11px; border-radius: 4px;")
+        self.btn_commit_both.setToolTip("Save new LAS/LAZ file AND update the loaded Potree octree in place.")
+        self.btn_commit_both.clicked.connect(lambda: self._finish("both"))
 
         h_btns.addWidget(btn_cancel)
         h_btns.addStretch()
         h_btns.addWidget(self.btn_stage)
-        h_btns.addWidget(self.btn_commit)
+        h_btns.addWidget(self.btn_commit_octree)
+        h_btns.addWidget(self.btn_commit_both)
         v.addLayout(h_btns)
 
     def _finish(self, choice: str):
@@ -173,6 +181,7 @@ class MainWindow(QMainWindow):
 
         self.current_las_path: Optional[str] = None
         self.current_potree_url: Optional[str] = None
+        self.current_potree_dir: Optional[str] = None
         self.commit_dialog: Optional[QProgressDialog] = None
         self.commit_worker: Optional[CommitWorker] = None
         self.conversion_dialog: Optional[ConversionDialog] = None
@@ -1769,6 +1778,9 @@ class MainWindow(QMainWindow):
         """Programmatic half of open_potree_file — usable from CLI auto-load too."""
         folder = os.path.dirname(os.path.abspath(file_path))
         entry_file = os.path.basename(file_path)
+        self.current_potree_dir = folder
+        if self.manager:
+            self.manager.potree_dir = folder
 
         alias = "cloud_" + str(abs(hash(folder)) % 100000)
         self.server.register_pointcloud_dir(alias, folder)
@@ -1871,6 +1883,9 @@ class MainWindow(QMainWindow):
         cloud_js = os.path.join(converted_dir, "cloud.js")
 
         if os.path.exists(meta_json) or os.path.exists(cloud_js):
+            self.current_potree_dir = converted_dir
+            if self.manager:
+                self.manager.potree_dir = converted_dir
             entry_file = "metadata.json" if os.path.exists(meta_json) else "cloud.js"
             alias = "cloud_" + str(abs(hash(converted_dir)) % 100000)
             self.server.register_pointcloud_dir(alias, converted_dir)
@@ -2641,17 +2656,54 @@ class MainWindow(QMainWindow):
             "label": f"FF3D Split Tree #{itc} -> {list(id_map.values())}",
             "color": "#06b6d4"
         }
-        self.manager.add_staged_edit(staged_edit)
-        self.refresh_staged_edits_table()
+        # 1. Instant Octree Commit (In-place patch)
+        if dlg.action_choice == "octree":
+            potree_dir = getattr(self, "current_potree_dir", None)
+            if not potree_dir or not os.path.isdir(potree_dir):
+                QMessageBox.warning(self, "No Potree Octree Loaded",
+                                    "No Potree converted octree folder is currently loaded to patch.\n"
+                                    "Staged the edit for LAS commit instead.")
+                self.manager.add_staged_edit(staged_edit)
+                self.refresh_staged_edits_table()
+                return
 
-        if hasattr(self, "btn_confirm_segmentation"):
-            self.btn_confirm_segmentation.setEnabled(False)
+            self.status_bar.showMessage(f"Patching Potree 2.0 octree in place for Tree #{itc}...", 10000)
+            QApplication.processEvents()
+            try:
+                res = self.manager.patch_potree_octree(potree_dir, [staged_edit])
+                pts_changed = res.get("changed_points", 0)
+                self.status_bar.showMessage(f"Patched Potree octree ({pts_changed:,} points updated) in place!", 8000)
+                self._run_js("window.reloadCurrentPointCloud();")
+                if hasattr(self, "btn_confirm_segmentation"):
+                    self.btn_confirm_segmentation.setEnabled(False)
+                QMessageBox.information(
+                    self,
+                    "Octree In-Place Commit Complete",
+                    f"Successfully committed ForestFormer3D split to the active Potree Octree!\n\n"
+                    f"• Target Tree: #{itc}\n"
+                    f"• Assigned Tree IDs: {list(id_map.values())}\n"
+                    f"• Octree Points Updated: {pts_changed:,}\n"
+                    f"• Octree Folder: {os.path.basename(potree_dir)}\n\n"
+                    "The change is permanently written into octree.bin and metadata.json.\n"
+                    "The viewer has been reloaded to show the new segmentation."
+                )
+            except Exception as e:
+                QMessageBox.critical(self, "Octree Patch Failed", f"Failed to patch Potree octree in place:\n\n{e}")
+                self.status_bar.showMessage(f"Octree patch error: {e}", 6000)
 
-        self.status_bar.showMessage(f"Staged ForestFormer3D split for Tree #{itc} -> IDs {list(id_map.values())}", 8000)
-
-        if dlg.action_choice == "commit":
+        # 2. Commit to Both (Streaming LAS/LAZ + In-place Octree Patch)
+        elif dlg.action_choice in ("both", "commit"):
+            self.manager.add_staged_edit(staged_edit)
+            self.refresh_staged_edits_table()
             self.commit_staged_edits_action()
+
+        # 3. Stage Edits Only
         else:
+            self.manager.add_staged_edit(staged_edit)
+            self.refresh_staged_edits_table()
+            if hasattr(self, "btn_confirm_segmentation"):
+                self.btn_confirm_segmentation.setEnabled(False)
+            self.status_bar.showMessage(f"Staged ForestFormer3D split for Tree #{itc} -> IDs {list(id_map.values())}", 8000)
             QMessageBox.information(
                 self,
                 "Split Staged",
@@ -3220,6 +3272,18 @@ class MainWindow(QMainWindow):
             self.clear_all_staged_edits()
         else:
             self.refresh_staged_edits_table()
+
+        # Auto-patch the active Potree 2.0 octree so it stays synchronized with the committed LAS file!
+        potree_dir = getattr(self, "current_potree_dir", None)
+        committed_edits = result.get("committed_edits", [])
+        if potree_dir and os.path.isdir(potree_dir) and committed_edits:
+            try:
+                self.status_bar.showMessage("Syncing committed edits to active Potree 2.0 octree in place...", 6000)
+                oct_res = self.manager.patch_potree_octree(potree_dir, committed_edits)
+                print(f"[MainWindow] Auto-patched Potree octree {potree_dir}: {oct_res}")
+                self._run_js("window.reloadCurrentPointCloud();")
+            except Exception as pe:
+                print(f"[MainWindow] Warning: Failed to patch Potree octree after LAS commit: {pe}")
 
         self.lbl_save_status.setText(f"Status: <span style='color:#10b981;'>Committed to {os.path.basename(out)}</span>")
         self.status_bar.showMessage(f"Committed {count} edits in {sec:.1f}s. Saved: {os.path.basename(out)}")

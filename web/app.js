@@ -514,6 +514,18 @@ window.loadPointCloudUrl = async function(url, displayName) {
     }
 };
 
+window.reloadCurrentPointCloud = async function() {
+    if (!currentPointCloud) return;
+    const name = currentPointCloud.name;
+    const url = currentPointCloud.url || (currentPointCloud.pcoGeometry && currentPointCloud.pcoGeometry.url);
+    if (!url) return;
+    console.log('[PotreeHybrid] Reloading active point cloud layer:', name);
+    removeLayer(name);
+    const cleanUrl = url.split('?')[0];
+    const busterUrl = `${cleanUrl}?t=${Date.now()}`;
+    await window.loadPointCloudUrl(busterUrl, name);
+};
+
 // ---------------------------------------------------------------------------
 // 3D Billboard Sprite Label Generator
 // ---------------------------------------------------------------------------
