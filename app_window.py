@@ -3540,7 +3540,7 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "grp_stand_filter"):
             return
 
-        if n_cnt <= 0 or not trees:
+        if (n_cnt <= 0 and len(trees) <= 1) or not trees:
             self.grp_stand_filter.setVisible(False)
             self.list_stand_trees.clear()
             if hasattr(self, "bar_stand_filter"):
@@ -3550,15 +3550,15 @@ class MainWindow(QMainWindow):
             return
 
         num_neighbor_trees = len([t for t in trees if not t.get("isTarget") and t.get("id", 0) > 0])
+        stand_label = f"🌲 Stand: Tree #{target_itc} ({num_neighbor_trees} neighbors, {rad:.0f}m)" if n_cnt > 0 else f"🌲 Stand: {len(trees)} trees detected"
         if hasattr(self, "bar_stand_filter"):
-            self.lbl_top_stand_info.setText(f"🌲 Stand: Tree #{target_itc} ({num_neighbor_trees} neighbors, {rad:.0f}m)")
+            self.lbl_top_stand_info.setText(stand_label)
             self.bar_stand_filter.setVisible(True)
             self._set_stand_filter_buttons_enabled(True)
 
         self.grp_stand_filter.setVisible(True)
-        self.lbl_stand_filter_info.setText(
-            f"Stand: {num_neighbor_trees} neighbor trees ({rad:.0f}m radius). Check trees to keep:"
-        )
+        info_label = f"Stand: {num_neighbor_trees} neighbor trees ({rad:.0f}m radius). Check trees to keep:" if n_cnt > 0 else f"Stand: {len(trees)} trees detected. Check trees to keep:"
+        self.lbl_stand_filter_info.setText(info_label)
 
         self.list_stand_trees.blockSignals(True)
         self.list_stand_trees.clear()

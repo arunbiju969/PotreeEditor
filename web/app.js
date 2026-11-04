@@ -1927,28 +1927,40 @@ let treeActiveFilteredData = null;
 
 function getStandTreeList() {
     if (!treeRawData) return [];
-    const { count, targetCount, neighborCount, scalars } = treeRawData;
+    const { count, targetCount, neighborCount, scalars, ff3dTrees, isSegmented } = treeRawData;
     const tidArr = scalars ? (scalars.itc || scalars.tree_id || scalars.treeID) : null;
 
     const treeCounts = new Map();
-    // Target tree points:
-    treeCounts.set(treeOverlayItc, targetCount);
+    const isSeg = Boolean(isSegmented || (ff3dTrees && ff3dTrees > 0));
 
-    // Neighbor points:
-    if (tidArr && neighborCount > 0) {
-        for (let i = targetCount; i < count; i++) {
+    if (isSeg && tidArr) {
+        for (let i = 0; i < count; i++) {
             const tid = Math.round(tidArr[i]);
             treeCounts.set(tid, (treeCounts.get(tid) || 0) + 1);
         }
-    } else if (neighborCount > 0) {
-        treeCounts.set(0, neighborCount);
+    } else {
+        // Target tree points:
+        treeCounts.set(treeOverlayItc, targetCount);
+
+        // Neighbor points:
+        if (tidArr && neighborCount > 0) {
+            for (let i = targetCount; i < count; i++) {
+                const tid = Math.round(tidArr[i]);
+                treeCounts.set(tid, (treeCounts.get(tid) || 0) + 1);
+            }
+        } else if (neighborCount > 0) {
+            treeCounts.set(0, neighborCount);
+        }
     }
 
     const list = [];
     for (const [tid, ptCount] of treeCounts.entries()) {
+        if (isSeg && tid === treeOverlayItc && ptCount <= 0) {
+            continue;
+        }
         list.push({
             id: tid,
-            isTarget: tid === treeOverlayItc,
+            isTarget: isSeg ? false : (tid === treeOverlayItc),
             count: ptCount
         });
     }
@@ -2374,11 +2386,14 @@ function updateTreeColors() {
     // 1. Tree ID / ITC mode: color all trees (target tree and neighbor trees) by distinct Tree ID
     const isTreeIdMode = ['itc', 'treeid', 'tree_id', 'trees', 'tree'].includes(nMode);
     if (isTreeIdMode) {
-        const tCount = targetCount || (count - (neighborCount || 0));
+        const isSeg = Boolean(activeData.isSegmented || (activeData.ff3dTrees && activeData.ff3dTrees > 0));
+        const tCount = isSeg ? 0 : (targetCount || (count - (neighborCount || 0)));
         const tidArr = scalars ? (scalars.itc || scalars.tree_id || scalars.treeID) : null;
         for (let i = 0; i < count; i++) {
             let tid = 0;
-            if (i < tCount) {
+            if (isSeg && tidArr) {
+                tid = Math.round(tidArr[i]);
+            } else if (i < tCount) {
                 tid = (tidArr ? Math.round(tidArr[i]) : treeOverlayItc) || 1;
             } else {
                 tid = tidArr ? Math.round(tidArr[i]) : 0;
@@ -2776,8 +2791,18 @@ window.viewTreeById = async function (itcValue, hintX, hintY, radius, neighborMo
             classification,
             scalars,
             cx, cy, cz,
-            bboxMin, bboxMax
+            bboxMin, bboxMax,
+            ff3dTrees,
+            ff3dLas,
+            isSegmented: seg
         };
+
+        // Reset previous stand filter state immediately so the new cloud
+        // renders cleanly with its updated points, scalars, and colors!
+        treeFilterActive = false;
+        treeFilterMode = false;
+        treeActiveFilteredData = null;
+        treeFilterSelectedIds = new Set();
 
         // Hide octree context now that valid tree points have arrived
         hideTreeContext();
@@ -2845,9 +2870,6 @@ window.viewTreeById = async function (itcValue, hintX, hintY, radius, neighborMo
         updateTreeColors();
 
         const standTrees = getStandTreeList();
-        treeFilterActive = false;
-        treeActiveFilteredData = null;
-        treeFilterSelectedIds = new Set();
         updateStandFilterHud();
 
         // Target-tree bbox (world): powers the bounding box + height label,
@@ -2855,7 +2877,7 @@ window.viewTreeById = async function (itcValue, hintX, hintY, radius, neighborMo
         {
             let fx0 = Infinity, fy0 = Infinity, fz0 = Infinity;
             let fx1 = -Infinity, fy1 = -Infinity, fz1 = -Infinity;
-            const nT = Math.max(1, Math.min(targetCount, count));
+            const nT = (targetCount > 0 && !seg) ? Math.min(targetCount, count) : count;
             for (let i = 0; i < nT * 3; i += 3) {
                 if (xyz[i] < fx0) fx0 = xyz[i];       if (xyz[i] > fx1) fx1 = xyz[i];
                 if (xyz[i+1] < fy0) fy0 = xyz[i+1];   if (xyz[i+1] > fy1) fy1 = xyz[i+1];
@@ -2866,7 +2888,7 @@ window.viewTreeById = async function (itcValue, hintX, hintY, radius, neighborMo
                 max: [cx + fx1, cy + fy1, cz + fz1]
             };
 
-            if (isNewTree) {
+            if (isNewTree || seg) {
                 const center = new THREE.Vector3(
                     cx + (fx0 + fx1) / 2,
                     cy + (fy0 + fy1) / 2,
@@ -2921,7 +2943,7 @@ window.viewTreeById = async function (itcValue, hintX, hintY, radius, neighborMo
             keep_tree_ids: activeKeep || null
         }).catch(() => {});
 
-        if (neighborCount > 0) {
+        if (neighborCount > 0 || (seg && ff3dTrees > 0)) {
             postJSON('/api/event', {
                 event: 'tree_stand_loaded',
                 target_itc: itcValue,
