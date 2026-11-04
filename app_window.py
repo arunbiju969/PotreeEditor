@@ -1819,9 +1819,11 @@ class MainWindow(QMainWindow):
 
         self.combo_neighbor_mode = QComboBox()
         self.combo_neighbor_mode.setStyleSheet("font-size: 11px; padding: 3px 6px;")
-        self.combo_neighbor_mode.addItem("Neighbor Trees & Canopy (Recommended)", "canopy")
+        # First entry is the default stand mode: the whole stand cylinder under
+        # Include Neighbors (canopy + ground) gives ForestFormer3D full context.
+        self.combo_neighbor_mode.addItem("All Stand Points (Canopy + Ground) (Recommended)", "all")
+        self.combo_neighbor_mode.addItem("Neighbor Trees & Canopy", "canopy")
         self.combo_neighbor_mode.addItem("Segmented Trees Only (ITC > 0)", "trees_only")
-        self.combo_neighbor_mode.addItem("All Stand Points (Canopy + Ground)", "all")
         self.combo_neighbor_mode.setEnabled(False)
         h_nmode.addWidget(self.combo_neighbor_mode)
         v_tree.addLayout(h_nmode)
@@ -3105,7 +3107,7 @@ class MainWindow(QMainWindow):
             self.sidebar_tabs.setCurrentIndex(1)
 
         radius = float(self.spin_tree_radius.value()) if (hasattr(self, "chk_tree_neighbors") and self.chk_tree_neighbors.isChecked()) else 0.0
-        n_mode = self.combo_neighbor_mode.currentData() if hasattr(self, "combo_neighbor_mode") else "canopy"
+        n_mode = self.combo_neighbor_mode.currentData() if hasattr(self, "combo_neighbor_mode") else "all"
         g_rad = float(self.spin_tree_ground.value()) if (hasattr(self, "chk_tree_ground") and self.chk_tree_ground.isChecked()) else 0.0
 
         hint_x = f"{self._last_picked_x}" if (hasattr(self, "_last_picked_itc") and self._last_picked_itc == itc and hasattr(self, "_last_picked_x")) else "null"
@@ -3149,7 +3151,7 @@ class MainWindow(QMainWindow):
             self.ribbon_stack.setCurrentIndex(5)
 
         radius = float(self.spin_tree_radius.value()) if (hasattr(self, "chk_tree_neighbors") and self.chk_tree_neighbors.isChecked()) else 0.0
-        n_mode = self.combo_neighbor_mode.currentData() if hasattr(self, "combo_neighbor_mode") else "canopy"
+        n_mode = self.combo_neighbor_mode.currentData() if hasattr(self, "combo_neighbor_mode") else "all"
         g_rad = float(self.spin_tree_ground.value()) if (hasattr(self, "chk_tree_ground") and self.chk_tree_ground.isChecked()) else 0.0
         hint_x = f"{self._last_picked_x}" if (hasattr(self, "_last_picked_itc") and self._last_picked_itc == itc and hasattr(self, "_last_picked_x")) else "null"
         hint_y = f"{self._last_picked_y}" if (hasattr(self, "_last_picked_itc") and self._last_picked_itc == itc and hasattr(self, "_last_picked_y")) else "null"
@@ -3223,7 +3225,7 @@ class MainWindow(QMainWindow):
             count = self.manager.export_tree_points(
                 path, itc,
                 x=state.get("x"), y=state.get("y"),
-                radius=radius, neighbor_mode=state.get("mode", "canopy"),
+                radius=radius, neighbor_mode=state.get("mode", "all"),
                 keep_tree_ids=keep_ids,
                 ground_radius=float(state.get("ground", 0.0) or 0.0))
         except Exception as exc:
@@ -3490,7 +3492,7 @@ class MainWindow(QMainWindow):
         if itc is not None:
             self._tree_view_state = {
                 "itc": int(itc), "radius": float(rad or 0.0),
-                "mode": getattr(self, "_tree_view_state", {}).get("mode", "canopy"),
+                "mode": getattr(self, "_tree_view_state", {}).get("mode", "all"),
                 "ground": float(getattr(self, "_tree_view_state", {}).get("ground", 0.0) or 0.0),
                 "x": getattr(self, "_last_picked_x", None) if getattr(self, "_last_picked_itc", None) == int(itc) else None,
                 "y": getattr(self, "_last_picked_y", None) if getattr(self, "_last_picked_itc", None) == int(itc) else None,

@@ -202,6 +202,19 @@ class TestStandFilterUI(unittest.TestCase):
         self.assertEqual(self.win.list_stand_trees.count(), 0)
         self.assertFalse(self.win.btn_tree_filter_mode.isChecked())
 
+    def test_default_stand_mode_is_all_stand_points(self):
+        """Stand Mode defaults to the whole stand (canopy + ground) under Include Neighbors."""
+        self.assertEqual(self.win.combo_neighbor_mode.currentData(), "all")
+        self.assertEqual(self.win.combo_neighbor_mode.currentText(),
+                         "All Stand Points (Canopy + Ground) (Recommended)")
+        # Neighbors stay off by default; the mode applies once the radius is in play.
+        self.assertFalse(self.win.chk_tree_neighbors.isChecked())
+        self.assertFalse(self.win.combo_neighbor_mode.isEnabled())
+
+        self.win.chk_tree_neighbors.setChecked(True)
+        self.assertTrue(self.win.combo_neighbor_mode.isEnabled())
+        self.assertEqual(self.win.combo_neighbor_mode.currentData(), "all")
+
 
 if __name__ == "__main__":
     unittest.main()
