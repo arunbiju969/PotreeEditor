@@ -1,0 +1,43 @@
+# ForestFormer3D — vendored AI segmentation engine, version pin
+#
+# The editor's "Segment (ForestFormer3D)" tool runs
+# ff3d_api.ForestFormer3D.predict_points() inside a persistent subprocess of a
+# CUDA-enabled Python env. The model sources are tracked by THIS repository as a
+# git submodule (a gitlink: the commit SHA is recorded in the superproject tree,
+# the sources stay in their own repository and history):
+#
+#     git submodule update --init vendor/ForestFormer3D      # fetch at pinned SHA
+#     ./setup_ff3d.sh                                        # submodule + weights + verify
+#
+# Layout, in one command:  git clone --recurse-submodules  (then run setup_ff3d.sh)
+
+url         = https://github.com/arunbiju969/ForestFormer3D.git
+path        = vendor/ForestFormer3D
+branch      = main
+commit      = 1b03f4cddf09aa5d3fa3ca0ea71ac1a1a697f994
+date        = 2026-11-04
+subject     = fix(setup): resolve repo root from the script location
+
+# Upstream lineage (informational — the editor does not read these)
+upstream_repo   = https://github.com/bxiang233/FF3D.git
+paper           = ForestFormer3D: A Unified Framework for End-to-End Segmentation of
+                  Forest LiDAR 3D Point Clouds (ICCV 2025 Oral, arXiv:2506.16991)
+architecture    = OneFormer3D-style transformer + Minkowski/spconv UNet encoders,
+                  trained on ForAINetV2 (classes: 0 = ground, 1 = tree)
+
+# --- What the submodule does NOT carry -------------------------------------
+# Model weights are gitignored inside the submodule (220 MB, exceeds GitHub's
+# 100 MB limit) and come from Zenodo record 16742708:
+#
+#   clean_forestformer.zip -> vendor/ForestFormer3D/work_dirs/clean_forestformer/epoch_3000_fix.pth
+#   https://zenodo.org/api/records/16742708/files/clean_forestformer.zip/content
+#
+# The torch interpreter is also outside git: a Python 3.11 env with
+# torch 2.7.1+cu128, spconv-cu128, torch-scatter/cluster and
+# torch-points-kernels, expected at ~/.venvs/ff3d (Windows: conda env `ff3d`).
+# Recipe: vendor/ForestFormer3D/setup_linux.sh   ·   check: verify_setup.py
+
+# --- Overrides read by ff3d_module.py (no code edit needed) ------------------
+#   FF3D_REPO    ForestFormer3D checkout    (default ./vendor/ForestFormer3D)
+#   FF3D_VENV    torch env prefix           (default ~/.venvs/ff3d)
+#   FF3D_PYTHON  interpreter in that env    (default <FF3D_VENV>/bin/python)

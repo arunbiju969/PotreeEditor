@@ -1,21 +1,65 @@
 """ForestFormer3D as an in-app segmentation module.
 
 Runs ForestFormer3D's Python API (ff3d_api.ForestFormer3D.predict_points) in a
-persistent subprocess of the ff3d conda/uv env — the app's own interpreter has
+persistent subprocess of the ff3d torch env — the app's own interpreter has
 no torch, and the model (~10 GB VRAM when warm) is built once and reused for
 every click. Protocol: one JSON line in {"in": npz_path, "out": npz_path},
 one JSON line out {"ok": ..., "n_trees": ...}.
+
+The model sources are the vendored git submodule in ./vendor/ForestFormer3D
+(pinned revision: forestformer3d.version; bootstrap: setup_ff3d.sh). Both
+halves can be pointed elsewhere with environment variables, no code edit:
+
+    FF3D_REPO    ForestFormer3D checkout   (default ./vendor/ForestFormer3D)
+    FF3D_VENV    torch env prefix          (default ~/.venvs/ff3d)
+    FF3D_PYTHON  interpreter in that env   (default <FF3D_VENV>/bin/python)
+
+The checkpoint itself (work_dirs/clean_forestformer/epoch_3000_fix.pth, 220 MB)
+is gitignored inside the submodule — see the setup script for fetching it.
 """
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import time
 
 import numpy as np
 
-FF3D_PYTHON = os.path.expanduser("~/.venvs/ff3d/bin/python")
-FF3D_REPO = "/run/media/neo/Omen/Projects/ForestFormer3D"
+_HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def _candidates(paths):
+    """Yield existing, absolute paths in priority order."""
+    for p in paths:
+        if not p:
+            continue
+        p = os.path.expanduser(p)
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def _repo_root():
+    return _candidates([
+        os.environ.get("FF3D_REPO"),
+        os.path.join(_HERE, "vendor", "ForestFormer3D"),
+        "/run/media/neo/Omen/Projects/ForestFormer3D",   # legacy external checkout
+    ])
+
+
+def _interpreter():
+    env = os.environ.get("FF3D_PYTHON")
+    venv = os.environ.get("FF3D_VENV", os.path.expanduser("~/.venvs/ff3d"))
+    return _candidates([
+        env,
+        os.path.join(venv, "bin", "python"),             # Linux / macOS
+        os.path.join(venv, "Scripts", "python.exe"),     # Windows
+    ])
+
+
+FF3D_REPO = _repo_root()
+FF3D_PYTHON = _interpreter()
 
 _RUNNER = '''
 import sys, json
@@ -64,6 +108,18 @@ class ForestFormer3DModule:
     def _ensure(self):
         if self._proc is not None and self._proc.poll() is None:
             return
+        if FF3D_REPO is None:
+            raise RuntimeError(
+                "ForestFormer3D sources not found. Run ./setup_ff3d.sh, or "
+                "git submodule update --init vendor/ForestFormer3D, or set FF3D_REPO.")
+        if FF3D_PYTHON is None:
+            raise RuntimeError(
+                "ForestFormer3D torch env not found. Create ~/.venvs/ff3d "
+                "(see vendor/ForestFormer3D/setup_linux.sh) or set FF3D_PYTHON.")
+        if not os.path.isfile(os.path.join(FF3D_REPO, "ff3d_api.py")):
+            raise RuntimeError(
+                f"{FF3D_REPO} has no ff3d_api.py — the submodule is at a revision "
+                "predating the Python API; run: git submodule update --remote vendor/ForestFormer3D")
         env = dict(os.environ, PYTHONPATH=FF3D_REPO)
         self._proc = subprocess.Popen(
             [FF3D_PYTHON, self._runner],

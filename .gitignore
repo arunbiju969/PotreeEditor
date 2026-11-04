@@ -63,6 +63,10 @@ temp/
 /potree/
 /potree.version.local
 
+# Vendored AI segmentation engine — tracked as a git SUBMODULE (gitlink), so it
+# needs no entry here; its own .gitignore governs work_dirs/ and data/ inside it.
+# Revision pinned in forestformer3d.version; bootstrap with setup_ff3d.sh.
+
 # Session scratch (permission-recovery backups, repro scripts)
 .dsh-acl-repair/
 
