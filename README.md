@@ -120,6 +120,25 @@ git clone --recurse-submodules https://github.com/arunbiju969/PotreeEditor.git
 
 ---
 
+## Per-Dataset Workspace
+
+Every master you open gets its own sidecar folder, so a dataset keeps its editing state in one place instead of scattering files next to the LAS:
+
+```
+tract.laz
+tract.potreeedit/
+├── workspace.json     manifest: master, created, last commit, commit count
+├── edits.db           edit history, split tree-ID routes, staged-edit snapshot
+├── segmented/         ForestFormer3D split clouds (tree_<itc>_ff3d_segmented.las)
+└── committed.laz      cumulative committed cloud — all edits, stacked
+```
+
+* **Commits stack.** Each commit reads `committed.laz` when it exists (the master on the very first commit) and writes back to it atomically, so the workspace holds *the* edited cloud instead of a chain of `_edited_edited.laz` files. The master is never rewritten.
+* **Nothing is lost on close.** Staged-but-uncommitted edits are snapshotted into `edits.db` and reappear in the sidebar table the next time you open the same master.
+* **History and routes are per dataset.** `edits.db` carries the `edit_history` log, the `tree_edits_index` routes that map a split tree's new ID to its segmented cloud, and the rendering settings saved for that dataset. Opening a converted cloud folder with no master still falls back to the folder-level `settings.db`.
+
+---
+
 ## How to Run
 
 Double-click or run from command line:
@@ -155,6 +174,7 @@ PotreeEditor/
 ├── app_window.py               # PyQt6 MainWindow with Ribbon, WebEngine & Staged Edits Table
 ├── pointcloud_manager.py       # Header inspector, staging manager & streaming commit engine
 ├── ff3d_module.py              # Persistent ForestFormer3D worker (JSON-line stdio)
+├── workspace.py                # Per-master sidecar workspace (<stem>.potreeedit/)
 ├── requirements.txt            # Python dependencies
 ├── README.md                   # System documentation
 ├── potree/                     # Vendored renderer (own git clone; untracked)

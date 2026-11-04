@@ -50,6 +50,10 @@ Thumbs.db
 *.bin
 *.e57
 *_converted/
+# Per-master editing workspace (sidecar of every LAS opened: edits.db,
+# segmented/, committed.laz) — see workspace.py
+*.potreeedit/
+*.tree_idx.json
 
 # Logs & temp
 *.log

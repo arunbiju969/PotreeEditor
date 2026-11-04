@@ -33,6 +33,7 @@ from PyQt6.QtWebEngineCore import QWebEngineSettings
 from pointcloud_manager import PointCloudManager
 from server import HybridServer
 from settings_store import SettingsStore
+from workspace import Workspace
 from conversion_dialog import ConversionDialog, find_potree_converter
 
 
@@ -65,16 +66,25 @@ class CommitWorker(QThread):
         self.output_path = output_path
 
     def run(self):
+        import time
         try:
             def cb(processed: int, total: int, msg: str):
                 self.progress.emit(processed, total, msg)
 
+            # Write beside the target with the same extension (laspy picks the
+            # compressor from it), then swap, so an interrupted commit cannot
+            # leave a half-written committed.laz behind.
+            base, ext = os.path.splitext(self.output_path)
+            tmp_path = f"{base}.writing{int(time.time() * 1000) % 100000}{ext or '.laz'}"
+
             result = self.manager.commit_staged_edits(
                 self.input_path,
-                self.output_path,
+                tmp_path,
                 progress_cb=cb,
                 chunk_size=1_000_000
             )
+            os.replace(tmp_path, self.output_path)
+            result["output_path"] = self.output_path
             self.finished.emit(result)
         except Exception as e:
             self.error.emit(str(e))
@@ -377,6 +387,7 @@ class MainWindow(QMainWindow):
         self.current_las_path: Optional[str] = None
         self.current_potree_url: Optional[str] = None
         self.current_potree_dir: Optional[str] = None
+        self.workspace: Optional[Workspace] = None
         self.commit_dialog: Optional[QProgressDialog] = None
         self.commit_worker: Optional[CommitWorker] = None
         self.conversion_dialog: Optional[ConversionDialog] = None
@@ -426,6 +437,14 @@ class MainWindow(QMainWindow):
 
     @property
     def settings_store(self) -> SettingsStore:
+        # A bound master owns its own workspace database (edits.db inside
+        # <stem>.potreeedit/); the potree-folder settings.db is the fallback
+        # for cloud folders opened without a LAS.
+        ws = getattr(self, "workspace", None)
+        if ws is not None:
+            if getattr(self, "_settings_store", None) is not ws.store:
+                self._settings_store = ws.store
+            return ws.store
         potree_dir = getattr(self, "current_potree_dir", None) or getattr(self, "potree_dir", None)
         if potree_dir and os.path.exists(potree_dir):
             db_dir = os.path.dirname(os.path.abspath(potree_dir))
@@ -439,6 +458,48 @@ class MainWindow(QMainWindow):
     @settings_store.setter
     def settings_store(self, store: SettingsStore):
         self._settings_store = store
+
+    def _attach_workspace(self, las_path: str):
+        """Bind the sidecar workspace of a master LAS/LAZ.
+
+        <stem>.potreeedit/ holds this dataset's edit database, ForestFormer3D
+        split files and the cumulative committed.laz. Attaching also restores
+        staged edits left over from a previous session.
+        """
+        try:
+            ws = Workspace(las_path).ensure()
+        except OSError as e:
+            self.workspace = None
+            self.status_bar.showMessage(f"Workspace unavailable ({e}); using default settings.db")
+            return None
+        self.workspace = ws
+        self.settings_store = ws.store
+        self.manager.workspace = ws
+        if hasattr(self.manager, "set_settings_store"):
+            self.manager.set_settings_store(ws.store)
+
+        restored = 0
+        try:
+            saved = ws.load_staged()
+        except Exception as e:
+            print(f"[MainWindow] Could not read staged edits snapshot: {e}")
+            saved = []
+        if saved:
+            self.manager.clear_staged_edits()
+            for e in saved:
+                self.manager.add_staged_edit(e)
+            restored = len(saved)
+            self.refresh_staged_edits_table()
+        if hasattr(self, "lbl_save_status") and restored:
+            self.lbl_save_status.setText(
+                f"Status: <span style='color:#f59e0b;'>{restored} Uncommitted Edits</span>")
+        self.log_console(
+            "WORKSPACE",
+            f"Attached {os.path.basename(ws.root)} "
+            f"({'committed cloud present' if ws.has_committed else 'no committed cloud yet'})"
+            + (f" · restored {restored} staged edit(s)" if restored else ""),
+            level="info")
+        return ws
 
     def open_edit_history_dialog(self):
         """Open the Edit History & Revert dialog."""
@@ -2472,6 +2533,7 @@ class MainWindow(QMainWindow):
         try:
             info = self.manager.load_las_header(las_path)
             self.current_las_path = las_path
+            self._attach_workspace(las_path)
             itc_status = "Yes (Available)" if info.get("has_itc") else "Will be added on commit"
             self.lbl_cloud_info.setText(
                 f"<b>File:</b> {info['filename']}<br>"
@@ -2495,6 +2557,7 @@ class MainWindow(QMainWindow):
         try:
             info = self.manager.load_las(las_path)
             self.current_las_path = las_path
+            self._attach_workspace(las_path)
             self.lbl_cloud_info.setText(
                 f"<b>File:</b> {info['filename']}<br>"
                 f"<b>Points:</b> {info['total_points']:,}<br>"
@@ -3825,9 +3888,21 @@ class MainWindow(QMainWindow):
     # -------------------------------------------------------------------------
     # Staged Edits Table & Removal Actions
     # -------------------------------------------------------------------------
+    def _snapshot_staged(self, staged: list):
+        """Persist the staged registry into the workspace database so the
+        sidebar table is still there the next time this master is opened."""
+        ws = getattr(self, "workspace", None)
+        if ws is None:
+            return
+        try:
+            ws.save_staged(staged)
+        except Exception as e:
+            print(f"[MainWindow] Could not snapshot staged edits: {e}")
+
     def refresh_staged_edits_table(self):
         staged = self.manager.get_staged_edits()
         count = len(staged)
+        self._snapshot_staged(staged)
 
         self.lbl_staged_count.setText(f"Staged Edits: {count} (Ready to Commit)")
         if count > 0:
@@ -4008,8 +4083,11 @@ class MainWindow(QMainWindow):
                 return
             self.current_las_path = file_path
 
+        ws = getattr(self, "workspace", None)
         base, ext = os.path.splitext(self.current_las_path)
-        default_out = f"{base}_edited{ext}"
+        # One cumulative cloud per master: commits stack onto committed.laz
+        # instead of each restarting from the master file.
+        default_out = ws.committed_laz if ws else f"{base}_edited{ext}"
         save_path = self._save_file(
             "Save Committed Point Cloud",
             default_out,
@@ -4017,6 +4095,11 @@ class MainWindow(QMainWindow):
         )
         if not save_path:
             return
+
+        input_path = self.current_las_path
+        stacking = bool(ws) and os.path.abspath(save_path) == os.path.abspath(ws.committed_laz)
+        if stacking and ws.has_committed:
+            input_path = ws.committed_laz
 
         total_pts = self.manager.header_info.get("total_points", 100) if self.manager.header_info else 100
         self.commit_dialog = QProgressDialog("Committing staged edits...", "Cancel", 0, total_pts, self)
@@ -4027,7 +4110,7 @@ class MainWindow(QMainWindow):
         self.commit_dialog.setValue(0)
         self.commit_dialog.show()
 
-        self.commit_worker = CommitWorker(self.manager, self.current_las_path, save_path)
+        self.commit_worker = CommitWorker(self.manager, input_path, save_path)
         self.commit_worker.progress.connect(self._on_commit_progress)
         self.commit_worker.finished.connect(self._on_commit_finished)
         self.commit_worker.error.connect(self._on_commit_error)
@@ -4116,6 +4199,19 @@ class MainWindow(QMainWindow):
                 self._run_js("window.reloadCurrentPointCloud();")
             except Exception as pe:
                 print(f"[MainWindow] Warning: Failed to patch Potree octree after LAS commit: {pe}")
+
+        ws = getattr(self, "workspace", None)
+        if ws is not None and os.path.abspath(out) == os.path.abspath(ws.committed_laz):
+            try:
+                ws.record_commit(out, count, mod_pts, sec, getattr(self, "current_potree_dir", None))
+            except OSError as me:
+                print(f"[MainWindow] Could not update workspace manifest: {me}")
+            self.lbl_save_status.setText(
+                f"Status: <span style='color:#10b981;'>Committed · workspace up to date</span>")
+            self.status_bar.showMessage(
+                f"Committed {count} edits ({mod_pts:,} points) onto {os.path.basename(out)} "
+                f"· next commit continues from it")
+            return
 
         self.lbl_save_status.setText(f"Status: <span style='color:#10b981;'>Committed to {os.path.basename(out)}</span>")
         self.status_bar.showMessage(f"Committed {count} edits in {sec:.1f}s. Saved: {os.path.basename(out)}")

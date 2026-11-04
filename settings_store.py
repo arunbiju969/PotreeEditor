@@ -51,6 +51,13 @@ class SettingsStore:
             " status TEXT DEFAULT 'active'"
             ")"
         )
+        # Snapshot of the staged (uncommitted) edit registry, so the sidebar
+        # table is restored when the master point cloud is reopened.
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS staged_edits ("
+            " idx INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " payload TEXT NOT NULL)"
+        )
         self._conn.commit()
 
     def get(self, key: str, default=None):
@@ -275,6 +282,35 @@ class SettingsStore:
             )
             self._conn.commit()
             return cur.rowcount
+
+    # -------------------------------------------------------------------------
+    # Staged (uncommitted) edit snapshot
+    # -------------------------------------------------------------------------
+    def save_staged_edits(self, edits: list) -> int:
+        """Replace the staged-edit snapshot with `edits` (JSON per row)."""
+        with self._lock:
+            self._conn.execute("DELETE FROM staged_edits")
+            self._conn.executemany(
+                "INSERT INTO staged_edits(payload) VALUES(?)",
+                [(json.dumps(e),) for e in edits]
+            )
+            self._conn.commit()
+            return len(edits)
+
+    def load_staged_edits(self) -> list:
+        """Return the last staged-edit snapshot, in staging order."""
+        with self._lock:
+            cur = self._conn.cursor()
+            rows = cur.execute(
+                "SELECT payload FROM staged_edits ORDER BY idx"
+            ).fetchall()
+        out = []
+        for (payload,) in rows:
+            try:
+                out.append(json.loads(payload))
+            except (ValueError, TypeError):
+                continue
+        return out
 
     def close(self):
         with self._lock:

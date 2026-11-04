@@ -567,6 +567,13 @@ class HybridRequestHandler(BaseHTTPRequestHandler):
         except Exception:
             pass
         out_dir = os.path.dirname(src) if src and os.path.exists(src) else os.getcwd()
+        ws = getattr(self.manager, "workspace", None)
+        if ws is not None:
+            try:
+                os.makedirs(ws.segmented_dir, exist_ok=True)
+                out_dir = ws.segmented_dir     # <stem>.potreeedit/segmented/
+            except OSError:
+                pass
         out_path = os.path.join(out_dir, f"tree_{itc}_ff3d_segmented.las")
         out.write(out_path)
         return out_path

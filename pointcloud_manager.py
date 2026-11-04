@@ -32,6 +32,7 @@ class PointCloudManager:
     def __init__(self):
         self._lock = threading.RLock()
         self.las_path: Optional[str] = None
+        self.workspace = None      # workspace.Workspace of the open master (set by MainWindow)
         self.header_info: Optional[Dict[str, Any]] = None
         self.las_data: Optional[laspy.LasData] = None
         self.selected_indices: np.ndarray = np.array([], dtype=int)
