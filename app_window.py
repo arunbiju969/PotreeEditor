@@ -20,7 +20,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QLabel, QFileDialog, QMessageBox, QProgressBar, QSplitter,
     QFrame, QComboBox, QCheckBox, QSpinBox, QDoubleSpinBox, QSlider, QGroupBox, QStatusBar,
-    QListWidget, QListWidgetItem, QPlainTextEdit,
+    QListWidget, QListWidgetItem, QPlainTextEdit, QLineEdit,
     QScrollArea, QStackedWidget, QButtonGroup, QTableWidget, QTableWidgetItem,
     QHeaderView, QAbstractItemView, QProgressDialog, QSizePolicy, QTabWidget, QGridLayout,
     QDialog
@@ -86,6 +86,46 @@ class CommitWorker(QThread):
             os.replace(tmp_path, self.output_path)
             result["output_path"] = self.output_path
             self.finished.emit(result)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+class SegmentationWorker(QThread):
+    """Runs one whole-file ForestFormer3D pass off the GUI thread.
+
+    mode="tract" tiles + merges + stitches; mode="single" is one cylinder pass.
+    The ForestFormer3D worker subprocess is shared with the Forestry tab, so
+    runs queue behind each other instead of fighting over the GPU.
+    """
+    progress = pyqtSignal(str)
+    finished = pyqtSignal(dict)
+    error = pyqtSignal(str)
+
+    def __init__(self, module, in_las: str, out_dir: str, mode: str,
+                 tile_size: float, overlap: float, roi=None, model: dict = None):
+        super().__init__()
+        self.module = module
+        self.in_las = in_las
+        self.out_dir = out_dir
+        self.mode = mode
+        self.tile_size = tile_size
+        self.overlap = overlap
+        self.roi = roi
+        self.model = model
+
+    def run(self):
+        import time
+        t0 = time.time()
+        label = "tiled tract (tiles + merge + seam stitch)" if self.mode == "tract" else "single-cloud cylinder pass"
+        self.progress.emit(f"ForestFormer3D {label} on {os.path.basename(self.in_las)}...")
+        try:
+            res = self.module.predict_file(
+                self.in_las, self.out_dir, mode=self.mode,
+                tile_size=self.tile_size, overlap=self.overlap,
+                roi=self.roi, model=self.model)
+            res["elapsed_seconds"] = time.time() - t0
+            res["mode"] = self.mode
+            self.finished.emit(res)
         except Exception as e:
             self.error.emit(str(e))
 
@@ -388,6 +428,14 @@ class MainWindow(QMainWindow):
         self.current_potree_url: Optional[str] = None
         self.current_potree_dir: Optional[str] = None
         self.workspace: Optional[Workspace] = None
+        # ForestFormer3D full-pipeline tab state
+        self.seg_worker: Optional[SegmentationWorker] = None
+        self._seg_result: Optional[str] = None
+        self._seg_run_dir: Optional[str] = None
+        self._seg_advanced: Dict[str, str] = {}
+        self._seg_timer = QTimer(self)
+        self._seg_timer.setInterval(1200)
+        self._seg_timer.timeout.connect(self._on_seg_tick)
         self.commit_dialog: Optional[QProgressDialog] = None
         self.commit_worker: Optional[CommitWorker] = None
         self.conversion_dialog: Optional[ConversionDialog] = None
@@ -4267,7 +4315,7 @@ class MainWindow(QMainWindow):
     # -------------------------------------------------------------------------
     def _collect_settings(self) -> dict:
         """Snapshot every persisted viewer setting from the ribbon widgets."""
-        return {
+        settings = {
             "render_mode": self.ribbon_combo_render_mode.currentData(),
             "shape": self.ribbon_combo_shape.currentData(),
             "sizing": self.ribbon_combo_sizing.currentData(),
@@ -4281,7 +4329,20 @@ class MainWindow(QMainWindow):
             "edl_radius": self.ribbon_spin_radius.value(),
             "edl_strength": self.ribbon_spin_strength.value(),
             "edl_opacity": self.ribbon_spin_opacity.value(),
+            "seg_mode": self.combo_seg_mode.currentData(),
+            "seg_radius": self.spin_seg_radius.value(),
+            "seg_step": self.spin_seg_step.value(),
+            "seg_score": self.spin_seg_score.value(),
+            "seg_tile": self.spin_seg_tile.value(),
+            "seg_overlap": self.spin_seg_overlap.value(),
+            "seg_roi_on": self.chk_seg_roi.isChecked(),
+            "seg_xmin": self.spin_seg_xmin.value(),
+            "seg_xmax": self.spin_seg_xmax.value(),
+            "seg_ymin": self.spin_seg_ymin.value(),
+            "seg_ymax": self.spin_seg_ymax.value(),
+            "seg_advanced": dict(getattr(self, "_seg_advanced", {})),
         }
+        return settings
 
     def _schedule_save_settings(self, *_):
         self._settings_timer.start()
@@ -4361,6 +4422,28 @@ class MainWindow(QMainWindow):
             if s.get(key) is not None:
                 set_spin(widget, key)
                 setter(widget.value())
+
+        # ForestFormer3D pipeline parameters (Segmentation tab)
+        set_combo(self.combo_seg_mode, "seg_mode")
+        for widget, key in ((self.spin_seg_radius, "seg_radius"),
+                            (self.spin_seg_step, "seg_step"),
+                            (self.spin_seg_score, "seg_score"),
+                            (self.spin_seg_tile, "seg_tile"),
+                            (self.spin_seg_overlap, "seg_overlap"),
+                            (self.spin_seg_xmin, "seg_xmin"),
+                            (self.spin_seg_xmax, "seg_xmax"),
+                            (self.spin_seg_ymin, "seg_ymin"),
+                            (self.spin_seg_ymax, "seg_ymax")):
+            set_spin(widget, key)
+        roi_on = s.get("seg_roi_on")
+        if roi_on is not None:
+            self.chk_seg_roi.blockSignals(True)
+            self.chk_seg_roi.setChecked(bool(roi_on))
+            self.chk_seg_roi.blockSignals(False)
+            self._on_seg_roi_toggled(bool(roi_on))
+        adv = s.get("seg_advanced")
+        if isinstance(adv, dict):
+            self._seg_advanced = dict(adv)
 
         geometry = s.get("geometry")
         if geometry:
@@ -4494,12 +4577,18 @@ class MainWindow(QMainWindow):
         self.btn_tab_ai.setProperty("class", "ribbonCategoryTab")
         self.btn_tab_ai.setVisible(False)  # Shown only while the Forestry sidebar tab is open
 
+        # Full-pipeline ForestFormer3D runs on any point cloud (always available)
+        self.btn_tab_segmentation = QPushButton("Segmentation")
+        self.btn_tab_segmentation.setCheckable(True)
+        self.btn_tab_segmentation.setProperty("class", "ribbonCategoryTab")
+
         self.ribbon_tab_group.addButton(self.btn_tab_file, 0)
         self.ribbon_tab_group.addButton(self.btn_tab_point, 1)
         self.ribbon_tab_group.addButton(self.btn_tab_layers, 2)
         self.ribbon_tab_group.addButton(self.btn_tab_settings, 3)
         self.ribbon_tab_group.addButton(self.btn_tab_filter, 4)
         self.ribbon_tab_group.addButton(self.btn_tab_ai, 5)
+        self.ribbon_tab_group.addButton(self.btn_tab_segmentation, 6)
 
         h_tabs.addWidget(self.btn_tab_file)
         h_tabs.addWidget(self.btn_tab_point)
@@ -4507,6 +4596,7 @@ class MainWindow(QMainWindow):
         h_tabs.addWidget(self.btn_tab_settings)
         h_tabs.addWidget(self.btn_tab_filter)
         h_tabs.addWidget(self.btn_tab_ai)
+        h_tabs.addWidget(self.btn_tab_segmentation)
         h_tabs.addStretch()
 
         v_main.addWidget(category_bar)
@@ -4522,6 +4612,7 @@ class MainWindow(QMainWindow):
         page_settings = self._create_ribbon_settings_page()
         page_filter = self._create_ribbon_filter_page()
         page_ai = self._create_ribbon_ai_page()
+        page_segmentation = self._create_ribbon_segmentation_page()
 
         self.ribbon_stack.addWidget(page_file)       # Index 0
         self.ribbon_stack.addWidget(page_point)      # Index 1
@@ -4529,6 +4620,7 @@ class MainWindow(QMainWindow):
         self.ribbon_stack.addWidget(page_settings)   # Index 3
         self.ribbon_stack.addWidget(page_filter)     # Index 4 (Stand Filter)
         self.ribbon_stack.addWidget(page_ai)         # Index 5 (AI Segmentation Toolset)
+        self.ribbon_stack.addWidget(page_segmentation)  # Index 6 (Full ForestFormer3D pipeline)
 
         self.ribbon_tab_group.idClicked.connect(self._on_ribbon_category_clicked)
         self.ribbon_stack.setCurrentIndex(1)
@@ -5299,6 +5391,344 @@ class MainWindow(QMainWindow):
 
         h_layout.addStretch()
         return page
+
+    # -------------------------------------------------------------------------
+    # Segmentation ribbon page: full ForestFormer3D pipeline on any point cloud
+    # -------------------------------------------------------------------------
+    def _create_ribbon_segmentation_page(self) -> QWidget:
+        page = QFrame()
+        page.setFixedHeight(92)
+        h_layout = QHBoxLayout(page)
+        h_layout.setContentsMargins(8, 6, 8, 6)
+        h_layout.setSpacing(8)
+
+        def _lbl(text):
+            l = QLabel(text)
+            l.setStyleSheet("color: #94a3b8; font-size: 11px;")
+            return l
+
+        def _spin(minv, maxv, val, step=1.0, suffix="", width=62):
+            s = QDoubleSpinBox()
+            s.setRange(minv, maxv)
+            s.setValue(val)
+            s.setSingleStep(step)
+            s.setDecimals(2 if step < 1 else 1)
+            if suffix:
+                s.setSuffix(suffix)
+            s.setStyleSheet(f"font-size: 11px; padding: 2px 4px; max-width: {width}px;")
+            s.valueChanged.connect(self._schedule_save_settings)
+            return s
+
+        def _group(title):
+            grp = QFrame()
+            grp.setProperty("class", "ribbonGroup")
+            grp.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
+            v = QVBoxLayout(grp)
+            v.setContentsMargins(10, 7, 10, 7)
+            v.setSpacing(3)
+            return grp, v
+
+        def _title(v, text):
+            t = QLabel(text)
+            t.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            t.setProperty("class", "ribbonTitle")
+            v.addWidget(t)
+
+        # ---- 1. Input & pipeline selection --------------------------------
+        grp_in, v_in = _group("PIPELINE")
+        row_in = QHBoxLayout()
+        row_in.setSpacing(4)
+        self.seg_edit_input = QLineEdit()
+        self.seg_edit_input.setPlaceholderText("Point cloud (LAS/LAZ)...")
+        self.seg_edit_input.setReadOnly(True)
+        self.seg_edit_input.setMinimumWidth(210)
+        self.seg_edit_input.setStyleSheet("font-size: 11px; padding: 3px 6px;")
+        btn_seg_browse = QPushButton("Browse...")
+        btn_seg_browse.setProperty("class", "ribbonToolBtn")
+        btn_seg_browse.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_seg_browse.clicked.connect(self.seg_browse_input)
+        btn_seg_open = QPushButton("Use Open Cloud")
+        btn_seg_open.setProperty("class", "ribbonToolBtn")
+        btn_seg_open.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_seg_open.clicked.connect(self.seg_use_open_cloud)
+        row_in.addWidget(self.seg_edit_input)
+        row_in.addWidget(btn_seg_browse)
+        row_in.addWidget(btn_seg_open)
+        v_in.addLayout(row_in)
+
+        row_mode = QHBoxLayout()
+        row_mode.setSpacing(4)
+        row_mode.addWidget(_lbl("Pipeline:"))
+        self.combo_seg_mode = QComboBox()
+        self.combo_seg_mode.setStyleSheet("font-size: 11px; padding: 2px 6px;")
+        self.combo_seg_mode.addItem("Tiled Tract (tiles + merge + seam stitch)", "tract")
+        self.combo_seg_mode.addItem("Single Cloud (one cylinder pass)", "single")
+        self.combo_seg_mode.currentIndexChanged.connect(self._schedule_save_settings)
+        row_mode.addWidget(self.combo_seg_mode)
+        row_mode.addStretch()
+        v_in.addLayout(row_mode)
+        _title(v_in, "PIPELINE INPUT")
+        h_layout.addWidget(grp_in)
+
+        # ---- 2. Model parameters ------------------------------------------
+        grp_p, v_p = _group("MODEL")
+        grid_p = QGridLayout()
+        grid_p.setHorizontalSpacing(4)
+        grid_p.setVerticalSpacing(3)
+        self.spin_seg_radius = _spin(2.0, 60.0, 16.0, 0.5, " m")
+        self.spin_seg_step = _spin(0.5, 20.0, 6.0, 0.5, " m")
+        self.spin_seg_score = _spin(0.05, 0.95, 0.40, 0.05)
+        self.spin_seg_tile = _spin(10.0, 400.0, 70.0, 5.0, " m")
+        self.spin_seg_overlap = _spin(0.0, 200.0, 10.0, 1.0, " m")
+        grid_p.addWidget(_lbl("Radius"), 0, 0)
+        grid_p.addWidget(self.spin_seg_radius, 0, 1)
+        grid_p.addWidget(_lbl("Voxel step"), 0, 2)
+        grid_p.addWidget(self.spin_seg_step, 0, 3)
+        grid_p.addWidget(_lbl("Score ≥"), 0, 4)
+        grid_p.addWidget(self.spin_seg_score, 0, 5)
+        grid_p.addWidget(_lbl("Tile"), 1, 0)
+        grid_p.addWidget(self.spin_seg_tile, 1, 1)
+        grid_p.addWidget(_lbl("Overlap"), 1, 2)
+        grid_p.addWidget(self.spin_seg_overlap, 1, 3)
+        self.btn_seg_advanced = QPushButton("Model / Advanced...")
+        self.btn_seg_advanced.setProperty("class", "ribbonToolBtn")
+        self.btn_seg_advanced.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_seg_advanced.setToolTip("Config, checkpoint, CUDA device and chunk size")
+        self.btn_seg_advanced.clicked.connect(self.seg_advanced_dialog)
+        grid_p.addWidget(self.btn_seg_advanced, 1, 4, 1, 2)
+        v_p.addLayout(grid_p)
+        _title(v_p, "FORESTFORMER3D PARAMETERS")
+        h_layout.addWidget(grp_p)
+
+        # ---- 3. Optional rectangular ROI ----------------------------------
+        grp_roi, v_roi = _group("AREA")
+        self.chk_seg_roi = QCheckBox("Clip to ROI")
+        self.chk_seg_roi.setStyleSheet("color: #e2e8f0; font-size: 11px; font-weight: 600;")
+        self.chk_seg_roi.toggled.connect(self._on_seg_roi_toggled)
+        v_roi.addWidget(self.chk_seg_roi)
+        grid_roi = QGridLayout()
+        grid_roi.setHorizontalSpacing(3)
+        self.spin_seg_xmin = _spin(-1e7, 1e7, 0.0, 1.0, width=70)
+        self.spin_seg_xmax = _spin(-1e7, 1e7, 100.0, 1.0, width=70)
+        self.spin_seg_ymin = _spin(-1e7, 1e7, 0.0, 1.0, width=70)
+        self.spin_seg_ymax = _spin(-1e7, 1e7, 100.0, 1.0, width=70)
+        for c, (cap, w) in enumerate((("X min", self.spin_seg_xmin), ("X max", self.spin_seg_xmax))):
+            grid_roi.addWidget(_lbl(cap), 0, c)
+            grid_roi.addWidget(w, 1, c)
+        for c, (cap, w) in enumerate((("Y min", self.spin_seg_ymin), ("Y max", self.spin_seg_ymax))):
+            grid_roi.addWidget(_lbl(cap), 0, c + 2)
+            grid_roi.addWidget(w, 1, c + 2)
+        v_roi.addLayout(grid_roi)
+        _title(v_roi, "STUDY AREA (SINGLE CLOUD)")
+        h_layout.addWidget(grp_roi)
+
+        # ---- 4. Run & result ----------------------------------------------
+        grp_run, v_run = _group("RUN")
+        row_run = QHBoxLayout()
+        row_run.setSpacing(4)
+        self.btn_seg_run = QPushButton("Run Segmentation")
+        self.btn_seg_run.setObjectName("btnSuccess")
+        self.btn_seg_run.setStyleSheet("""
+            QPushButton#btnSuccess {
+                background-color: #059669; border: 1px solid #10b981; color: #ffffff;
+                font-weight: 700; padding: 4px 10px; border-radius: 4px;
+            }""")
+        self.btn_seg_run.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_seg_run.clicked.connect(self.run_segmentation_action)
+        self.btn_seg_load = QPushButton("Load Result")
+        self.btn_seg_load.setProperty("class", "ribbonToolBtn")
+        self.btn_seg_load.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_seg_load.setEnabled(False)
+        self.btn_seg_load.clicked.connect(self.load_segmentation_result)
+        row_run.addWidget(self.btn_seg_run)
+        row_run.addWidget(self.btn_seg_load)
+        v_run.addLayout(row_run)
+        self.bar_seg_progress = QProgressBar()
+        self.bar_seg_progress.setRange(0, 100)
+        self.bar_seg_progress.setValue(0)
+        self.bar_seg_progress.setTextVisible(False)
+        self.bar_seg_progress.setFixedWidth(190)
+        self.bar_seg_progress.setFixedHeight(10)
+        v_run.addWidget(self.bar_seg_progress)
+        self.lbl_seg_status = QLabel("Idle")
+        self.lbl_seg_status.setStyleSheet("color: #94a3b8; font-size: 10px;")
+        self.lbl_seg_status.setMinimumWidth(190)
+        v_run.addWidget(self.lbl_seg_status)
+        _title(v_run, "RUN & RESULT")
+        h_layout.addWidget(grp_run)
+
+        h_layout.addStretch()
+        return page
+
+    def _seg_output_dir(self) -> str:
+        """Run outputs live in the workspace: <stem>.potreeedit/segmented/pipeline/."""
+        ws = getattr(self, "workspace", None)
+        base = ws.segmented_dir if ws is not None else os.path.join(
+            os.path.dirname(self.current_las_path or os.getcwd()), "segmented")
+        return os.path.join(base, "pipeline")
+
+    def seg_browse_input(self):
+        path = self._pick_file("Select Point Cloud for ForestFormer3D", "",
+                               "LAS/LAZ Files (*.las *.laz);;All Files (*)")
+        if path:
+            self.seg_edit_input.setText(path)
+
+    def seg_use_open_cloud(self):
+        if self.current_las_path:
+            self.seg_edit_input.setText(self.current_las_path)
+
+    def _on_seg_roi_toggled(self, checked: bool):
+        for w in (self.spin_seg_xmin, self.spin_seg_xmax, self.spin_seg_ymin, self.spin_seg_ymax):
+            w.setEnabled(checked)
+
+    def seg_advanced_dialog(self):
+        """Config / checkpoint / device / chunk overrides for the warm model."""
+        from ff3d_module import repo_root as ff3d_repo_root
+        cfg_default = os.path.join(ff3d_repo_root() or "", "configs",
+                                   "oneformer3d_qs_radius16_qp300_2many.py")
+        ckp_default = os.path.join(ff3d_repo_root() or "", "work_dirs", "clean_forestformer",
+                                   "epoch_3000_fix.pth")
+        dlg = QDialog(self)
+        dlg.setWindowTitle("ForestFormer3D Model Settings")
+        v = QVBoxLayout(dlg)
+        form = QGridLayout()
+
+        def _row(r, label, value, placeholder=""):
+            form.addWidget(QLabel(label), r, 0)
+            e = QLineEdit(value or "")
+            e.setPlaceholderText(placeholder)
+            e.setMinimumWidth(360)
+            form.addWidget(e, r, 1)
+            return e
+
+        e_cfg = _row(0, "Config", self._seg_advanced.get("config", ""), cfg_default)
+        e_ckp = _row(1, "Checkpoint", self._seg_advanced.get("checkpoint", ""), ckp_default)
+        e_dev = _row(2, "Device", self._seg_advanced.get("device", ""), "cuda:0")
+        e_chk = _row(3, "Chunk (points)", self._seg_advanced.get("chunk", ""), "20000")
+        v.addLayout(form)
+        hint = QLabel("Blank fields use ForestFormer3D defaults. Changing model settings\n"
+                      "rebuilds the warm model on the next run (~10 s).")
+        hint.setStyleSheet("color: #94a3b8;")
+        v.addWidget(hint)
+        box = QHBoxLayout()
+        btn_ok = QPushButton("Apply")
+        btn_ok.setObjectName("btnSuccess")
+        btn_cancel = QPushButton("Cancel")
+        btn_ok.clicked.connect(dlg.accept)
+        btn_cancel.clicked.connect(dlg.reject)
+        box.addStretch()
+        box.addWidget(btn_cancel)
+        box.addWidget(btn_ok)
+        v.addLayout(box)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._seg_advanced = {
+            "config": e_cfg.text().strip(),
+            "checkpoint": e_ckp.text().strip(),
+            "device": e_dev.text().strip(),
+            "chunk": e_chk.text().strip(),
+        }
+        self._schedule_save_settings()
+        self.log_console("FF3D", "Model settings updated: " +
+                         (", ".join(f"{k}={v}" for k, v in self._seg_advanced.items() if v)
+                          or "engine defaults"), level="info")
+
+    def run_segmentation_action(self):
+        """Run the full ForestFormer3D pipeline on the selected point cloud."""
+        if getattr(self, "seg_worker", None) is not None and self.seg_worker.isRunning():
+            return
+        in_las = self.seg_edit_input.text().strip() or (self.current_las_path or "")
+        if not in_las or not os.path.exists(in_las):
+            QMessageBox.warning(self, "No Point Cloud",
+                                "Pick a LAS/LAZ point cloud to segment (Browse... or Use Open Cloud).")
+            return
+        mode = self.combo_seg_mode.currentData()
+        out_dir = self._seg_output_dir()
+        roi = None
+        if self.chk_seg_roi.isChecked():
+            roi = [self.spin_seg_xmin.value(), self.spin_seg_ymin.value(),
+                   self.spin_seg_xmax.value(), self.spin_seg_ymax.value()]
+        model = dict(self._seg_advanced)
+        model.update({"radius": self.spin_seg_radius.value(),
+                      "step_size": self.spin_seg_step.value(),
+                      "score_th": self.spin_seg_score.value()})
+        try:
+            from ff3d_module import get_module
+            module = get_module()
+        except Exception as e:
+            QMessageBox.critical(self, "ForestFormer3D Unavailable", str(e))
+            return
+
+        self._seg_run_dir = out_dir
+        self.seg_worker = SegmentationWorker(
+            module, in_las, out_dir, mode,
+            self.spin_seg_tile.value(), self.spin_seg_overlap.value(), roi, model)
+        self.seg_worker.progress.connect(self._on_seg_progress)
+        self.seg_worker.finished.connect(self._on_seg_finished)
+        self.seg_worker.error.connect(self._on_seg_error)
+        self.seg_worker.start()
+
+        self.btn_seg_run.setEnabled(False)
+        self.btn_seg_load.setEnabled(False)
+        self.bar_seg_progress.setRange(0, 0)
+        self.lbl_seg_status.setText("Running ForestFormer3D...")
+        self.log_console("FF3D", f"Pipeline run started: {os.path.basename(in_las)} "
+                                 f"({mode}, radius={self.spin_seg_radius.value():.1f}m, "
+                                 f"step={self.spin_seg_step.value():.1f}m, "
+                                 f"score≥{self.spin_seg_score.value():.2f}"
+                                 + (f", tile={self.spin_seg_tile.value():.0f}m/overlap={self.spin_seg_overlap.value():.0f}m"
+                                    if mode == "tract" else f", ROI={roi}") + ")", level="info")
+        self._seg_timer.start()
+
+    def _on_seg_progress(self, msg: str):
+        self.lbl_seg_status.setText(msg)
+        self.status_bar.showMessage(msg)
+        self.log_console("FF3D", msg, level="info")
+
+    def _on_seg_tick(self):
+        """Live tile progress from ForestFormer3D's tract progress file."""
+        if getattr(self, "seg_worker", None) is None:
+            return
+        pf = os.path.join(getattr(self, "_seg_run_dir", "") or "", "tract_tiling_progress.json")
+        try:
+            with open(pf, "r", encoding="utf-8") as f:
+                prog = json.load(f)
+            done = len(prog.get("completed_tiles") or {})
+            trees = prog.get("global_tree_offset")
+            if done:
+                self.lbl_seg_status.setText(f"Tiles done: {done} · trees so far: {trees or 0}")
+        except (OSError, ValueError):
+            pass
+
+    def _on_seg_finished(self, res: dict):
+        self.bar_seg_progress.setRange(0, 100)
+        self.bar_seg_progress.setValue(100)
+        self.btn_seg_run.setEnabled(True)
+        self._seg_timer.stop()
+        out = res.get("out_las", "")
+        self._seg_result = out
+        self.btn_seg_load.setEnabled(bool(out) and os.path.exists(out))
+        secs = res.get("elapsed_seconds", 0.0)
+        n = res.get("n_trees")
+        self.lbl_seg_status.setText("Finished")
+        self.status_bar.showMessage(f"ForestFormer3D finished in {secs:.1f}s: {os.path.basename(out)}")
+        self.log_console("FF3D", f"Pipeline finished in {secs:.1f}s → {out}"
+                         + (f" ({n} trees)" if n else ""), level="success")
+
+    def _on_seg_error(self, msg: str):
+        self.bar_seg_progress.setRange(0, 100)
+        self.bar_seg_progress.setValue(0)
+        self.btn_seg_run.setEnabled(True)
+        self._seg_timer.stop()
+        self.lbl_seg_status.setText("Failed")
+        self.log_console("FF3D", f"Pipeline failed: {msg}", level="error")
+        QMessageBox.critical(self, "Segmentation Failed", msg)
+
+    def load_segmentation_result(self):
+        """Stream the stitched/segmented result into the Potree viewport."""
+        out = getattr(self, "_seg_result", "")
+        if out and os.path.exists(out):
+            self.open_las_path(out)
 
     def _on_ai_tree_spin_changed(self, val: int):
         if hasattr(self, "spin_tree_view") and self.spin_tree_view.value() != val:

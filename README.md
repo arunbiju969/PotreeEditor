@@ -49,7 +49,8 @@ A desktop point cloud viewer and editing environment combining:
 
 * **Instant Startup (<0.1s) & Low RAM (~200MB):** Never blocks on multi-gigabyte raw LAS files upon opening `metadata.json`. Potree streams LOD octrees on demand.
 * **Optimistic Visual Staging:** Delineated tree crowns and noise areas are highlighted immediately in the 3D viewport with closed colored line loops, glowing vertices, and floating 3D text billboards (`Tree #101`, `Noise (7)`).
-* **Categorized Top Ribbon Bar:** Clean tabbed ribbon bar with `File`, `Point`, and `Settings` categories for uncluttered, modern desktop workflows.
+* **Categorized Top Ribbon Bar:** Clean tabbed ribbon bar with `File`, `Point`, `Layers`, `Settings`, `Segmentation` (plus `Filter` and `AI` while the Forestry tab is open) for uncluttered, modern desktop workflows.
+* **Full ForestFormer3D Pipeline from the UI:** Pick any LAS/LAZ on the `Segmentation` tab and run tiled-tract or single-cloud instance segmentation with editable radius, voxel step, score threshold, tiling and ROI, then load the stitched result straight into the viewport.
 * **Single-Pass Deferred Commit:** When ready, a background streaming worker updates millions of points chunk-by-chunk in a single pass without memory overhead.
 * **Auto-Incrementing Tree IDs:** Automatically increments the Tree ID for rapid sequential crown drafting.
 * **Individual Staged Edit Management:** Active staged edits are tracked in a sidebar table with individual deletion buttons and a master clear button.
@@ -117,6 +118,23 @@ git clone --recurse-submodules https://github.com/arunbiju969/PotreeEditor.git
 ```
 
 `ff3d_module.py` resolves the engine in this order, so a checkout can move without a code edit: `$FF3D_REPO` → `./vendor/ForestFormer3D` → the legacy external checkout at `/run/media/neo/Omen/Projects/ForestFormer3D` (last, as a fallback). The interpreter resolves `$FF3D_PYTHON` → `$FF3D_VENV/bin/python` → `~/.venvs/ff3d/bin/python`. If either is missing, segmentation fails with the fix in the message, not a stack trace.
+
+### Segmentation tab (full pipeline)
+
+The top ribbon has a permanent **Segmentation** category that runs the complete ForestFormer3D pipeline on **any** point cloud — not only the one you have open.
+
+| Control | What it does |
+|---|---|
+| **Browse… / Use Open Cloud** | Pick the LAS/LAZ to segment; defaults to the cloud currently open |
+| **Pipeline** | *Tiled Tract* — cuts the cloud into tiles, segments each, merges and seam-stitches (any size). *Single Cloud* — one cylinder pass over the whole file |
+| **Radius / Voxel step / Score ≥** | Model-level: neighbourhood radius (16 m), voxel step (6 m), instance score threshold (0.40) |
+| **Tile / Overlap** | Tiling for the tract pipeline (70 m tiles, 10 m overlap) |
+| **Clip to ROI** | Restrict a Single Cloud run to an X/Y rectangle |
+| **Model / Advanced…** | Config, checkpoint, CUDA device and chunk size; blank = engine defaults |
+| **Run Segmentation** | Starts the run; the bar animates and the label streams tiles completed and trees found |
+| **Load Result** | Streams the finished cloud into the Potree viewport (converts on demand) |
+
+Runs land in the workspace at `<master>.potreeedit/segmented/pipeline/` as `<stem>_entire_tract_stitched.las` (tract) or `<stem>_ff3d_segmented.las` (single cloud). Parameters are stored per dataset in `edits.db`, so a tract reopens with the settings that produced the last run. Changing a model-level parameter rebuilds the warm model on the next run (~10 s); the tiled tract run reports progress from ForestFormer3D's own `tract_tiling_progress.json`, so the counter is real, not a guess.
 
 ---
 

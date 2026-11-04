@@ -58,15 +58,47 @@ def _interpreter():
     ])
 
 
+def repo_root():
+    """Absolute path of the resolved ForestFormer3D checkout (None if missing)."""
+    return _repo_root()
+
+
 FF3D_REPO = _repo_root()
 FF3D_PYTHON = _interpreter()
 
 _RUNNER = '''
-import sys, json
+import os, sys, json
 import numpy as np
 from ff3d_api import ForestFormer3D
 
-ff = ForestFormer3D()
+_model = None
+_model_key = None
+
+
+def model_for(req):
+    """Build the model once and reuse it; rebuild only when a model-level
+    parameter (weights, device, voxel radius/step, score threshold) changes."""
+    global _model, _model_key
+    key = (req.get("config") or "", req.get("checkpoint") or "",
+           req.get("device") or "cuda:0", float(req.get("radius", 16.0)),
+           float(req.get("step_size", 6.0)), float(req.get("score_th", 0.4)))
+    if _model is not None and _model_key == key:
+        return _model
+    kw = {}
+    if req.get("config"):
+        kw["config"] = req["config"]
+    if req.get("checkpoint"):
+        kw["checkpoint"] = req["checkpoint"]
+    if req.get("device"):
+        kw["device"] = req["device"]
+    for name in ("radius", "step_size", "score_th"):
+        if req.get(name) is not None:
+            kw[name] = float(req[name])
+    _model = ForestFormer3D(**kw)
+    _model_key = key
+    return _model
+
+
 print("##FF3D## " + json.dumps({"ready": True}), flush=True)
 for line in sys.stdin:
     line = line.strip()
@@ -74,11 +106,29 @@ for line in sys.stdin:
         continue
     req = json.loads(line)
     try:
-        d = np.load(req["in"])
-        sem, inst, scores = ff.predict_points(d["xyz"])
-        np.savez(req["out"], sem=sem.astype(np.int16), inst=inst.astype(np.int32),
-                 scores=scores.astype(np.float32))
-        out = {"ok": True, "n_trees": int(len(np.unique(inst[inst >= 0])))}
+        mode = req.get("mode", "points")
+        if mode == "points":
+            ff = model_for(req)
+            d = np.load(req["in"])
+            sem, inst, scores = ff.predict_points(d["xyz"])
+            np.savez(req["out"], sem=sem.astype(np.int16), inst=inst.astype(np.int32),
+                     scores=scores.astype(np.float32))
+            out = {"ok": True, "n_trees": int(len(np.unique(inst[inst >= 0])))}
+        elif mode == "tract":
+            ff = model_for(req)
+            las_out = ff.predict_tract(
+                req["in"], req["out_dir"],
+                tile_size=float(req.get("tile_size", 70.0)),
+                overlap=float(req.get("overlap", 10.0)))
+            out = {"ok": True, "out_las": las_out}
+        else:  # single: one cylinder pass over the whole file
+            ff = model_for(req)
+            roi = req.get("roi")
+            res = ff.predict(req["in"], roi=tuple(roi) if roi else None)
+            stem = os.path.splitext(os.path.basename(req["in"]))[0]
+            las_out = os.path.join(req["out_dir"], stem + "_ff3d_segmented.las")
+            ForestFormer3D.save_las(req["in"], res, las_out)
+            out = {"ok": True, "out_las": las_out, "n_trees": int(res.n_trees)}
     except Exception as e:
         out = {"ok": False, "error": str(e)}
     print("##FF3D## " + json.dumps(out), flush=True)
@@ -146,6 +196,40 @@ class ForestFormer3DModule:
         os.remove(in_path)
         os.remove(out_path)
         return d["sem"], d["inst"], d["scores"]
+
+    def predict_file(self, in_las: str, out_dir: str, mode: str = "tract", *,
+                     tile_size: float = 70.0, overlap: float = 10.0,
+                     roi=None, model: dict = None) -> dict:
+        """Full-pipeline run over a LAS/LAZ file (blocks for minutes on a tract).
+
+        mode="tract"  tiles the cloud, runs each tile, merges and seam-stitches
+                      -> <out_dir>/<stem>_entire_tract_stitched.las
+        mode="single" one cylinder pass over the whole file
+                      -> <out_dir>/<stem>_ff3d_segmented.las
+
+        `model` optionally carries ForestFormer3D constructor overrides
+        (config, checkpoint, device, radius, step_size, score_th); changing one
+        rebuilds the warm model on the next request. Returns the worker's reply:
+        {"ok": True, "out_las": path, "n_trees": int|None}.
+        """
+        self._ensure()
+        os.makedirs(out_dir, exist_ok=True)
+        payload = {"mode": mode,
+                   "in": os.path.abspath(in_las),
+                   "out_dir": os.path.abspath(out_dir),
+                   "tile_size": float(tile_size),
+                   "overlap": float(overlap)}
+        if roi:
+            payload["roi"] = [float(v) for v in roi]
+        for k, v in (model or {}).items():
+            if v not in (None, ""):
+                payload[k] = v
+        self._proc.stdin.write(json.dumps(payload) + "\n")
+        self._proc.stdin.flush()
+        res = _read_tagged(self._proc.stdout)
+        if not res.get("ok"):
+            raise RuntimeError(f"ForestFormer3D {mode} run failed: {res}")
+        return res
 
     def close(self):
         if self._proc is not None and self._proc.poll() is None:
