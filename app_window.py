@@ -1882,15 +1882,6 @@ class MainWindow(QMainWindow):
         self.btn_extract_tree.clicked.connect(self.extract_tree_view_action)
         v_tree.addWidget(self.btn_extract_tree)
 
-        # AI Segmentation has moved to the top ribbon "AI" tab (under AI SEGMENTATION TOOLSET)
-        btn_open_ai_tab = QPushButton("🤖 AI Segmentation Toolset (Top Ribbon Tab) →")
-        btn_open_ai_tab.setObjectName("btnSecondary")
-        btn_open_ai_tab.setStyleSheet("padding: 6px 10px; font-size: 11px; font-weight: 600; color: #38bdf8;")
-        btn_open_ai_tab.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_open_ai_tab.setToolTip("Open the AI Segmentation Toolset in the top ribbon bar")
-        btn_open_ai_tab.clicked.connect(self._switch_to_ai_tab)
-        v_tree.addWidget(btn_open_ai_tab)
-
         btn_close_tree = QPushButton("Close Tree View & Back to Layers")
         btn_close_tree.setObjectName("btnSecondary")
         btn_close_tree.setStyleSheet("padding: 5px 10px; font-size: 11px;")
@@ -5210,12 +5201,6 @@ class MainWindow(QMainWindow):
 
         h_layout.addStretch()
         return page
-
-    def _switch_to_ai_tab(self):
-        if hasattr(self, "btn_tab_ai"):
-            self.btn_tab_ai.setChecked(True)
-        if hasattr(self, "ribbon_stack"):
-            self.ribbon_stack.setCurrentIndex(5)
 
     def _on_ai_tree_spin_changed(self, val: int):
         if hasattr(self, "spin_tree_view") and self.spin_tree_view.value() != val:
