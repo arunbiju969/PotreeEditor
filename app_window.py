@@ -79,15 +79,16 @@ class CommitWorker(QThread):
 
 
 class ConfirmSplitDialog(QDialog):
-    """Dialog to review and confirm individual Tree IDs when ForestFormer3D splits a tree."""
-    def __init__(self, parent, target_itc: int, n_trees: int, seg_las_path: str, max_itc: int):
+    """Dialog to review and confirm individual Tree IDs when ForestFormer3D splits a tree or segments unassigned stand points."""
+    def __init__(self, parent, target_itc: int, n_trees: int, seg_las_path: str, max_itc: int, is_target_included: bool = True):
         super().__init__(parent)
-        self.setWindowTitle("Confirm ForestFormer3D Tree Split")
+        self.setWindowTitle(f"Confirm ForestFormer3D Tree Split: Tree #{target_itc}" if is_target_included else "Confirm ForestFormer3D Segmentation: New Trees")
         self.resize(460, 360)
         self.target_itc = target_itc
         self.n_trees = n_trees
         self.seg_las_path = seg_las_path
         self.max_itc = max_itc
+        self.is_target_included = is_target_included
         self.id_spinners = []
         self.action_choice = "cancel"
         self.init_ui()
@@ -96,14 +97,24 @@ class ConfirmSplitDialog(QDialog):
         v = QVBoxLayout(self)
         v.setSpacing(12)
 
-        lbl_title = QLabel(f"<b>ForestFormer3D Split: Tree #{self.target_itc}</b>")
-        lbl_title.setStyleSheet("font-size: 13px; color: #10b981;")
-        v.addWidget(lbl_title)
+        if self.is_target_included:
+            lbl_title = QLabel(f"<b>ForestFormer3D Split: Tree #{self.target_itc}</b>")
+            lbl_title.setStyleSheet("font-size: 13px; color: #10b981;")
+            v.addWidget(lbl_title)
 
-        lbl_desc = QLabel(
-            f"ForestFormer3D detected <b>{self.n_trees} individual trees</b> in this area.<br>"
-            "Assign Tree IDs below to update the master point cloud:"
-        )
+            lbl_desc = QLabel(
+                f"ForestFormer3D detected <b>{self.n_trees} individual trees</b> in Tree #{self.target_itc}.<br>"
+                "Assign Tree IDs below to update the master point cloud:"
+            )
+        else:
+            lbl_title = QLabel(f"<b>ForestFormer3D Segmentation: New Trees (Stand Points)</b>")
+            lbl_title.setStyleSheet("font-size: 13px; color: #10b981;")
+            v.addWidget(lbl_title)
+
+            lbl_desc = QLabel(
+                f"ForestFormer3D detected <b>{self.n_trees} new individual trees</b> in the selected stand points near Tree #{self.target_itc}.<br>"
+                "Assign new Tree IDs below to update the master point cloud:"
+            )
         lbl_desc.setStyleSheet("color: #cbd5e1; font-size: 11px;")
         v.addWidget(lbl_desc)
 
@@ -117,10 +128,11 @@ class ConfirmSplitDialog(QDialog):
             lbl.setStyleSheet("font-weight: 600; color: #f8fafc;")
             spin = QSpinBox()
             spin.setRange(1, 9999999)
-            if i == 0:
+            if i == 0 and self.is_target_included:
                 spin.setValue(self.target_itc)
             else:
-                spin.setValue(self.max_itc + i)
+                offset = i if self.is_target_included else (i + 1)
+                spin.setValue(self.max_itc + offset)
             spin.setStyleSheet("padding: 4px 8px; font-size: 12px;")
             self.id_spinners.append(spin)
             h.addWidget(lbl)
@@ -292,11 +304,12 @@ class EditHistoryDialog(QDialog):
         rec = self.selected_edit
         edit_id = rec.get("id")
         target_itc = rec.get("target_itc")
+        target_desc = f"Tree #{target_itc}" if target_itc else "Stand Segmentation (Unassigned Points)"
         reply = QMessageBox.question(
             self,
             "Confirm Revert",
-            f"Are you sure you want to revert Edit #{edit_id} (Tree #{target_itc})?\n\n"
-            f"This will restore Tree #{target_itc} points in the octree in-place and mark this edit as reverted.",
+            f"Are you sure you want to revert Edit #{edit_id} ({target_desc})?\n\n"
+            f"This will restore the original points in the octree in-place and mark this edit as reverted.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.Yes
         )
@@ -310,14 +323,16 @@ class EditHistoryDialog(QDialog):
             return
 
         try:
-            parent.manager.revert_potree_octree(potree_dir, rec)
+            res = parent.manager.revert_potree_octree(potree_dir, rec)
             rev_pts = res.get("reverted_points", 0)
             self.settings_store.mark_edit_reverted(edit_id)
-            self.settings_store.revert_tree_edits_by_parent_itc(target_itc)
+            self.settings_store.revert_tree_edits_by_edit_id(edit_id)
+            if target_itc:
+                self.settings_store.revert_tree_edits_by_parent_itc(target_itc)
+                parent.manager.clear_tree_cache(target_itc)
+                parent._run_js(f"if (window.invalidateTreeCache) window.invalidateTreeCache({target_itc});")
 
             # Invalidate caches in Python and JavaScript
-            parent.manager.clear_tree_cache(target_itc)
-            parent._run_js(f"if (window.invalidateTreeCache) window.invalidateTreeCache({target_itc});")
             for a_id in rec.get("assigned_itcs", []):
                 parent.manager.clear_tree_cache(int(a_id))
                 parent._run_js(f"if (window.invalidateTreeCache) window.invalidateTreeCache({int(a_id)});")
@@ -326,11 +341,12 @@ class EditHistoryDialog(QDialog):
             # Remove from staged edits if currently present
             parent.manager.staged_edits = [
                 e for e in parent.manager.staged_edits
-                if e.get("db_edit_id") != edit_id and e.get("target_itc") != target_itc
+                if e.get("db_edit_id") != edit_id and (target_itc is None or e.get("target_itc") != target_itc)
             ]
             parent.refresh_staged_edits_table()
             parent._run_js("window.reloadCurrentPointCloud();")
-            parent._run_js(f"window.viewTreeById({target_itc});")
+            if target_itc:
+                parent._run_js(f"window.viewTreeById({target_itc});")
 
             QMessageBox.information(
                 self,
@@ -2791,14 +2807,26 @@ class MainWindow(QMainWindow):
         hint_x = f"{self._last_picked_x}" if (hasattr(self, "_last_picked_itc") and self._last_picked_itc == itc and hasattr(self, "_last_picked_x")) else "null"
         hint_y = f"{self._last_picked_y}" if (hasattr(self, "_last_picked_itc") and self._last_picked_itc == itc and hasattr(self, "_last_picked_y")) else "null"
 
+        # Check if Stand Filter is active with specific checked trees
+        keep_ids = None
+        if hasattr(self, "list_stand_trees") and self.list_stand_trees.count() > 0:
+            checked = [self.list_stand_trees.item(i).data(Qt.ItemDataRole.UserRole)
+                       for i in range(self.list_stand_trees.count())
+                       if self.list_stand_trees.item(i).checkState() == Qt.CheckState.Checked]
+            if checked and len(checked) < self.list_stand_trees.count():
+                keep_ids = checked
+
         self._tree_view_state = {
             "itc": itc, "radius": radius, "mode": n_mode, "ground": g_rad,
             "x": float(self._last_picked_x) if hint_x != "null" else None,
             "y": float(self._last_picked_y) if hint_y != "null" else None,
+            "keep_ids": keep_ids,
         }
-        self.lbl_tree_view_status.setText(f"ForestFormer3D segmenting Tree #{itc}... (first run loads the model, ~15 s)")
-        self.status_bar.showMessage("ForestFormer3D segmentation running (~10 s)...", 15000)
-        self._run_js(f"window.segmentTreeById({itc}, {hint_x}, {hint_y}, {radius:.1f}, '{n_mode}', {g_rad:.1f});")
+        status_target = f"Tree #{itc}" if (keep_ids is None or itc in keep_ids) else f"selected stand points near Tree #{itc}"
+        self.lbl_tree_view_status.setText(f"ForestFormer3D segmenting {status_target}... (first run loads the model, ~15 s)")
+        self.status_bar.showMessage(f"ForestFormer3D segmentation running on {status_target} (~10 s)...", 15000)
+        keep_json = json.dumps(keep_ids) if keep_ids is not None else "null"
+        self._run_js(f"window.segmentTreeById({itc}, {hint_x}, {hint_y}, {radius:.1f}, '{n_mode}', {g_rad:.1f}, {keep_json});")
 
     def extract_tree_view_action(self):
         """Write the full-density tree/stand currently displayed in the Forestry tab
@@ -2864,7 +2892,12 @@ class MainWindow(QMainWindow):
         seg_las = str(data.get("ff3d_las", ""))
         max_itc = self.manager.get_max_itc()
 
-        dlg = ConfirmSplitDialog(self, itc, n_trees, seg_las, max_itc)
+        keep_ids = data.get("keep_tree_ids")
+        is_target_included = True
+        if keep_ids is not None:
+            is_target_included = (itc in [int(x) for x in keep_ids])
+
+        dlg = ConfirmSplitDialog(self, itc, n_trees, seg_las, max_itc, is_target_included=is_target_included)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
 
@@ -2875,7 +2908,12 @@ class MainWindow(QMainWindow):
         base_dir = os.path.dirname(os.path.abspath(potree_dir)) if potree_dir else os.getcwd()
         edits_dir = os.path.join(base_dir, "edits", "trees")
         os.makedirs(edits_dir, exist_ok=True)
-        canonical_las = os.path.join(edits_dir, f"tree_{itc}_split.las")
+        import time
+        if is_target_included:
+            canonical_las = os.path.join(edits_dir, f"tree_{itc}_split.las")
+        else:
+            canonical_las = os.path.join(edits_dir, f"stand_near_{itc}_split_{int(time.time())}.las")
+
         if seg_las and os.path.exists(seg_las) and os.path.abspath(seg_las) != os.path.abspath(canonical_las):
             try:
                 import shutil
@@ -2885,14 +2923,16 @@ class MainWindow(QMainWindow):
                 print(f"[MainWindow] Error copying split LAS to edits dir: {ce}")
 
         # Stage the edit in PointCloudManager
+        edit_label = f"FF3D Split Tree #{itc} -> {list(id_map.values())}" if is_target_included else f"FF3D New Trees -> {list(id_map.values())}"
         staged_edit = {
             "type": "ff3d_split",
             "action": "ff3d_split",
-            "target_itc": itc,
+            "target_itc": itc if is_target_included else None,
             "segmented_las": seg_las,
             "id_mapping": id_map,
-            "label": f"FF3D Split Tree #{itc} -> {list(id_map.values())}",
-            "color": "#06b6d4"
+            "label": edit_label,
+            "color": "#06b6d4",
+            "is_target_included": is_target_included,
         }
         # 1. Instant Octree Commit (In-place patch)
         if dlg.action_choice == "octree":
@@ -2904,7 +2944,7 @@ class MainWindow(QMainWindow):
                 self.refresh_staged_edits_table()
                 return
 
-            self.status_bar.showMessage(f"Patching Potree 2.0 octree in place for Tree #{itc}...", 10000)
+            self.status_bar.showMessage(f"Patching Potree 2.0 octree in place for {edit_label}...", 10000)
             QApplication.processEvents()
             try:
                 res = self.manager.patch_potree_octree(potree_dir, [staged_edit])
@@ -2915,7 +2955,7 @@ class MainWindow(QMainWindow):
                     edit_type="ff3d_split",
                     potree_dir=potree_dir,
                     las_path=self.manager.las_path,
-                    target_itc=itc,
+                    target_itc=itc if is_target_included else None,
                     assigned_itcs=list(id_map.values()),
                     id_mapping=id_map,
                     segmented_las_path=seg_las,
@@ -2928,7 +2968,7 @@ class MainWindow(QMainWindow):
                 staged_edit["db_edit_id"] = db_id
                 staged_edit["action"] = "ff3d_split [Octree Patched]"
                 staged_edit["color"] = "#0284c7"
-                staged_edit["label"] = f"FF3D Split Tree #{itc} -> {list(id_map.values())} [Octree Patched]"
+                staged_edit["label"] = f"{edit_label} [Octree Patched]"
                 self.manager.add_staged_edit(staged_edit)
                 self.refresh_staged_edits_table()
 
@@ -2949,36 +2989,46 @@ class MainWindow(QMainWindow):
                         c_int = int(c_idx)
                         a_int = int(assigned_id)
                         pt_cnt = int((c_arr == c_int).sum())
-                        self.settings_store.register_tree_edit(a_int, itc, c_int, db_id, seg_las, pt_cnt)
-                        self.manager.register_tree_edit(a_int, itc, c_int, db_id, seg_las, pt_cnt, id_map)
+                        parent_val = itc if is_target_included else a_int
+                        self.settings_store.register_tree_edit(a_int, parent_val, c_int, db_id, seg_las, pt_cnt)
+                        self.manager.register_tree_edit(a_int, parent_val, c_int, db_id, seg_las, pt_cnt, id_map)
                 except Exception as reg_err:
                     print(f"[MainWindow] Error registering tree edits: {reg_err}")
 
                 # 4. Invalidate caches so next query fetches the new single tree
-                self.manager.clear_tree_cache(itc)
-                self._run_js(f"if (window.invalidateTreeCache) window.invalidateTreeCache({itc});")
+                if is_target_included:
+                    self.manager.clear_tree_cache(itc)
+                    self._run_js(f"if (window.invalidateTreeCache) window.invalidateTreeCache({itc});")
                 for assigned_id in id_map.values():
                     self.manager.clear_tree_cache(int(assigned_id))
                     self._run_js(f"if (window.invalidateTreeCache) window.invalidateTreeCache({int(assigned_id)});")
 
                 self.status_bar.showMessage(f"Patched Potree octree ({pts_changed:,} points) and logged to database!", 8000)
                 self._run_js("window.reloadCurrentPointCloud();")
-                # Immediately refresh the tree view so Forestry displays ONLY the single tree!
-                self._run_js(f"window.viewTreeById({itc});")
+                # Refresh the tree view
+                if is_target_included:
+                    self._run_js(f"window.viewTreeById({itc});")
+                elif id_map:
+                    first_id = list(id_map.values())[0]
+                    self._run_js(f"window.viewTreeById({first_id});")
 
                 if hasattr(self, "btn_confirm_segmentation"):
                     self.btn_confirm_segmentation.setEnabled(False)
+
+                source_desc = f"• Target Tree: #{itc}\n" if is_target_included else "• Source: Stand Selection (Unassigned Points)\n"
+                refresh_desc = f"The Forestry tree view has refreshed to show only Tree #{itc}." if is_target_included else f"The Forestry tree view has refreshed to show new Tree #{list(id_map.values())[0]}."
+
                 QMessageBox.information(
                     self,
                     "Octree In-Place Commit Complete",
                     f"Successfully committed ForestFormer3D split to the active Potree Octree!\n\n"
-                    f"• Target Tree: #{itc}\n"
+                    f"{source_desc}"
                     f"• Assigned Tree IDs: {list(id_map.values())}\n"
                     f"• Octree Points Updated: {pts_changed:,}\n"
                     f"• Octree Folder: {os.path.basename(potree_dir)}\n"
                     f"• Database History ID: #{db_id}\n\n"
                     "The edit has been automatically staged and logged into settings.db.\n"
-                    "The Forestry tree view has refreshed to show only Tree #{itc}."
+                    f"{refresh_desc}"
                 )
             except Exception as e:
                 QMessageBox.critical(self, "Octree Patch Failed", f"Failed to patch Potree octree in place:\n\n{e}")
@@ -3011,23 +3061,30 @@ class MainWindow(QMainWindow):
                     c_int = int(c_idx)
                     a_int = int(assigned_id)
                     pt_cnt = int((c_arr == c_int).sum())
-                    self.manager.register_tree_edit(a_int, itc, c_int, 0, seg_las, pt_cnt, id_map)
+                    parent_val = itc if is_target_included else a_int
+                    self.manager.register_tree_edit(a_int, parent_val, c_int, 0, seg_las, pt_cnt, id_map)
             except Exception:
                 pass
-            self.manager.clear_tree_cache(itc)
-            self._run_js(f"if (window.invalidateTreeCache) window.invalidateTreeCache({itc});")
+            if is_target_included:
+                self.manager.clear_tree_cache(itc)
+                self._run_js(f"if (window.invalidateTreeCache) window.invalidateTreeCache({itc});")
             for assigned_id in id_map.values():
                 self.manager.clear_tree_cache(int(assigned_id))
                 self._run_js(f"if (window.invalidateTreeCache) window.invalidateTreeCache({int(assigned_id)});")
-            self._run_js(f"window.viewTreeById({itc});")
+            if is_target_included:
+                self._run_js(f"window.viewTreeById({itc});")
+            elif id_map:
+                first_id = list(id_map.values())[0]
+                self._run_js(f"window.viewTreeById({first_id});")
 
             if hasattr(self, "btn_confirm_segmentation"):
                 self.btn_confirm_segmentation.setEnabled(False)
-            self.status_bar.showMessage(f"Staged ForestFormer3D split for Tree #{itc} -> IDs {list(id_map.values())}", 8000)
+            self.status_bar.showMessage(f"Staged {edit_label}", 8000)
+            title_stage = f"ForestFormer3D split for Tree #{itc}" if is_target_included else "ForestFormer3D segmentation for selected stand points"
             QMessageBox.information(
                 self,
-                "Split Staged",
-                f"ForestFormer3D split for Tree #{itc} has been staged successfully!\n\n"
+                "Edits Staged",
+                f"{title_stage} has been staged successfully!\n\n"
                 f"Assigned Tree IDs: {list(id_map.values())}\n\n"
                 "You can see it in the 'Staged Trees & Edits' list on the Layers tab.\n"
                 "When ready, click 'Commit & Save to LAS/LAZ...' (or Ctrl+Shift+S) to write the updated point cloud."
@@ -3679,14 +3736,17 @@ class MainWindow(QMainWindow):
                             s_las = laspy.read(e["segmented_las"])
                             extra_d = [d.name for d in s_las.point_format.dimensions]
                             c_arr = np.asarray(s_las.ff3d_tree_id if "ff3d_tree_id" in extra_d else (s_las.tree_id if "tree_id" in extra_d else np.zeros(len(s_las))), dtype=np.int32)
-                            p_itc = int(e.get("target_itc", 0))
+                            is_inc = e.get("is_target_included", e.get("target_itc") is not None)
+                            raw_target = e.get("target_itc")
+                            p_itc = int(raw_target) if (raw_target is not None and is_inc) else 0
                             id_map = e.get("id_mapping", {})
                             for c_idx, assigned_id in id_map.items():
                                 c_int = int(c_idx)
                                 a_int = int(assigned_id)
                                 pt_cnt = int((c_arr == c_int).sum())
-                                self.settings_store.register_tree_edit(a_int, p_itc, c_int, e.get("db_edit_id", 0), e["segmented_las"], pt_cnt)
-                                self.manager.register_tree_edit(a_int, p_itc, c_int, e.get("db_edit_id", 0), e["segmented_las"], pt_cnt, id_map)
+                                parent_val = p_itc if is_inc else a_int
+                                self.settings_store.register_tree_edit(a_int, parent_val, c_int, e.get("db_edit_id", 0), e["segmented_las"], pt_cnt)
+                                self.manager.register_tree_edit(a_int, parent_val, c_int, e.get("db_edit_id", 0), e["segmented_las"], pt_cnt, id_map)
                         except Exception as tree_err:
                             print(f"[MainWindow] Error registering tree edit on commit: {tree_err}")
                 self._run_js("window.reloadCurrentPointCloud();")

@@ -261,17 +261,48 @@ class HybridRequestHandler(BaseHTTPRequestHandler):
                 radius = float(data.get("radius", 0.0))
                 neighbor_mode = str(data.get("neighbor_mode", "trees_only"))
                 ground_radius = float(data.get("ground_radius", 0.0))
+                keep_tree_ids = data.get("keep_tree_ids")
                 payload = self.manager.get_tree_points(itc, x=x, y=y, radius=radius,
                                                        neighbor_mode=neighbor_mode,
                                                        ground_radius=ground_radius)
-                if payload.get("count", 0) > 0:
+                if payload and payload.get("count", 0) > 0:
                     import numpy as np
                     from ff3d_module import get_module
-                    xyz = np.asarray(payload["xyz"], dtype=np.float32)
-                    _sem, inst, _scores = get_module().predict(xyz)
-                    ff_ids = np.where(inst < 0, 0, inst + 1).astype(np.float32)
                     payload = dict(payload)
                     scalars = dict(payload.get("scalars") or {})
+
+                    # If keep_tree_ids is provided (e.g. from an active Stand Filter),
+                    # restrict segmentation to only the selected tree/canopy points:
+                    if keep_tree_ids is not None:
+                        keep = set(int(t) for t in keep_tree_ids)
+                        itc_name = next((n for n in ("itc", "treeID", "tree_id") if n in scalars), None)
+                        if itc_name is not None:
+                            arr_itc = np.asarray(scalars[itc_name], dtype=np.int64)
+                            sel = np.isin(arr_itc, list(keep))
+                            if sel.any():
+                                filtered_xyz = np.asarray(payload["xyz"])[sel]
+                                payload["xyz"] = filtered_xyz
+                                if payload.get("rgb") is not None:
+                                    payload["rgb"] = np.asarray(payload["rgb"])[sel]
+                                if payload.get("intensity") is not None:
+                                    payload["intensity"] = np.asarray(payload["intensity"])[sel]
+                                if payload.get("classification") is not None:
+                                    payload["classification"] = np.asarray(payload["classification"])[sel]
+                                scalars = {k: np.asarray(v)[sel] for k, v in scalars.items()}
+                                payload["scalars"] = scalars
+                                payload["count"] = int(sel.sum())
+                                target_cnt = payload.get("target_count", 0)
+                                payload["target_count"] = int(np.sum(sel[:min(target_cnt, len(sel))]))
+                                payload["neighbor_count"] = payload["count"] - payload["target_count"]
+                                payload["bbox_min"] = [float(val) for val in filtered_xyz.min(axis=0)]
+                                payload["bbox_max"] = [float(val) for val in filtered_xyz.max(axis=0)]
+
+                    xyz = np.asarray(payload["xyz"], dtype=np.float32)
+                    if len(xyz) == 0:
+                        self.send_error(400, "No points available for segmentation after applying filter.")
+                        return
+                    _sem, inst, _scores = get_module().predict(xyz)
+                    ff_ids = np.where(inst < 0, 0, inst + 1).astype(np.float32)
                     scalars["itc"] = ff_ids          # JS colours from the itc scalar
                     payload["scalars"] = scalars
                     payload["ff3d_trees"] = int(np.unique(inst[inst >= 0]).size)
@@ -404,7 +435,7 @@ class HybridRequestHandler(BaseHTTPRequestHandler):
         # record stride must include them before arrays are assigned).
         pf = laspy.PointFormat(3)
         try:
-            for name, dtype in (("ff3d_tree_id", "uint16"),
+            for name, dtype in (("ff3d_tree_id", "int32"),
                                 ("ff3d_semantic", "uint8"),
                                 ("ff3d_score", "float32")):
                 pf.add_extra_dimension(laspy.ExtraBytesParams(name=name, type=np.dtype(dtype)))
@@ -444,9 +475,9 @@ class HybridRequestHandler(BaseHTTPRequestHandler):
             out.green = rgb[:, 1].astype(np.uint16) * 256
             out.blue = rgb[:, 2].astype(np.uint16) * 256
         try:
-            out["ff3d_tree_id"] = np.asarray(inst).astype(np.uint16)
-            out["ff3d_semantic"] = np.asarray(sem).astype(np.uint8)
-            out["ff3d_score"] = np.asarray(scores).astype(np.float32)
+            out["ff3d_tree_id"] = np.asarray(inst, dtype=np.int32)
+            out["ff3d_semantic"] = np.asarray(sem, dtype=np.uint8)
+            out["ff3d_score"] = np.asarray(scores, dtype=np.float32)
         except Exception:
             pass
         out_dir = os.path.dirname(src) if src and os.path.exists(src) else os.getcwd()

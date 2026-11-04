@@ -2631,7 +2631,7 @@ window.invalidateTreeCache = function (itcValue) {
     console.log(`[PotreeHybrid] Invalidated treeBufferCache for Tree #${num}`);
 };
 
-window.viewTreeById = async function (itcValue, hintX, hintY, radius, neighborMode, groundRadius, endpoint) {
+window.viewTreeById = async function (itcValue, hintX, hintY, radius, neighborMode, groundRadius, endpoint, keepTreeIds) {
     if (itcValue === null || itcValue === undefined) return;
     const num = Number(itcValue);
     if (!num || num <= 0) return;
@@ -2644,7 +2644,13 @@ window.viewTreeById = async function (itcValue, hintX, hintY, radius, neighborMo
     const gRad = Number(groundRadius) || 0.0;
     const ep = endpoint || '/api/get_tree';
     const seg = ep.indexOf('segment') !== -1;
-    const cacheKey = `${num}_${radVal}_${nMode}_${gRad}_${seg ? 'seg' : 'itc'}`;
+
+    let activeKeep = keepTreeIds;
+    if (!activeKeep && seg && treeFilterActive && treeFilterSelectedIds && treeFilterSelectedIds.size > 0) {
+        activeKeep = Array.from(treeFilterSelectedIds);
+    }
+    const keepStr = (activeKeep && activeKeep.length > 0) ? activeKeep.slice().sort().join(',') : 'all';
+    const cacheKey = `${num}_${radVal}_${nMode}_${gRad}_${seg ? 'seg' : 'itc'}_${keepStr}`;
 
     try {
         let buf = treeBufferCache.get(cacheKey);
@@ -2658,6 +2664,9 @@ window.viewTreeById = async function (itcValue, hintX, hintY, radius, neighborMo
                 showToast(`Fetching ${label} — querying full density...`);
             }
             const payload = { itc: num, radius: radVal, neighbor_mode: nMode };
+            if (activeKeep && activeKeep.length > 0) {
+                payload.keep_tree_ids = activeKeep;
+            }
             if (gRad > 0) payload.ground_radius = gRad;
             if (hintX !== undefined && hintX !== null) payload.x = Number(hintX);
             if (hintY !== undefined && hintY !== null) payload.y = Number(hintY);
@@ -2898,7 +2907,8 @@ window.viewTreeById = async function (itcValue, hintX, hintY, radius, neighborMo
             trees: standTrees,
             ff3d_trees: ff3dTrees,
             ff3d_las: ff3dLas,
-            is_segmented: seg
+            is_segmented: seg,
+            keep_tree_ids: activeKeep || null
         }).catch(() => {});
 
         if (neighborCount > 0) {
@@ -2921,9 +2931,13 @@ window.viewTreeById = async function (itcValue, hintX, hintY, radius, neighborMo
 
 // Segment the displayed tree/stand with ForestFormer3D: the overlay rebuilds
 // coloured per detected instance (green = tree 1, 48-stop palette per tree).
-window.segmentTreeById = function (itcValue, hintX, hintY, radius, neighborMode, groundRadius) {
+window.segmentTreeById = function (itcValue, hintX, hintY, radius, neighborMode, groundRadius, keepTreeIds) {
+    let keep = keepTreeIds;
+    if (!keep && treeFilterActive && treeFilterSelectedIds && treeFilterSelectedIds.size > 0) {
+        keep = Array.from(treeFilterSelectedIds);
+    }
     return window.viewTreeById(itcValue, hintX, hintY, radius, neighborMode, groundRadius,
-                               '/api/segment_tree');
+                               '/api/segment_tree', keep);
 };
 
 window.currentTreeViewItc = function () {

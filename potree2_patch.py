@@ -314,6 +314,7 @@ class Potree2Cloud:
                         mapped_itc[seg_tree_ids == int(raw_id)] = int(target_id)
 
                     target_itc = edit.get("target_itc")
+                    is_target_included = edit.get("is_target_included", True)
                     min_x, max_x = float(np.min(seg_xyz[:, 0])), float(np.max(seg_xyz[:, 0]))
                     min_y, max_y = float(np.min(seg_xyz[:, 1])), float(np.max(seg_xyz[:, 1]))
                     min_z, max_z = float(np.min(seg_xyz[:, 2])), float(np.max(seg_xyz[:, 2]))
@@ -326,7 +327,7 @@ class Potree2Cloud:
                              (mm["y"] >= ry0) & (mm["y"] <= ry1) &
                              (mm["z"] >= rz0) & (mm["z"] <= rz1))
 
-                    if target_itc is not None and has_itc:
+                    if is_target_included and target_itc is not None and has_itc:
                         bmask |= (mm["itc"] == int(target_itc))
 
                     cands = np.flatnonzero(bmask)
@@ -440,11 +441,11 @@ class Potree2Cloud:
         etype = edit.get("type", edit.get("edit_type", "ff3d_split"))
         if etype == "ff3d_split":
             target_itc = edit.get("target_itc")
+            is_target_included = edit.get("is_target_included", target_itc is not None)
             seg_las = edit.get("segmented_las") or edit.get("segmented_las_path")
             if not seg_las or not os.path.exists(seg_las):
                 raise FileNotFoundError(f"Segmented LAS file not found to revert: {seg_las}")
-            if target_itc is None:
-                raise ValueError("Target ITC is required to revert a tree split.")
+            restore_itc = int(target_itc) if (target_itc is not None and is_target_included) else 0
 
             import laspy
             from scipy.spatial import cKDTree
@@ -499,7 +500,9 @@ class Potree2Cloud:
                         id_mapping = json.loads(id_mapping)
                     except Exception:
                         id_mapping = {}
-                assigned_ids = [int(v) for v in id_mapping.values()] + [int(target_itc)]
+                assigned_ids = [int(v) for v in id_mapping.values()]
+                if restore_itc > 0:
+                    assigned_ids.append(restore_itc)
                 if has_itc:
                     for aid in assigned_ids:
                         bmask |= (mm["itc"] == aid)
@@ -524,13 +527,13 @@ class Potree2Cloud:
                         if is_tree_pt.any():
                             cand_trees = cand_matched[is_tree_pt]
                             if has_itc:
-                                mm["itc"][cand_trees] = int(target_itc)
+                                mm["itc"][cand_trees] = restore_itc
                                 touched_attrs.add("itc")
                             if has_tree_id and tree_id_field:
-                                mm[tree_id_field][cand_trees] = int(target_itc) - 1
+                                mm[tree_id_field][cand_trees] = (restore_itc - 1) if restore_itc > 0 else -1
                                 touched_attrs.add(tree_id_field)
                             if has_cls:
-                                mm["classification"][cand_trees] = 4
+                                mm["classification"][cand_trees] = 4 if restore_itc > 0 else 1
                                 touched_attrs.add("classification")
                             if has_sem:
                                 mm["semantic_pred"][cand_trees] = 0

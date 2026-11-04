@@ -1091,7 +1091,7 @@ class PointCloudManager:
                     if int(assigned) == itc_val:
                         return {
                             "itc_id": itc_val,
-                            "parent_itc": int(edit.get("target_itc", itc_val)),
+                            "parent_itc": int(edit.get("target_itc") or itc_val),
                             "cluster_idx": int(c_idx),
                             "las_path": edit.get("segmented_las"),
                             "id_mapping": id_map,
