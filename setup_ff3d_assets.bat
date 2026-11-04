@@ -77,6 +77,7 @@ echo [INFO] Unpacking to %SUB%\work_dirs ...
 tar -xf "%TEMP%\clean_forestformer.zip" -C "%SUB%\work_dirs"
 if errorlevel 1 ( echo [ERROR] unpack failed. & pause & exit /b 1 )
 if not exist "%CKPT%" ( echo [ERROR] unpacked, but %CKPT% is still missing. & pause & exit /b 1 )
+del "%TEMP%\clean_forestformer.zip" >nul 2>&1
 echo [INFO] Checkpoint ready.
 :weights_done
 

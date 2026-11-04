@@ -95,6 +95,7 @@ else
     echo "[INFO] Unpacking → $CKPT_REL ..."
     unzip -o -q "$ZIP" -d "$SUB_PATH/work_dirs/" || die "unzip failed."
     [ -f "$CKPT" ] || die "unpacked, but $CKPT_REL is still missing — check the zip layout."
+    rm -f "$ZIP"
     ok "checkpoint ready ($(du -h "$CKPT" | cut -f1))"
 fi
 
