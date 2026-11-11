@@ -244,17 +244,29 @@ class HybridRequestHandler(BaseHTTPRequestHandler):
                 except Exception as e:
                     result = {"success": False, "error": str(e)}
 
+        elif path == "/api/get_all_points":
+            if self.manager:
+                payload = self.manager.get_all_points()
+                self._send_tree_binary(payload)
+                return
+
         elif path == "/api/get_tree":
             if self.manager and data.get("itc") is not None:
                 itc = int(data["itc"])
+                if itc == 0 or data.get("all_points"):
+                    payload = self.manager.get_all_points()
+                    self._send_tree_binary(payload)
+                    return
                 x = float(data["x"]) if data.get("x") is not None else None
                 y = float(data["y"]) if data.get("y") is not None else None
                 radius = float(data.get("radius", 0.0))
                 neighbor_mode = str(data.get("neighbor_mode", "trees_only"))
                 ground_radius = float(data.get("ground_radius", 0.0))
+                full_neighbors = bool(data.get("full_neighbors", False))
                 payload = self.manager.get_tree_points(itc, x=x, y=y, radius=radius,
                                                        neighbor_mode=neighbor_mode,
-                                                       ground_radius=ground_radius)
+                                                       ground_radius=ground_radius,
+                                                       full_neighbors=full_neighbors)
                 self._send_tree_binary(payload)
                 return
 
@@ -269,6 +281,7 @@ class HybridRequestHandler(BaseHTTPRequestHandler):
                 radius = float(data.get("radius", 0.0))
                 neighbor_mode = str(data.get("neighbor_mode", "trees_only"))
                 ground_radius = float(data.get("ground_radius", 0.0))
+                full_neighbors = bool(data.get("full_neighbors", False))
                 keep_tree_ids = data.get("keep_tree_ids")
 
                 target_str = f"Tree #{itc}" if (not keep_tree_ids or itc in [int(k) for k in keep_tree_ids]) else f"stand selection near Tree #{itc}"
@@ -281,7 +294,8 @@ class HybridRequestHandler(BaseHTTPRequestHandler):
                 t0 = time.time()
                 payload = self.manager.get_tree_points(itc, x=x, y=y, radius=radius,
                                                        neighbor_mode=neighbor_mode,
-                                                       ground_radius=ground_radius)
+                                                       ground_radius=ground_radius,
+                                                       full_neighbors=full_neighbors)
                 pts_cnt = payload.get("count", 0) if payload else 0
                 t_cnt = payload.get("target_count", 0) if payload else 0
                 n_cnt = payload.get("neighbor_count", 0) if payload else 0
@@ -436,7 +450,8 @@ class HybridRequestHandler(BaseHTTPRequestHandler):
         scalars = payload.get("scalars", {})
         has_scalars = bool(scalars and count > 0)
         has_neighbors = bool(payload.get("neighbor_count", 0) > 0)
-        if has_scalars or has_neighbors:
+        has_all_points = bool(payload.get("is_all_points", False))
+        if has_scalars or has_neighbors or has_all_points:
             flags |= 8
 
         header = struct.pack(
@@ -462,8 +477,14 @@ class HybridRequestHandler(BaseHTTPRequestHandler):
                 "target_count": payload.get("target_count", count),
                 "neighbor_count": payload.get("neighbor_count", 0),
                 "radius": payload.get("radius", 0.0),
-                "neighbor_mode": payload.get("neighbor_mode", "trees_only")
+                "neighbor_mode": payload.get("neighbor_mode", "trees_only"),
+                "full_neighbors": bool(payload.get("full_neighbors", False)),
+                "is_all_points": bool(payload.get("is_all_points", False)),
+                "total_points": payload.get("total_points", count),
+                "display_points": payload.get("display_points", count),
             }
+            if "trees_summary" in payload:
+                meta_dict["trees"] = payload["trees_summary"]
             if payload.get("ff3d_trees") is not None:
                 meta_dict["ff3d_trees"] = int(payload["ff3d_trees"])
             if payload.get("ff3d_las"):

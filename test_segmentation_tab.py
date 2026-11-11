@@ -52,10 +52,10 @@ class StubModule:
     delay = 0.0
 
     def predict_file(self, in_las, out_dir, mode="tract", *, tile_size=70.0,
-                     overlap=10.0, roi=None, model=None, on_output=None):
+                     overlap=10.0, roi=None, model=None, workers=1, on_output=None, **kwargs):
         StubModule.calls.append({"in_las": in_las, "out_dir": out_dir, "mode": mode,
                                  "tile_size": tile_size, "overlap": overlap,
-                                 "roi": roi, "model": dict(model or {})})
+                                 "roi": roi, "model": dict(model or {}), "workers": workers})
         if on_output:
             on_output(f"[stub] {mode} pass over {os.path.basename(in_las)}")
             on_output("[stub] merge + seam stitch complete")

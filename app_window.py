@@ -65,6 +65,7 @@ class BridgeSignaler(QObject):
     indexing_event = pyqtSignal(dict)
     segmentation_step = pyqtSignal(dict)
     console_log = pyqtSignal(dict)
+    measurement_completed = pyqtSignal(dict)
 
 
 class CommitWorker(QThread):
@@ -116,7 +117,8 @@ class SegmentationWorker(QThread):
     error = pyqtSignal(str)
 
     def __init__(self, module, in_las: str, out_dir: str, mode: str,
-                 tile_size: float, overlap: float, roi=None, model: dict = None):
+                 tile_size: float, overlap: float, roi=None, model: dict = None,
+                 workers: int = 1):
         super().__init__()
         self.module = module
         self.in_las = in_las
@@ -126,22 +128,44 @@ class SegmentationWorker(QThread):
         self.overlap = overlap
         self.roi = roi
         self.model = model
+        self.workers = workers
+        self._is_stopped = False
+
+    def stop(self):
+        self._is_stopped = True
+        try:
+            if self.module:
+                self.module.stop()
+        except Exception:
+            pass
 
     def run(self):
         import time
         t0 = time.time()
-        label = "tiled tract (tiles + merge + seam stitch)" if self.mode == "tract" else "single-cloud cylinder pass"
+        w_txt = f" with {self.workers} worker(s)" if self.mode == "tract" and self.workers > 1 else ""
+        label = f"tiled tract (tiles + merge + seam stitch){w_txt}" if self.mode == "tract" else "single-cloud cylinder pass"
         self.progress.emit(f"ForestFormer3D {label} on {os.path.basename(self.in_las)}...")
         try:
-            res = self.module.predict_file(
-                self.in_las, self.out_dir, mode=self.mode,
-                tile_size=self.tile_size, overlap=self.overlap,
-                roi=self.roi, model=self.model, on_output=self.log.emit)
+            kw = {
+                "tile_size": self.tile_size,
+                "overlap": self.overlap,
+                "roi": self.roi,
+                "model": self.model,
+                "on_output": self.log.emit,
+            }
+            import inspect
+            sig = inspect.signature(self.module.predict_file)
+            if "workers" in sig.parameters or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+                kw["workers"] = self.workers
+            res = self.module.predict_file(self.in_las, self.out_dir, mode=self.mode, **kw)
             res["elapsed_seconds"] = time.time() - t0
             res["mode"] = self.mode
             self.finished.emit(res)
         except Exception as e:
-            self.error.emit(str(e))
+            if self._is_stopped:
+                self.finished.emit({"stopped": True, "elapsed_seconds": time.time() - t0, "mode": self.mode})
+            else:
+                self.error.emit(str(e))
 
 
 class ConfirmSplitDialog(QDialog):
@@ -624,6 +648,17 @@ class MainWindow(QMainWindow):
             self.signaler.segmentation_step.emit(data)
         elif event_name == "console_log":
             self.signaler.console_log.emit(data)
+        elif event_name in ("measurement_completed", "measure_completed", "measurement"):
+            self.signaler.measurement_completed.emit(data)
+            msg = data.get("msg", "")
+            if not msg:
+                d3d = data.get("distance_3d", 0.0)
+                dxy = data.get("distance_xy", 0.0)
+                dz = data.get("delta_z", 0.0)
+                p1 = data.get("p1", {})
+                p2 = data.get("p2", {})
+                msg = f"Measured: 3D = {d3d:.3f} m | Horiz (ΔXY) = {dxy:.3f} m | Vert (ΔZ) = {dz:.3f} m | P1: ({p1.get('x', 0):.2f}, {p1.get('y', 0):.2f}, {p1.get('z', 0):.2f}) → P2: ({p2.get('x', 0):.2f}, {p2.get('y', 0):.2f}, {p2.get('z', 0):.2f})"
+            self.log_console("MEASURE", msg, level="success")
 
     def init_ui(self):
         self.setWindowTitle("Potree Hybrid Editor (LOD Streaming + Optimistic Visual Staging)")
@@ -1253,6 +1288,11 @@ class MainWindow(QMainWindow):
         now_str = datetime.now().strftime("%H:%M:%S")
 
         color_map = {
+            "FF3D": "#10b981",      # emerald
+            "STITCH": "#a855f7",    # purple
+            "TILE": "#06b6d4",      # cyan
+            "MEM": "#64748b",       # slate blue
+            "MEASURE": "#facc15",   # yellow
             "QUERY": "#38bdf8",     # sky blue
             "STAND": "#06b6d4",     # cyan
             "AI": "#a855f7",        # purple
@@ -1946,6 +1986,17 @@ class MainWindow(QMainWindow):
         h_neighbors.addStretch()
         v_tree.addLayout(h_neighbors)
 
+        h_full_neighbors = QHBoxLayout()
+        self.chk_full_neighbors = QCheckBox("Full Neighbors")
+        self.chk_full_neighbors.setToolTip("Bring in the complete uncropped point cloud for all neighbor trees that touch the stand radius (prevents tree crowns from being cut at the boundary).")
+        self.chk_full_neighbors.setStyleSheet("color: #38bdf8; font-size: 11px; font-weight: 600;")
+        self.chk_full_neighbors.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.chk_full_neighbors.setEnabled(self.chk_tree_neighbors.isChecked())
+        self.chk_full_neighbors.toggled.connect(self._on_full_neighbors_toggled)
+        h_full_neighbors.addWidget(self.chk_full_neighbors)
+        h_full_neighbors.addStretch()
+        v_tree.addLayout(h_full_neighbors)
+
         h_nmode = QHBoxLayout()
         lbl_nmode = QLabel("Stand Mode:")
         lbl_nmode.setStyleSheet("color: #94a3b8; font-size: 11px;")
@@ -1988,8 +2039,7 @@ class MainWindow(QMainWindow):
             lambda on: (self.spin_tree_ground.setEnabled(on), self.view_tree_action()))
         self.spin_tree_ground.editingFinished.connect(self.view_tree_action)
 
-        # Bounding box (visible by default, with tree height label). Measure
-        # lives on the ribbon Point tab (chk_ribbon_measure).
+        # Bounding box (visible by default, with tree height label) & 3D Measure tool
         h_tools = QHBoxLayout()
         self.chk_tree_bbox = QCheckBox("Bounding Box")
         self.chk_tree_bbox.setChecked(True)
@@ -1998,6 +2048,34 @@ class MainWindow(QMainWindow):
         self.chk_tree_bbox.toggled.connect(
             lambda on: self._run_js(f"if (window.setTreeBBox) window.setTreeBBox({'true' if on else 'false'});"))
         h_tools.addWidget(self.chk_tree_bbox)
+
+        self.btn_forestry_measure = QPushButton("📏 Measure")
+        self.btn_forestry_measure.setToolTip("Measure 3D distance between points (Ctrl+Click 2 points to measure)")
+        self.btn_forestry_measure.setCheckable(True)
+        self.btn_forestry_measure.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_forestry_measure.setStyleSheet("""
+            QPushButton {
+                background: #334155;
+                color: #e2e8f0;
+                font-size: 11px;
+                font-weight: 600;
+                padding: 3px 8px;
+                border-radius: 4px;
+                border: 1px solid #475569;
+            }
+            QPushButton:hover {
+                background: #475569;
+            }
+            QPushButton:checked {
+                background: #0284c7;
+                color: #ffffff;
+                border: 1px solid #38bdf8;
+            }
+        """)
+        self.btn_forestry_measure.clicked.connect(lambda checked=False: self.activate_web_tool("measure"))
+        self._tool_buttons["forestry_measure"] = self.btn_forestry_measure
+        h_tools.addWidget(self.btn_forestry_measure)
+
         h_tools.addStretch()
         v_tree.addLayout(h_tools)
 
@@ -2007,6 +2085,34 @@ class MainWindow(QMainWindow):
         btn_view_tree.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_view_tree.clicked.connect(self.view_tree_action)
         v_tree.addWidget(btn_view_tree)
+
+        # Bring in all points feature (under Forestry tab)
+        self.btn_bring_all_points = QPushButton("Bring in All Points (Full Cloud)")
+        self.btn_bring_all_points.setObjectName("btnPrimary")
+        self.btn_bring_all_points.setStyleSheet("""
+            QPushButton {
+                background-color: #0284c7;
+                color: #ffffff;
+                font-size: 11px;
+                font-weight: 700;
+                padding: 6px 12px;
+                border-radius: 4px;
+                border: 1px solid #38bdf8;
+            }
+            QPushButton:hover {
+                background-color: #0369a1;
+            }
+            QPushButton:pressed {
+                background-color: #075985;
+            }
+        """)
+        self.btn_bring_all_points.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_bring_all_points.setToolTip(
+            "Bring in all points of the loaded cloud into the Forestry tab in full density,\n"
+            "enabling points selection (box/polygon/pick) and filter options across all trees."
+        )
+        self.btn_bring_all_points.clicked.connect(self.view_all_points_action)
+        v_tree.addWidget(self.btn_bring_all_points)
 
         # Export the currently displayed full-density tree/stand back to LAS/LAZ
         # (extracted straight from the master file, honoring the stand filter)
@@ -2075,6 +2181,13 @@ class MainWindow(QMainWindow):
         btn_sel_target.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_sel_target.clicked.connect(self._on_filter_select_target_only)
         h_fquick.addWidget(btn_sel_target)
+
+        btn_sel_none = QPushButton("Clear")
+        btn_sel_none.setStyleSheet("font-size: 10px; padding: 2px 6px;")
+        btn_sel_none.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_sel_none.setToolTip("Deselect all trees/items in filter list")
+        btn_sel_none.clicked.connect(self._on_filter_select_none)
+        h_fquick.addWidget(btn_sel_none)
         v_filter.addLayout(h_fquick)
 
         # Multi-select tree list with checkboxes
@@ -2663,11 +2776,38 @@ class MainWindow(QMainWindow):
         base_name = os.path.splitext(os.path.basename(las_path))[0]
         default_out = os.path.join(parent_dir, base_name + "_converted")
 
-        out_dir = QFileDialog.getExistingDirectory(
+        # Qt's directory picker keeps "Choose" DISABLED while the shown path
+        # does not exist - and the suggested "<name>_converted" folder almost
+        # never does, so the dialog opened with a dead button. Create it up
+        # front (it is the output location anyway) and remove it again if the
+        # user cancels or picks elsewhere without using it.
+        created_default = False
+        if not os.path.isdir(default_out):
+            try:
+                os.makedirs(default_out)
+                created_default = True
+            except OSError:
+                pass
+
+        dialog = QFileDialog(
             self,
             "Select Destination Directory for Converted Potree Dataset",
-            default_out
+            default_out if os.path.isdir(default_out) else parent_dir,
         )
+        dialog.setFileMode(QFileDialog.FileMode.Directory)
+        dialog.setOption(QFileDialog.Option.ShowDirsOnly, True)
+        out_dir = ""
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            selected = dialog.selectedFiles()
+            out_dir = selected[0] if selected else ""
+
+        if (created_default and out_dir != default_out
+                and os.path.isdir(default_out) and not os.listdir(default_out)):
+            try:
+                os.rmdir(default_out)
+            except OSError:
+                pass
+
         if not out_dir:
             return
 
@@ -3213,18 +3353,40 @@ class MainWindow(QMainWindow):
             self.spin_tree_radius.setEnabled(checked)
         if hasattr(self, "combo_neighbor_mode"):
             self.combo_neighbor_mode.setEnabled(checked)
+        if hasattr(self, "chk_full_neighbors"):
+            self.chk_full_neighbors.setEnabled(checked)
         if hasattr(self, "chk_ai_neighbors") and self.chk_ai_neighbors.isChecked() != checked:
             self.chk_ai_neighbors.blockSignals(True)
             self.chk_ai_neighbors.setChecked(checked)
             self.chk_ai_neighbors.blockSignals(False)
         if hasattr(self, "spin_ai_radius"):
             self.spin_ai_radius.setEnabled(checked)
+        if hasattr(self, "chk_ai_full_neighbors"):
+            self.chk_ai_full_neighbors.setEnabled(checked)
 
-    def _toggle_tree_measure(self, on: bool):
-        """Ribbon Point-tab Measure toggle: click-to-click distances on the tree."""
-        self._run_js(f"if (window.setTreeMeasure) window.setTreeMeasure({'true' if on else 'false'});")
+    def _on_full_neighbors_toggled(self, checked: bool):
+        if hasattr(self, "chk_ai_full_neighbors") and self.chk_ai_full_neighbors.isChecked() != checked:
+            self.chk_ai_full_neighbors.blockSignals(True)
+            self.chk_ai_full_neighbors.setChecked(checked)
+            self.chk_ai_full_neighbors.blockSignals(False)
+        self._run_js(f"if (window.setFullNeighbors) window.setFullNeighbors({'true' if checked else 'false'});")
+        # Automatically re-render if currently viewing a tree with neighbors
+        state = getattr(self, "_tree_view_state", None) or {}
+        if state.get("itc", 0) > 0 and hasattr(self, "chk_tree_neighbors") and self.chk_tree_neighbors.isChecked():
+            self.view_tree_action()
+
+    def _on_ai_full_neighbors_toggled(self, checked: bool):
+        if hasattr(self, "chk_full_neighbors") and self.chk_full_neighbors.isChecked() != checked:
+            self.chk_full_neighbors.blockSignals(True)
+            self.chk_full_neighbors.setChecked(checked)
+            self.chk_full_neighbors.blockSignals(False)
+        self._on_full_neighbors_toggled(checked)
+
+    def _toggle_tree_measure(self, on: bool = True):
+        """Measure tool toggle: click-to-click distances in 3D."""
+        self.activate_web_tool("measure" if on else "nav")
         self.status_bar.showMessage(
-            "Measure: click points on the tree (double-click to clear)" if on else "Measure: off")
+            "Measure: Ctrl+Click 2 points to measure 3D distance (double-click to clear)" if on else "Measure: off")
 
     def view_tree_action(self):
         """Render the full point set of one tree (queried from the LAS master)
@@ -3245,6 +3407,7 @@ class MainWindow(QMainWindow):
         radius = float(self.spin_tree_radius.value()) if (hasattr(self, "chk_tree_neighbors") and self.chk_tree_neighbors.isChecked()) else 0.0
         n_mode = self.combo_neighbor_mode.currentData() if hasattr(self, "combo_neighbor_mode") else "all"
         g_rad = float(self.spin_tree_ground.value()) if (hasattr(self, "chk_tree_ground") and self.chk_tree_ground.isChecked()) else 0.0
+        full_neigh = bool(self.chk_full_neighbors.isChecked()) if (hasattr(self, "chk_full_neighbors") and radius > 0) else False
 
         hint_x = f"{self._last_picked_x}" if (hasattr(self, "_last_picked_itc") and self._last_picked_itc == itc and hasattr(self, "_last_picked_x")) else "null"
         hint_y = f"{self._last_picked_y}" if (hasattr(self, "_last_picked_itc") and self._last_picked_itc == itc and hasattr(self, "_last_picked_y")) else "null"
@@ -3253,21 +3416,61 @@ class MainWindow(QMainWindow):
         # re-queries the identical full-density point set from the master file
         self._tree_view_state = {
             "itc": itc, "radius": radius, "mode": n_mode, "ground": g_rad,
+            "full_neighbors": full_neigh,
             "x": float(self._last_picked_x) if hint_x != "null" else None,
             "y": float(self._last_picked_y) if hint_y != "null" else None,
         }
 
         is_indexing = getattr(self.manager, "_is_indexing", False)
         fallback_str = " via streaming fallback (background indexing in progress)" if is_indexing else ""
+        full_neigh_str = " (full uncropped trees)" if full_neigh else ""
 
         if radius > 0:
-            self.lbl_tree_view_status.setText(f"Querying Tree #{itc} and neighbors ({radius:.0f}m stand){fallback_str}...")
-            self.status_bar.showMessage(f"Viewing Tree #{itc} + neighbors within {radius:.0f}m stand{fallback_str}...", 6000)
+            self.lbl_tree_view_status.setText(f"Querying Tree #{itc} and neighbors ({radius:.0f}m stand{full_neigh_str}){fallback_str}...")
+            self.status_bar.showMessage(f"Viewing Tree #{itc} + neighbors within {radius:.0f}m stand{full_neigh_str}{fallback_str}...", 6000)
         else:
             self.lbl_tree_view_status.setText(f"Querying all points of Tree #{itc}{fallback_str}...")
             self.status_bar.showMessage(f"Viewing Tree #{itc} — querying full-density points{fallback_str}...", 6000)
 
-        self._run_js(f"window.viewTreeById({itc}, {hint_x}, {hint_y}, {radius:.1f}, '{n_mode}', {g_rad:.1f});")
+        self._run_js(f"window.viewTreeById({itc}, {hint_x}, {hint_y}, {radius:.1f}, '{n_mode}', {g_rad:.1f}, '/api/get_tree', null, {'true' if full_neigh else 'false'});")
+
+    def view_all_points_action(self):
+        """Bring in all points of the loaded cloud into memory and render them
+        in full density in the Forestry tab, enabling in-memory point selection
+        (box/polygon) and stand filter options across the entire dataset."""
+        if not self.manager.las_path and self.manager.las_data is None:
+            self.status_bar.showMessage("No LAS/LAZ source file is bound to bring in all points from.")
+            self.lbl_tree_view_status.setText("No LAS/LAZ source file bound. Open a LAS/LAZ or converted dataset with sibling LAS.")
+            return
+
+        if hasattr(self, "sidebar_tabs"):
+            self.sidebar_tabs.setCurrentIndex(1)  # Switch to Forestry tab
+
+        self.lbl_tree_view_status.setText("Bringing in all points of the cloud into memory and 3D view...")
+        self.status_bar.showMessage("Loading all points into Forestry tab (full density)...", 8000)
+        QApplication.processEvents()
+
+        # Load LAS into memory if not already in RAM so polygon/box selection has point access
+        if self.manager.las_data is None and self.manager.las_path:
+            try:
+                self.manager.load_las(self.manager.las_path)
+            except Exception as e:
+                self.lbl_tree_view_status.setText(f"Error loading points into RAM: {e}")
+                self.status_bar.showMessage(f"Failed to load points: {e}", 5000)
+                return
+
+        self._tree_view_state = {
+            "itc": 0,
+            "is_all_points": True,
+            "radius": 0.0,
+            "mode": "all",
+            "ground": 0.0,
+            "x": None,
+            "y": None
+        }
+
+        self.btn_extract_tree.setEnabled(True)
+        self._run_js("if (window.viewAllPoints) window.viewAllPoints(); else if (window.viewTreeById) window.viewTreeById(0, null, null, 0, 'all', 0, '/api/get_all_points');")
 
     def segment_tree_action(self):
         """Segment the displayed tree/stand with ForestFormer3D (separate
@@ -3289,6 +3492,7 @@ class MainWindow(QMainWindow):
         radius = float(self.spin_tree_radius.value()) if (hasattr(self, "chk_tree_neighbors") and self.chk_tree_neighbors.isChecked()) else 0.0
         n_mode = self.combo_neighbor_mode.currentData() if hasattr(self, "combo_neighbor_mode") else "all"
         g_rad = float(self.spin_tree_ground.value()) if (hasattr(self, "chk_tree_ground") and self.chk_tree_ground.isChecked()) else 0.0
+        full_neigh = bool(self.chk_full_neighbors.isChecked()) if (hasattr(self, "chk_full_neighbors") and radius > 0) else False
         hint_x = f"{self._last_picked_x}" if (hasattr(self, "_last_picked_itc") and self._last_picked_itc == itc and hasattr(self, "_last_picked_x")) else "null"
         hint_y = f"{self._last_picked_y}" if (hasattr(self, "_last_picked_itc") and self._last_picked_itc == itc and hasattr(self, "_last_picked_y")) else "null"
 
@@ -3303,6 +3507,7 @@ class MainWindow(QMainWindow):
 
         self._tree_view_state = {
             "itc": itc, "radius": radius, "mode": n_mode, "ground": g_rad,
+            "full_neighbors": full_neigh,
             "x": float(self._last_picked_x) if hint_x != "null" else None,
             "y": float(self._last_picked_y) if hint_y != "null" else None,
             "keep_ids": keep_ids,
@@ -3320,7 +3525,7 @@ class MainWindow(QMainWindow):
             self.log_console("STAND", f"Stand Filter active: isolating {len(keep_ids)} selected IDs: {keep_ids}", level="info")
 
         keep_json = json.dumps(keep_ids) if keep_ids is not None else "null"
-        self._run_js(f"window.segmentTreeById({itc}, {hint_x}, {hint_y}, {radius:.1f}, '{n_mode}', {g_rad:.1f}, {keep_json});")
+        self._run_js(f"window.segmentTreeById({itc}, {hint_x}, {hint_y}, {radius:.1f}, '{n_mode}', {g_rad:.1f}, {keep_json}, {'true' if full_neigh else 'false'});")
 
     def extract_tree_view_action(self):
         """Write the full-density tree/stand currently displayed in the Forestry tab
@@ -3343,9 +3548,16 @@ class MainWindow(QMainWindow):
             keep_ids = checked or None
 
         itc = int(state.get("itc", 0))
+        is_all_points = bool(state.get("is_all_points", False) or itc == 0)
         radius = float(state.get("radius", 0.0))
-        suggested = os.path.join(os.path.expanduser("~"),
-                                 f"tree_{itc}_stand_{radius:.0f}m.copc.laz" if radius > 0 else f"tree_{itc}.copc.laz")
+        if is_all_points:
+            suggested = os.path.join(os.path.expanduser("~"),
+                                     "filtered_stand.copc.laz" if keep_ids else "all_points.copc.laz")
+        elif radius > 0:
+            suggested = os.path.join(os.path.expanduser("~"),
+                                     f"tree_{itc}_stand_{radius:.0f}m.copc.laz")
+        else:
+            suggested = os.path.join(os.path.expanduser("~"), f"tree_{itc}.copc.laz")
         path, selected_filter = QFileDialog.getSaveFileName(
             self, "Extract Displayed Points as COPC / LAS / LAZ", suggested,
             "COPC LAZ Files (*.copc.laz);;LAZ Files (*.laz);;LAS Files (*.las)")
@@ -3355,15 +3567,19 @@ class MainWindow(QMainWindow):
             path += ".copc.laz" if selected_filter.startswith("COPC") else (
                 ".las" if selected_filter.startswith("LAS") else ".laz")
 
-        self.status_bar.showMessage(f"Extracting Tree #{itc} full-density points from master...")
+        extract_label = "all/filtered points" if is_all_points else f"Tree #{itc}"
+        self.status_bar.showMessage(f"Extracting {extract_label} full-density points from master...")
         QApplication.processEvents()
         try:
+            full_neighbors = bool(state.get("full_neighbors", False))
             count = self.manager.export_tree_points(
                 path, itc,
                 x=state.get("x"), y=state.get("y"),
                 radius=radius, neighbor_mode=state.get("mode", "all"),
                 keep_tree_ids=keep_ids,
-                ground_radius=float(state.get("ground", 0.0) or 0.0))
+                ground_radius=float(state.get("ground", 0.0) or 0.0),
+                is_all_points=is_all_points,
+                full_neighbors=full_neighbors)
         except Exception as exc:
             QMessageBox.warning(self, "Extract Tree Stand", f"Extraction failed: {exc}")
             self.status_bar.showMessage(f"Extraction failed: {exc}", 6000)
@@ -3624,25 +3840,56 @@ class MainWindow(QMainWindow):
             self.btn_confirm_segmentation.setEnabled(False)
             self.btn_confirm_segmentation.setText("Confirm & Stage Split Edits")
 
+        is_all_points = bool(data.get("is_all_points", False) or itc == 0)
+        total_pts = data.get("total_points") or data.get("count", 0)
+        disp_pts = data.get("count", 0)
+        full_neigh = bool(data.get("full_neighbors", False))
+
+        if hasattr(self, "chk_full_neighbors") and self.chk_full_neighbors.isChecked() != full_neigh:
+            self.chk_full_neighbors.blockSignals(True)
+            self.chk_full_neighbors.setChecked(full_neigh)
+            self.chk_full_neighbors.blockSignals(False)
+
         # A full-density tree/stand is on screen: the Extract action can re-query it
         if itc is not None:
+            prev_state = getattr(self, "_tree_view_state", None) or {}
             self._tree_view_state = {
                 "itc": int(itc), "radius": float(rad or 0.0),
-                "mode": getattr(self, "_tree_view_state", {}).get("mode", "all"),
-                "ground": float(getattr(self, "_tree_view_state", {}).get("ground", 0.0) or 0.0),
+                "mode": prev_state.get("mode", "all"),
+                "ground": float(prev_state.get("ground", 0.0) or 0.0),
+                "full_neighbors": full_neigh or prev_state.get("full_neighbors", False),
                 "x": getattr(self, "_last_picked_x", None) if getattr(self, "_last_picked_itc", None) == int(itc) else None,
                 "y": getattr(self, "_last_picked_y", None) if getattr(self, "_last_picked_itc", None) == int(itc) else None,
+                "is_all_points": is_all_points,
             }
         if hasattr(self, "btn_extract_tree"):
             self.btn_extract_tree.setEnabled(True)
 
-        if hasattr(self, "lbl_tree_view_status"):
+        if is_all_points:
+            if total_pts > disp_pts:
+                if hasattr(self, "lbl_tree_view_status"):
+                    self.lbl_tree_view_status.setText(
+                        f"All Points: {disp_pts:,} displayed in 3D ({total_pts:,} in memory for selection & export)"
+                    )
+                self.status_bar.showMessage(
+                    f"All points loaded ({total_pts:,} pts in memory, {disp_pts:,} displayed in 3D).", 6000
+                )
+            else:
+                if hasattr(self, "lbl_tree_view_status"):
+                    self.lbl_tree_view_status.setText(
+                        f"All Points: {disp_pts:,} points loaded (full cloud)"
+                    )
+                self.status_bar.showMessage(
+                    f"All points loaded ({disp_pts:,} points).", 6000
+                )
+        elif hasattr(self, "lbl_tree_view_status"):
             if n_cnt > 0:
+                full_notice = " · full neighbor trees" if full_neigh else ""
                 self.lbl_tree_view_status.setText(
-                    f"Tree #{itc}: {t_cnt:,} target pts + {n_cnt:,} neighbor pts ({rad:.0f}m stand){fallback_notice}"
+                    f"Tree #{itc}: {t_cnt:,} target pts + {n_cnt:,} neighbor pts ({rad:.0f}m stand{full_notice}){fallback_notice}"
                 )
                 self.status_bar.showMessage(
-                    f"Viewing Tree #{itc} ({t_cnt:,} pts) + {n_cnt:,} neighbor pts within {rad:.0f}m stand{fallback_notice}.", 6000
+                    f"Viewing Tree #{itc} ({t_cnt:,} pts) + {n_cnt:,} neighbor pts within {rad:.0f}m stand{full_notice}{fallback_notice}.", 6000
                 )
             else:
                 self.lbl_tree_view_status.setText(
@@ -3651,10 +3898,10 @@ class MainWindow(QMainWindow):
                 self.status_bar.showMessage(
                     f"Viewing Tree #{itc} ({t_cnt:,} full-density points){fallback_notice}.", 6000
                 )
-        if hasattr(self, "grp_stand_filter") and n_cnt <= 0:
+        if hasattr(self, "grp_stand_filter") and n_cnt <= 0 and not is_all_points:
             self.grp_stand_filter.setVisible(False)
             self.list_stand_trees.clear()
-        if hasattr(self, "bar_stand_filter") and n_cnt <= 0:
+        if hasattr(self, "bar_stand_filter") and n_cnt <= 0 and not is_all_points:
             # Keep the Stand Filter buttons present on the Filter page, just not highlighted
             self.bar_stand_filter.setVisible(True)
             self._set_stand_filter_buttons_enabled(False)
@@ -3665,11 +3912,12 @@ class MainWindow(QMainWindow):
         t_cnt = data.get("target_count", 0)
         rad = data.get("radius", 0.0)
         trees = data.get("trees", [])
+        is_all_points = bool(data.get("is_all_points", False) or target_itc == 0)
 
         if not hasattr(self, "grp_stand_filter"):
             return
 
-        if (n_cnt <= 0 and len(trees) <= 1) or not trees:
+        if not is_all_points and ((n_cnt <= 0 and len(trees) <= 1) or not trees):
             self.grp_stand_filter.setVisible(False)
             self.list_stand_trees.clear()
             if hasattr(self, "bar_stand_filter"):
@@ -3678,15 +3926,35 @@ class MainWindow(QMainWindow):
                 self._set_stand_filter_buttons_enabled(False)
             return
 
+        num_trees = len([t for t in trees if t.get("id", 0) > 0])
         num_neighbor_trees = len([t for t in trees if not t.get("isTarget") and t.get("id", 0) > 0])
-        stand_label = f"🌲 Stand: Tree #{target_itc} ({num_neighbor_trees} neighbors, {rad:.0f}m)" if n_cnt > 0 else f"🌲 Stand: {len(trees)} trees detected"
+        total_pts = data.get("total_points") or data.get("count", 0)
+        disp_pts = data.get("count", 0)
+
+        if is_all_points:
+            if total_pts > disp_pts:
+                stand_label = f"🌲 All Points: {num_trees} trees ({disp_pts:,} displayed / {total_pts:,} total)" if num_trees > 0 else f"🌲 All Points ({disp_pts:,} displayed / {total_pts:,} total)"
+                info_label = f"All Points: {len(trees)} trees ({total_pts:,} in RAM). Check trees to filter view:" if len(trees) > 1 else f"All Points: {disp_pts:,} displayed ({total_pts:,} in RAM). Ready for selection."
+                if hasattr(self, "lbl_tree_view_status"):
+                    self.lbl_tree_view_status.setText(f"Displaying {disp_pts:,} sampled points in 3D ({total_pts:,} points in memory for selection & export).")
+            else:
+                stand_label = f"🌲 All Points: {num_trees} trees ({total_pts:,} pts)" if num_trees > 0 else f"🌲 All Points ({total_pts:,} pts)"
+                info_label = f"All Points: {len(trees)} items loaded. Check items to filter view:" if len(trees) > 1 else f"All Points ({total_pts:,} pts). Ready for selection and filter."
+                if hasattr(self, "lbl_tree_view_status"):
+                    self.lbl_tree_view_status.setText(f"Displaying all {total_pts:,} points of the cloud in full density.")
+        elif n_cnt > 0:
+            stand_label = f"🌲 Stand: Tree #{target_itc} ({num_neighbor_trees} neighbors, {rad:.0f}m)"
+            info_label = f"Stand: {num_neighbor_trees} neighbor trees ({rad:.0f}m radius). Check trees to keep:"
+        else:
+            stand_label = f"🌲 Stand: {len(trees)} trees detected"
+            info_label = f"Stand: {len(trees)} trees detected. Check trees to keep:"
+
         if hasattr(self, "bar_stand_filter"):
             self.lbl_top_stand_info.setText(stand_label)
             self.bar_stand_filter.setVisible(True)
             self._set_stand_filter_buttons_enabled(True)
 
         self.grp_stand_filter.setVisible(True)
-        info_label = f"Stand: {num_neighbor_trees} neighbor trees ({rad:.0f}m radius). Check trees to keep:" if n_cnt > 0 else f"Stand: {len(trees)} trees detected. Check trees to keep:"
         self.lbl_stand_filter_info.setText(info_label)
 
         self.list_stand_trees.blockSignals(True)
@@ -3695,7 +3963,10 @@ class MainWindow(QMainWindow):
             tid = t.get("id", 0)
             cnt = t.get("count", 0)
             is_target = t.get("isTarget", False)
-            if is_target:
+            is_class = t.get("isClass", False)
+            if is_class:
+                label = f"Class {tid}: {cnt:,} pts"
+            elif is_target:
                 label = f"★ Target Tree #{tid} ({cnt:,} pts)"
             elif tid > 0:
                 label = f"Tree #{tid} ({cnt:,} pts)"
@@ -3788,6 +4059,16 @@ class MainWindow(QMainWindow):
         self.list_stand_trees.blockSignals(False)
         self._run_js(f"if (window.setTreeFilterSelection) window.setTreeFilterSelection({json.dumps(target_ids)});")
         self.status_bar.showMessage(f"Only Target Tree #{target_itc} selected for filter.", 2500)
+
+    def _on_filter_select_none(self):
+        if not hasattr(self, "list_stand_trees"):
+            return
+        self.list_stand_trees.blockSignals(True)
+        for i in range(self.list_stand_trees.count()):
+            self.list_stand_trees.item(i).setCheckState(Qt.CheckState.Unchecked)
+        self.list_stand_trees.blockSignals(False)
+        self._run_js("if (window.setTreeFilterSelection) window.setTreeFilterSelection([]);")
+        self.status_bar.showMessage("Cleared filter selection.", 2500)
 
     def _apply_tree_filter(self):
         if not hasattr(self, "list_stand_trees"):
@@ -4358,6 +4639,7 @@ class MainWindow(QMainWindow):
             "seg_radius": self.spin_seg_radius.value(),
             "seg_step": self.spin_seg_step.value(),
             "seg_score": self.spin_seg_score.value(),
+            "seg_workers": self.spin_seg_workers.value(),
             "seg_tile": self.spin_seg_tile.value(),
             "seg_overlap": self.spin_seg_overlap.value(),
             "seg_roi_on": self.chk_seg_roi.isChecked(),
@@ -4379,7 +4661,8 @@ class MainWindow(QMainWindow):
             self.settings_store.set_many(self._collect_settings())
             self.settings_store.set("geometry",
                                     bytes(self.saveGeometry().toHex().data()).decode())
-            self.settings_store.set("splitter", self.splitter.sizes())
+            # Horizontal splitter sizes are intentionally NOT persisted: the
+            # sidebar always opens fully expanded (see _apply_loaded_settings).
         except Exception as e:  # persistence must never break editing
             print(f"[Settings] save failed: {e}")
 
@@ -4406,7 +4689,10 @@ class MainWindow(QMainWindow):
             if val is None:
                 return
             widget.blockSignals(True)
-            widget.setValue(float(val))
+            if isinstance(widget, QSpinBox):
+                widget.setValue(int(float(val)))
+            else:
+                widget.setValue(float(val))
             widget.blockSignals(False)
 
         if s.get("render_mode") is not None:
@@ -4455,6 +4741,7 @@ class MainWindow(QMainWindow):
         for widget, key in ((self.spin_seg_radius, "seg_radius"),
                             (self.spin_seg_step, "seg_step"),
                             (self.spin_seg_score, "seg_score"),
+                            (self.spin_seg_workers, "seg_workers"),
                             (self.spin_seg_tile, "seg_tile"),
                             (self.spin_seg_overlap, "seg_overlap"),
                             (self.spin_seg_xmin, "seg_xmin"),
@@ -4483,9 +4770,14 @@ class MainWindow(QMainWindow):
         geometry = s.get("geometry")
         if geometry:
             self.restoreGeometry(QByteArray.fromHex(geometry.encode()))
-        sizes = s.get("splitter")
-        if isinstance(sizes, list) and sizes:
-            self.splitter.setSizes(sizes)
+        # The sidebar always opens FULLY EXPANDED at its maximum width. It can
+        # still be dragged within its 340-450 px range during the session; that
+        # choice is no longer persisted. (Older builds stored it under the
+        # "splitter" key - deliberately ignored here.)
+        sidebar = self.splitter.widget(0)
+        full = sidebar.maximumWidth()
+        total = sum(self.splitter.sizes()) or self.width()
+        self.splitter.setSizes([full, max(total - full, 800)])
 
     def _wire_settings_persistence(self):
         """Every ribbon setting change schedules a debounced save."""
@@ -4726,35 +5018,6 @@ class MainWindow(QMainWindow):
         v_open.addWidget(lbl_open)
         h_layout.addWidget(grp_open)
 
-        # Save & Commit Group
-        grp_save = QFrame()
-        grp_save.setProperty("class", "ribbonGroup")
-        v_save = QVBoxLayout(grp_save)
-        v_save.setContentsMargins(10, 7, 10, 7)
-        v_save.setSpacing(3)
-
-        h_save_btns = QHBoxLayout()
-        h_save_btns.setSpacing(4)
-
-        btn_commit = QPushButton("Commit & Save to LAS/LAZ...")
-        btn_commit.setProperty("class", "ribbonToolBtn")
-        btn_commit.setObjectName("btnSuccess")
-        btn_commit.clicked.connect(self.commit_staged_edits_action)
-
-        btn_save = QPushButton("Save (RAM)...")
-        btn_save.setProperty("class", "ribbonToolBtn")
-        btn_save.clicked.connect(self.save_modified_las)
-
-        h_save_btns.addWidget(btn_commit)
-        h_save_btns.addWidget(btn_save)
-        v_save.addLayout(h_save_btns)
-
-        lbl_save = QLabel("SAVE & COMMIT")
-        lbl_save.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        lbl_save.setProperty("class", "ribbonTitle")
-        v_save.addWidget(lbl_save)
-        h_layout.addWidget(grp_save)
-
         h_layout.addStretch()
         return page
 
@@ -4969,6 +5232,15 @@ class MainWindow(QMainWindow):
         btn_pick.clicked.connect(lambda checked=False: self.activate_web_tool("inspect"))
         self._tool_buttons["inspect"] = btn_pick
 
+        btn_measure = QPushButton("Measure")
+        btn_measure.setToolTip("Measure 3D distance between points (Ctrl+Click 2 points to measure, double-click or clear to reset)")
+        btn_measure.setProperty("class", "ribbonToolBtn")
+        btn_measure.setCheckable(True)
+        btn_measure.clicked.connect(lambda checked=False: self.activate_web_tool("measure"))
+        self.btn_ribbon_measure = btn_measure
+        self.chk_ribbon_measure = btn_measure  # Compatibility alias
+        self._tool_buttons["measure"] = btn_measure
+
         btn_commit_ribbon = QPushButton("Commit Edits")
         btn_commit_ribbon.setProperty("class", "ribbonToolBtn")
         btn_commit_ribbon.setObjectName("btnSuccess")
@@ -4982,18 +5254,11 @@ class MainWindow(QMainWindow):
         h_tools.addWidget(btn_orbit)
         h_tools.addWidget(btn_box)
         h_tools.addWidget(btn_pick)
+        h_tools.addWidget(btn_measure)
         h_tools.addWidget(btn_commit_ribbon)
         h_tools.addWidget(btn_clear)
 
         v_tools.addLayout(h_tools)
-
-        # Point-to-point distance measuring on the displayed tree (Forestry
-        # overlay): markers + 3D/horizontal distance labels; double-click clears.
-        self.chk_ribbon_measure = QCheckBox("Measure")
-        self.chk_ribbon_measure.setStyleSheet("color: #e2e8f0; font-size: 11px; font-weight: 600;")
-        self.chk_ribbon_measure.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.chk_ribbon_measure.toggled.connect(self._toggle_tree_measure)
-        v_tools.addWidget(self.chk_ribbon_measure, alignment=Qt.AlignmentFlag.AlignCenter)
 
         lbl_title_tools = QLabel("SELECTION & EDITING")
         lbl_title_tools.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -5406,6 +5671,14 @@ class MainWindow(QMainWindow):
         self.spin_ai_radius.valueChanged.connect(self._on_ai_radius_changed)
         h_stand.addWidget(self.spin_ai_radius)
 
+        self.chk_ai_full_neighbors = QCheckBox("Full")
+        self.chk_ai_full_neighbors.setToolTip("Full uncropped neighbor trees")
+        self.chk_ai_full_neighbors.setStyleSheet("color: #38bdf8; font-size: 11px; font-weight: 500;")
+        self.chk_ai_full_neighbors.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.chk_ai_full_neighbors.setEnabled(False)
+        self.chk_ai_full_neighbors.toggled.connect(self._on_ai_full_neighbors_toggled)
+        h_stand.addWidget(self.chk_ai_full_neighbors)
+
         v_stand.addLayout(h_stand)
         v_stand.addStretch()
 
@@ -5471,6 +5744,14 @@ class MainWindow(QMainWindow):
             s.valueChanged.connect(self._schedule_save_settings)
             return s
 
+        def _ispin(minv, maxv, val, width=50):
+            s = QSpinBox()
+            s.setRange(minv, maxv)
+            s.setValue(val)
+            s.setStyleSheet(f"font-size: 11px; padding: 2px 4px; max-width: {width}px;")
+            s.valueChanged.connect(self._schedule_save_settings)
+            return s
+
         def _group(title):
             grp = QFrame()
             grp.setProperty("class", "ribbonGroup")
@@ -5530,6 +5811,8 @@ class MainWindow(QMainWindow):
         self.spin_seg_radius = _spin(2.0, 60.0, 16.0, 0.5, " m")
         self.spin_seg_step = _spin(0.5, 20.0, 6.0, 0.5, " m")
         self.spin_seg_score = _spin(0.05, 0.95, 0.40, 0.05)
+        self.spin_seg_workers = _ispin(1, 8, 1, width=46)
+        self.spin_seg_workers.setToolTip("Parallel tile workers (1 for ≤16GB GPUs, 2 for 24GB GPUs)")
         self.spin_seg_tile = _spin(10.0, 400.0, 70.0, 5.0, " m")
         self.spin_seg_overlap = _spin(0.0, 200.0, 10.0, 1.0, " m")
         grid_p.addWidget(_lbl("Radius"), 0, 0)
@@ -5538,6 +5821,8 @@ class MainWindow(QMainWindow):
         grid_p.addWidget(self.spin_seg_step, 0, 3)
         grid_p.addWidget(_lbl("Score ≥"), 0, 4)
         grid_p.addWidget(self.spin_seg_score, 0, 5)
+        grid_p.addWidget(_lbl("Workers"), 0, 6)
+        grid_p.addWidget(self.spin_seg_workers, 0, 7)
         grid_p.addWidget(_lbl("Tile"), 1, 0)
         grid_p.addWidget(self.spin_seg_tile, 1, 1)
         grid_p.addWidget(_lbl("Overlap"), 1, 2)
@@ -5547,65 +5832,144 @@ class MainWindow(QMainWindow):
         self.btn_seg_advanced.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_seg_advanced.setToolTip("Config, checkpoint, CUDA device and chunk size")
         self.btn_seg_advanced.clicked.connect(self.seg_advanced_dialog)
-        grid_p.addWidget(self.btn_seg_advanced, 1, 4, 1, 2)
+        grid_p.addWidget(self.btn_seg_advanced, 1, 4, 1, 4)
         v_p.addLayout(grid_p)
         _title(v_p, "FORESTFORMER3D PARAMETERS")
         h_layout.addWidget(grp_p)
 
-        # ---- 3. Optional rectangular ROI ----------------------------------
-        grp_roi, v_roi = _group("AREA")
+        # ---- 3. Optional rectangular ROI (Removed from UI per user request) ---
         self.chk_seg_roi = QCheckBox("Clip to ROI")
-        self.chk_seg_roi.setStyleSheet("color: #e2e8f0; font-size: 11px; font-weight: 600;")
-        self.chk_seg_roi.toggled.connect(self._on_seg_roi_toggled)
-        v_roi.addWidget(self.chk_seg_roi)
-        grid_roi = QGridLayout()
-        grid_roi.setHorizontalSpacing(3)
+        self.chk_seg_roi.setChecked(False)
         self.spin_seg_xmin = _spin(-1e7, 1e7, 0.0, 1.0, width=70)
         self.spin_seg_xmax = _spin(-1e7, 1e7, 100.0, 1.0, width=70)
         self.spin_seg_ymin = _spin(-1e7, 1e7, 0.0, 1.0, width=70)
         self.spin_seg_ymax = _spin(-1e7, 1e7, 100.0, 1.0, width=70)
-        for c, (cap, w) in enumerate((("X min", self.spin_seg_xmin), ("X max", self.spin_seg_xmax))):
-            grid_roi.addWidget(_lbl(cap), 0, c)
-            grid_roi.addWidget(w, 1, c)
-        for c, (cap, w) in enumerate((("Y min", self.spin_seg_ymin), ("Y max", self.spin_seg_ymax))):
-            grid_roi.addWidget(_lbl(cap), 0, c + 2)
-            grid_roi.addWidget(w, 1, c + 2)
-        v_roi.addLayout(grid_roi)
-        _title(v_roi, "STUDY AREA (SINGLE CLOUD)")
-        h_layout.addWidget(grp_roi)
+        self.chk_seg_roi.toggled.connect(self._on_seg_roi_toggled)
 
         # ---- 4. Run & result ----------------------------------------------
         grp_run, v_run = _group("RUN")
+        v_run.setContentsMargins(10, 6, 10, 6)
+        v_run.setSpacing(5)
+
         row_run = QHBoxLayout()
-        row_run.setSpacing(4)
+        row_run.setSpacing(6)
         self.btn_seg_run = QPushButton("Run Segmentation")
-        self.btn_seg_run.setObjectName("btnSuccess")
-        self.btn_seg_run.setStyleSheet("""
-            QPushButton#btnSuccess {
-                background-color: #059669; border: 1px solid #10b981; color: #ffffff;
-                font-weight: 700; padding: 4px 10px; border-radius: 4px;
-            }""")
+        self.btn_seg_run.setObjectName("btnSegRun")
+        self.btn_seg_run.setFixedHeight(28)
         self.btn_seg_run.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_seg_run.setStyleSheet("""
+            QPushButton#btnSegRun {
+                background-color: #059669;
+                border: 1px solid #10b981;
+                color: #ffffff;
+                font-size: 11px;
+                font-weight: 700;
+                padding: 4px 12px;
+                border-radius: 4px;
+            }
+            QPushButton#btnSegRun:hover {
+                background-color: #10b981;
+                border-color: #34d399;
+            }
+            QPushButton#btnSegRun:pressed {
+                background-color: #047857;
+            }
+            QPushButton#btnSegRun:disabled {
+                background-color: #14352a;
+                border: 1px solid #0f5132;
+                color: #4ade80;
+            }
+        """)
         self.btn_seg_run.clicked.connect(self.run_segmentation_action)
+
+        self.btn_seg_stop = QPushButton("Stop")
+        self.btn_seg_stop.setObjectName("btnSegStop")
+        self.btn_seg_stop.setFixedHeight(28)
+        self.btn_seg_stop.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_seg_stop.setEnabled(False)
+        self.btn_seg_stop.setToolTip("Safely stop segmentation (completed tiles remain saved)")
+        self.btn_seg_stop.setStyleSheet("""
+            QPushButton#btnSegStop {
+                background-color: #dc2626;
+                border: 1px solid #ef4444;
+                color: #ffffff;
+                font-size: 11px;
+                font-weight: 700;
+                padding: 4px 10px;
+                border-radius: 4px;
+            }
+            QPushButton#btnSegStop:hover {
+                background-color: #ef4444;
+                border-color: #f87171;
+            }
+            QPushButton#btnSegStop:pressed {
+                background-color: #b91c1c;
+            }
+            QPushButton#btnSegStop:disabled {
+                background-color: #1e293b;
+                border: 1px solid #334764;
+                color: #475569;
+            }
+        """)
+        self.btn_seg_stop.clicked.connect(self.stop_segmentation_action)
+
         self.btn_seg_load = QPushButton("Load Result")
-        self.btn_seg_load.setProperty("class", "ribbonToolBtn")
+        self.btn_seg_load.setObjectName("btnSegLoad")
+        self.btn_seg_load.setFixedHeight(28)
         self.btn_seg_load.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_seg_load.setEnabled(False)
+        self.btn_seg_load.setStyleSheet("""
+            QPushButton#btnSegLoad {
+                background-color: #1e293b;
+                border: 1px solid #334764;
+                color: #f1f5f9;
+                font-size: 11px;
+                font-weight: 600;
+                padding: 4px 12px;
+                border-radius: 4px;
+            }
+            QPushButton#btnSegLoad:hover {
+                background-color: #2b3e5a;
+                border-color: #38bdf8;
+            }
+            QPushButton#btnSegLoad:pressed {
+                background-color: #0f172a;
+            }
+            QPushButton#btnSegLoad:disabled {
+                background-color: #141c28;
+                border: 1px solid #1e293b;
+                color: #475569;
+            }
+        """)
         self.btn_seg_load.clicked.connect(self.load_segmentation_result)
+
         row_run.addWidget(self.btn_seg_run)
+        row_run.addWidget(self.btn_seg_stop)
         row_run.addWidget(self.btn_seg_load)
         v_run.addLayout(row_run)
+
         self.bar_seg_progress = QProgressBar()
         self.bar_seg_progress.setRange(0, 100)
         self.bar_seg_progress.setValue(0)
         self.bar_seg_progress.setTextVisible(False)
-        self.bar_seg_progress.setFixedWidth(190)
-        self.bar_seg_progress.setFixedHeight(10)
+        self.bar_seg_progress.setFixedHeight(8)
+        self.bar_seg_progress.setStyleSheet("""
+            QProgressBar {
+                background-color: #0b111c;
+                border: 1px solid #283952;
+                border-radius: 4px;
+            }
+            QProgressBar::chunk {
+                background-color: #10b981;
+                border-radius: 3px;
+            }
+        """)
         v_run.addWidget(self.bar_seg_progress)
+
+        # Retain status label object in memory for headless tests and console tracking,
+        # but do not add it to the visible card layout (status is shown on Activity Console).
         self.lbl_seg_status = QLabel("Idle")
-        self.lbl_seg_status.setStyleSheet("color: #94a3b8; font-size: 10px;")
-        self.lbl_seg_status.setMinimumWidth(190)
-        v_run.addWidget(self.lbl_seg_status)
+
         _title(v_run, "RUN & RESULT")
         h_layout.addWidget(grp_run)
 
@@ -5720,9 +6084,11 @@ class MainWindow(QMainWindow):
         self._seg_region_frac = 0.0
         self._seg_pct_logged = 0
         self._seg_diag_n = 0
+        workers = int(self.spin_seg_workers.value())
         self.seg_worker = SegmentationWorker(
             module, in_las, out_dir, mode,
-            self.spin_seg_tile.value(), self.spin_seg_overlap.value(), roi, model)
+            self.spin_seg_tile.value(), self.spin_seg_overlap.value(), roi, model,
+            workers=workers)
         self.seg_worker.progress.connect(self._on_seg_progress)
         self.seg_worker.log.connect(self._on_seg_output)
         self.seg_worker.finished.connect(self._on_seg_finished)
@@ -5730,11 +6096,13 @@ class MainWindow(QMainWindow):
         self.seg_worker.start()
 
         self.btn_seg_run.setEnabled(False)
+        self.btn_seg_stop.setEnabled(True)
+        self.btn_seg_stop.setText("Stop")
         self.btn_seg_load.setEnabled(False)
         self.bar_seg_progress.setRange(0, 0)
         self.lbl_seg_status.setText("Running ForestFormer3D...")
         self.log_console("FF3D", f"Pipeline run started: {os.path.basename(in_las)} "
-                                 f"({mode}, radius={self.spin_seg_radius.value():.1f}m, "
+                                 f"({mode}, workers={workers}, radius={self.spin_seg_radius.value():.1f}m, "
                                  f"step={self.spin_seg_step.value():.1f}m, "
                                  f"score≥{self.spin_seg_score.value():.2f}"
                                  + (f", tile={self.spin_seg_tile.value():.0f}m/overlap={self.spin_seg_overlap.value():.0f}m"
@@ -5742,6 +6110,17 @@ class MainWindow(QMainWindow):
         self._seg_timer.start()
         # Watching the pipeline narrate itself is the point of the run.
         self._set_console_open(True)
+
+    def stop_segmentation_action(self):
+        """Safely stop active ForestFormer3D segmentation without losing completed tiles."""
+        if not getattr(self, "seg_worker", None) or not self.seg_worker.isRunning():
+            return
+        self.btn_seg_stop.setEnabled(False)
+        self.btn_seg_stop.setText("Stopping...")
+        self.lbl_seg_status.setText("Stopping...")
+        self.status_bar.showMessage("Stopping ForestFormer3D... Completed tiles remain saved.")
+        self.log_console("FF3D", "Stop requested by user. Safely terminating worker (completed tiles are saved)...", level="warn")
+        self.seg_worker.stop()
 
     def _on_seg_progress(self, msg: str):
         self.lbl_seg_status.setText(msg)
@@ -5755,9 +6134,9 @@ class MainWindow(QMainWindow):
         if not text:
             return
 
-        # The per-region bar is the only line that carries k/n, so percent and
-        # time left come from it: "Processing regions (FAST): 44%|██ | 4/9 [...]".
-        m = re.search(r"Processing regions \(FAST\):\s*(\d+)%\|[^|]*\|\s*(\d+)/(\d+)", text)
+        # The per-region bar carries k/n, so percent and time left come from it:
+        # e.g., "Processing regions (FAST): 44%|██ | 4/9 [...]" or "(PIPELINED)"
+        m = re.search(r"Processing regions \([^)]*\):\s*(\d+)%\|[^|]*\|\s*(\d+)/(\d+)", text)
         if m:
             self._seg_region_progress(int(m.group(2)), int(m.group(3)))
             return
@@ -5765,27 +6144,62 @@ class MainWindow(QMainWindow):
         m = re.search(r"(\d+) active tiles", text)
         if m:
             self._seg_tiles_total = int(m.group(1))
-        m = re.match(r"\[(\d+)/(\d+)\] Fast Processing Tile", text)
+        m = re.match(r"\[(\d+)/(\d+)\] (?:Fast )?Processing Tile", text)
         if m:
             self._seg_tile_index = int(m.group(1))
             self._seg_tiles_total = int(m.group(2))
             self._seg_region_frac = 0.0
 
-        # Thin the engine's diagnostics so the log stays readable: VRAM stats
-        # every 8th report, mask-pruning every 20th.
-        self._seg_diag_n = getattr(self, "_seg_diag_n", 0) + 1
-        if text.startswith("[VRAM]") and self._seg_diag_n % 8:
-            return
-        if text.startswith("[MEM]") and self._seg_diag_n % 20:
-            return
-
         self.lbl_seg_status.setText(text[:110])
         self.status_bar.showMessage(text[:160])
-        self.log_console("FF3D", text[:220],
-                         level="error" if text[:6].lower() in ("error", "trace") else "info")
+
+        # Specific categorization and formatting for every pipeline milestone
+        if "Loading input point cloud into memory" in text:
+            self.log_console("FF3D", f"Loading master cloud into memory: {text.split(':')[-1].strip()}", level="info")
+        elif "Loaded" in text and "points in" in text:
+            self.log_console("FF3D", text, level="success")
+        elif "active tiles contain points" in text:
+            self.log_console("TILE", f"Tract Grid Partition: {text}", level="info")
+        elif "already completed" in text and "Skipping" in text:
+            self.log_console("FF3D", f"Checkpoint Resume: {text}", level="info")
+        elif "Processing Tile" in text:
+            self.log_console("TILE", f"--- {text} ---", level="info")
+        elif "[Tile Prep]" in text:
+            self.log_console("TILE", text.replace("[Tile Prep]", "").strip(), level="info")
+        elif "[Post-Process]" in text:
+            self.log_console("FF3D", text.replace("[Post-Process]", "").strip(), level="info")
+        elif "[Tile Save]" in text or "Saved segmented LAS to:" in text:
+            self.log_console("TILE", text.replace("[Tile Save]", "").strip(), level="success")
+        elif "Finished Fast in" in text or ("Finished in" in text and "trees assigned" in text):
+            self.log_console("TILE", text, level="success")
+        elif "[Merge Complete]" in text or ("Merged" in text and "points in" in text):
+            self.log_console("FF3D", text, level="success")
+        elif "BOUNDARY TREE STITCHER" in text:
+            self.log_console("STITCH", "Starting Boundary Tree Stitching across tile seams...", level="info")
+        elif "Grid Seams" in text or ("Found" in text and "seams" in text):
+            self.log_console("STITCH", text, level="info")
+        elif "Corridor Extraction" in text:
+            self.log_console("STITCH", text, level="info")
+        elif "Seam Analysis" in text:
+            self.log_console("STITCH", text, level="info")
+        elif "SEAM RECONNECTION RESULTS" in text or "Total Split Tree Halves Merged" in text or "Total Seam Contact Matches" in text:
+            self.log_console("STITCH", text, level="success")
+        elif "Streaming stitched tract to" in text:
+            self.log_console("STITCH", text, level="info")
+        elif text.startswith("[VRAM]"):
+            self._seg_diag_n = getattr(self, "_seg_diag_n", 0) + 1
+            if self._seg_diag_n % 8 == 0:
+                self.log_console("FF3D", text, level="info")
+        elif text.startswith("[MEM]"):
+            self._seg_diag_n = getattr(self, "_seg_diag_n", 0) + 1
+            if self._seg_diag_n % 20 == 0:
+                self.log_console("FF3D", text, level="info")
+        else:
+            self.log_console("FF3D", text[:220],
+                             level="error" if text[:6].lower() in ("error", "trace") else "info")
 
     def _seg_region_progress(self, done: int, total: int):
-        """Percent, ETA and a 10%-milestone console line from region k/n."""
+        """Percent, ETA and frequent console milestone from region k/n."""
         frac = max(0.0, min(1.0, done / total)) if total else 0.0
         self._seg_region_frac = frac
         tiles = getattr(self, "_seg_tiles_total", 0)
@@ -5806,10 +6220,15 @@ class MainWindow(QMainWindow):
             f"{_fmt_duration(elapsed)} elapsed · ~{_fmt_duration(eta)} left")
         self.status_bar.showMessage(self.lbl_seg_status.text())
 
-        if pct >= getattr(self, "_seg_pct_logged", 0) + 10:
-            self._seg_pct_logged = (pct // 10) * 10
+        # Log milestone every 5% OR at least once every 45s during long runs
+        now = time.time()
+        last_t = getattr(self, "_seg_last_prog_log_t", 0.0)
+        last_pct = getattr(self, "_seg_pct_logged", -1)
+        if pct >= last_pct + 5 or (now - last_t) >= 45.0 or done == total:
+            self._seg_pct_logged = (pct // 5) * 5
+            self._seg_last_prog_log_t = now
             self.log_console(
-                "FF3D", f"Progress {self._seg_pct_logged}% · {where} · region {done}/{total} · "
+                "FF3D", f"Progress {pct}% · {where} · region {done}/{total} ({(done/total*100):.1f}% tile) · "
                         f"{_fmt_duration(elapsed)} elapsed, ~{_fmt_duration(eta)} left",
                 level="info")
 
@@ -5834,9 +6253,19 @@ class MainWindow(QMainWindow):
 
     def _on_seg_finished(self, res: dict):
         self.bar_seg_progress.setRange(0, 100)
-        self.bar_seg_progress.setValue(100)
         self.btn_seg_run.setEnabled(True)
+        self.btn_seg_stop.setEnabled(False)
+        self.btn_seg_stop.setText("Stop")
         self._seg_timer.stop()
+
+        if res.get("stopped"):
+            self.bar_seg_progress.setValue(0)
+            self.lbl_seg_status.setText("Stopped")
+            self.status_bar.showMessage("ForestFormer3D stopped by user. Progress saved.")
+            self.log_console("FF3D", "Pipeline stopped. Completed tiles are preserved in tract_tiling_progress.json. Click 'Run Segmentation' to resume.", level="warn")
+            return
+
+        self.bar_seg_progress.setValue(100)
         out = res.get("out_las", "")
         self._seg_result = out
         self.btn_seg_load.setEnabled(bool(out) and os.path.exists(out))
@@ -5851,6 +6280,8 @@ class MainWindow(QMainWindow):
         self.bar_seg_progress.setRange(0, 100)
         self.bar_seg_progress.setValue(0)
         self.btn_seg_run.setEnabled(True)
+        self.btn_seg_stop.setEnabled(False)
+        self.btn_seg_stop.setText("Stop")
         self._seg_timer.stop()
         self.lbl_seg_status.setText("Cancelled" if getattr(self, "_seg_closing", False) else "Failed")
         self.log_console("FF3D", f"Pipeline failed: {msg}", level="error")
@@ -5873,6 +6304,8 @@ class MainWindow(QMainWindow):
     def _on_ai_neighbors_toggled(self, checked: bool):
         if hasattr(self, "spin_ai_radius"):
             self.spin_ai_radius.setEnabled(checked)
+        if hasattr(self, "chk_ai_full_neighbors"):
+            self.chk_ai_full_neighbors.setEnabled(checked)
         if hasattr(self, "chk_tree_neighbors") and self.chk_tree_neighbors.isChecked() != checked:
             self.chk_tree_neighbors.blockSignals(True)
             self.chk_tree_neighbors.setChecked(checked)
@@ -6004,16 +6437,22 @@ class MainWindow(QMainWindow):
         if tool_name == "clear":
             self.clear_selection()
             return
-        # Re-clicking the active lasso/box/pick tool turns it off, back to navigation.
-        if self._active_tool == tool_name and tool_name in ("polygon", "box", "inspect"):
+        # Re-clicking the active lasso/box/pick/measure tool turns it off, back to navigation.
+        prev_tool = getattr(self, "_active_tool", "nav")
+        if self._active_tool == tool_name and tool_name in ("polygon", "box", "inspect", "measure"):
             tool_name = "nav"
         self._active_tool = tool_name
         self._run_js(f"window.setActiveTool('{tool_name}');")
         self._sync_tool_buttons()
+        if tool_name == "measure":
+            self.log_console("MEASURE", "Measure tool active — Hold Ctrl and click 2 points to measure 3D distance.", level="info")
+        elif prev_tool == "measure" and tool_name != "measure":
+            self.log_console("MEASURE", "Measure tool deactivated.", level="info")
 
     def _sync_tool_buttons(self):
         """Keep the ribbon tool buttons' checked state in sync with the viewer mode."""
         for name, btn in self._tool_buttons.items():
             btn.blockSignals(True)
-            btn.setChecked(name == self._active_tool)
+            is_active = (name == self._active_tool) or (self._active_tool == "measure" and name in ("measure", "forestry_measure"))
+            btn.setChecked(is_active)
             btn.blockSignals(False)

@@ -117,6 +117,27 @@ html, body {
     color: #60a5fa;
 }
 
+/* Floating Bottom Measure HUD Banner */
+.measure-hud {
+    position: absolute;
+    bottom: 24px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 1020;
+    display: none;
+    align-items: center;
+    gap: 12px;
+    background: rgba(15, 23, 42, 0.94);
+    backdrop-filter: blur(10px);
+    border: 1px solid #f59e0b;
+    border-radius: 8px;
+    padding: 10px 18px;
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.6);
+    color: #f8fafc;
+    font-size: 13px;
+    pointer-events: auto;
+}
+
 /* Toast Message */
 .toast-msg {
     position: absolute;

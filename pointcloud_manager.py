@@ -1078,7 +1078,7 @@ class PointCloudManager:
             self._tree_cache.clear()
             return
         itc_int = int(itc_value)
-        keys_to_del = [k for k in self._tree_cache if (k == itc_int or (isinstance(k, tuple) and k[0] == itc_int))]
+        keys_to_del = [k for k in self._tree_cache if (k == itc_int or (isinstance(k, tuple) and k[0] == itc_int) or k == "all_points" or (isinstance(k, str) and k.startswith("all_points")))]
         for k in keys_to_del:
             self._tree_cache.pop(k, None)
 
@@ -1118,7 +1118,8 @@ class PointCloudManager:
         return None
 
     def _get_edited_tree_points(self, edit_info: Dict[str, Any], itc_val: int,
-                                rad_val: float, n_mode: str, g_rad_val: float) -> Optional[Dict[str, Any]]:
+                                rad_val: float, n_mode: str, g_rad_val: float,
+                                full_neighbors: bool = False) -> Optional[Dict[str, Any]]:
         las_file = edit_info.get("las_path")
         if not las_file or not os.path.exists(las_file):
             return None
@@ -1171,7 +1172,11 @@ class PointCloudManager:
                 in_rad = d2 <= (rad_val * rad_val)
                 # Siblings are other trees in this split
                 is_sibling = (cids >= 0) & (cids != target_cluster)
-                n_mask = n_mask | (in_rad & is_sibling)
+                if full_neighbors:
+                    touching_cids = np.unique(cids[in_rad & is_sibling])
+                    n_mask = n_mask | np.isin(cids, touching_cids)
+                else:
+                    n_mask = n_mask | (in_rad & is_sibling)
 
             if g_rad_val > 0.0:
                 in_g = d2 <= (g_rad_val * g_rad_val)
@@ -1222,6 +1227,7 @@ class PointCloudManager:
             "neighbor_count": neighbor_count,
             "radius": rad_val,
             "neighbor_mode": n_mode,
+            "full_neighbors": bool(full_neighbors),
             "indexing_active": getattr(self, "_is_indexing", False),
             "centroid": [float(centroid[0]), float(centroid[1]), float(centroid[2])],
             "xyz": np.ascontiguousarray(centered, dtype=np.float32),
@@ -1234,13 +1240,162 @@ class PointCloudManager:
         }
 
     @_synchronized
+    def get_all_points(self, max_display_points: int = 2_000_000) -> Optional[Dict[str, Any]]:
+        """
+        Retrieve points in the current point cloud dataset for visualization
+        and interactive selection/filtering under the Forestry tab.
+        Loads the cloud into RAM if needed so that polygon/box selection,
+        classification, and tree editing operate on the complete, exact point set.
+        For 3D WebGL transmission, subsamples to max_display_points (default 2M)
+        to prevent browser buffer exhaustion and GPU out-of-memory crashes.
+        """
+        if self.las_data is None and self.las_path:
+            self.load_las(self.las_path)
+
+        if self.las_data is None:
+            return None
+
+        total_points = len(self.las_data)
+        if total_points == 0:
+            return {
+                "count": 0, "itc": 0, "total_points": 0, "display_points": 0,
+                "target_count": 0, "neighbor_count": 0, "trees_summary": []
+            }
+
+        cache_key = f"all_points_{max_display_points}"
+        if cache_key in self._tree_cache:
+            return self._tree_cache[cache_key]
+
+        if total_points > max_display_points and max_display_points > 0:
+            step = int(np.ceil(total_points / max_display_points))
+            s = slice(0, total_points, step)
+        else:
+            step = 1
+            s = slice(None)
+
+        extra_dims = [d.name for d in self.las_data.point_format.dimensions]
+        has_rgb = "red" in extra_dims
+        has_int = "intensity" in extra_dims
+        has_cls = "classification" in extra_dims
+
+        skip_dims = {"x", "y", "z", "X", "Y", "Z", "red", "green", "blue", "intensity", "classification"}
+        scalar_names = [d for d in extra_dims if d not in skip_dims]
+        scalars = {}
+        for sname in scalar_names:
+            try:
+                scalars[sname] = np.asarray(getattr(self.las_data, sname)[s], dtype=np.float32)
+            except Exception:
+                pass
+
+        x = np.asarray(self.las_data.x[s], dtype=np.float64)
+        y = np.asarray(self.las_data.y[s], dtype=np.float64)
+        z = np.asarray(self.las_data.z[s], dtype=np.float64)
+        display_count = len(x)
+
+        cx, cy, cz = float(x.mean()), float(y.mean()), float(z.mean())
+        centroid = np.array([cx, cy, cz], dtype=np.float64)
+        xyz_f64 = np.column_stack((x, y, z))
+        centered = (xyz_f64 - centroid).astype(np.float32)
+        lo = centered.min(axis=0)
+        hi = centered.max(axis=0)
+
+        rgb = None
+        if has_rgb:
+            r = (np.asarray(self.las_data.red[s]) >> 8).astype(np.uint8)
+            g = (np.asarray(self.las_data.green[s]) >> 8).astype(np.uint8)
+            b = (np.asarray(self.las_data.blue[s]) >> 8).astype(np.uint8)
+            rgb = np.column_stack((r, g, b))
+
+        intensity = None
+        if has_int:
+            intensity = np.asarray(self.las_data.intensity[s], dtype=np.uint16)
+
+        classification = None
+        if has_cls:
+            classification = np.asarray(self.las_data.classification[s], dtype=np.uint8)
+
+        # Compute full-cloud tree / class summary over the entire dataset in RAM
+        trees_summary = []
+        tree_dim = next((n for n in ("itc", "treeID", "tree_id") if n in extra_dims), None)
+        if tree_dim:
+            try:
+                tids = np.asarray(getattr(self.las_data, tree_dim))
+                u_ids, u_counts = np.unique(tids, return_counts=True)
+                valid_mask = u_ids > 0
+                valid_ids = u_ids[valid_mask]
+                valid_counts = u_counts[valid_mask]
+                sort_order = np.argsort(-valid_counts)
+                for tid, cnt in zip(valid_ids[sort_order], valid_counts[sort_order]):
+                    trees_summary.append({
+                        "id": int(tid),
+                        "count": int(cnt),
+                        "isTarget": False,
+                        "isClass": False
+                    })
+                zero_mask = u_ids <= 0
+                for tid, cnt in zip(u_ids[zero_mask], u_counts[zero_mask]):
+                    trees_summary.append({
+                        "id": int(tid),
+                        "count": int(cnt),
+                        "isTarget": False,
+                        "isClass": False
+                    })
+            except Exception as e:
+                print(f"[PointCloudManager] Warning computing tree summary: {e}")
+        elif has_cls:
+            try:
+                cls_arr = np.asarray(self.las_data.classification)
+                u_cls, u_counts = np.unique(cls_arr, return_counts=True)
+                sort_order = np.argsort(-u_counts)
+                for c_id, cnt in zip(u_cls[sort_order], u_counts[sort_order]):
+                    trees_summary.append({
+                        "id": int(c_id),
+                        "count": int(cnt),
+                        "isTarget": False,
+                        "isClass": True
+                    })
+            except Exception as e:
+                print(f"[PointCloudManager] Warning computing class summary: {e}")
+
+        if len(trees_summary) > 5000:
+            trees_summary = trees_summary[:5000]
+
+        res = {
+            "itc": 0,
+            "is_all_points": True,
+            "count": display_count,
+            "total_points": total_points,
+            "display_points": display_count,
+            "target_count": 0,
+            "neighbor_count": display_count,
+            "radius": 0.0,
+            "neighbor_mode": "all",
+            "indexing_active": getattr(self, "_is_indexing", False),
+            "centroid": [float(centroid[0]), float(centroid[1]), float(centroid[2])],
+            "xyz": np.ascontiguousarray(centered, dtype=np.float32),
+            "rgb": np.ascontiguousarray(rgb, dtype=np.uint8) if rgb is not None else None,
+            "intensity": np.ascontiguousarray(intensity, dtype=np.uint16) if intensity is not None else None,
+            "classification": np.ascontiguousarray(classification, dtype=np.uint8) if classification is not None else None,
+            "scalars": scalars,
+            "trees_summary": trees_summary,
+            "bbox_min": [float(lo[0]), float(lo[1]), float(lo[2])],
+            "bbox_max": [float(hi[0]), float(hi[1]), float(hi[2])],
+        }
+
+        self._tree_cache[cache_key] = res
+        return res
+
+    @_synchronized
     def get_tree_points(self, itc_value: int, x: Optional[float] = None, y: Optional[float] = None,
                         radius: float = 0.0, neighbor_mode: str = "trees_only",
-                        ground_radius: float = 0.0) -> Optional[Dict[str, Any]]:
+                        ground_radius: float = 0.0,
+                        full_neighbors: bool = False) -> Optional[Dict[str, Any]]:
         """
         Retrieve ALL points whose ITC/tree-id equals `itc_value` (full density).
         Optionally retrieves surrounding neighbor points within `radius` meters
         and ground points (ASPRS class 2) within `ground_radius` meters.
+        When full_neighbors=True, brings in the entire uncropped point cloud
+        for all neighbor trees that touch the radius.
         Works in both in-memory (small clouds) and streaming (200M+) modes.
         Uses spatial/chunk indexing and early-exit to respond in milliseconds.
         """
@@ -1248,7 +1403,7 @@ class PointCloudManager:
         rad_val = max(0.0, float(radius or 0.0))
         g_rad_val = max(0.0, float(ground_radius or 0.0))
         n_mode = str(neighbor_mode or "trees_only")
-        cache_key = (itc_val, round(rad_val, 1), n_mode, round(g_rad_val, 1))
+        cache_key = (itc_val, round(rad_val, 1), n_mode, round(g_rad_val, 1), bool(full_neighbors))
 
         if cache_key in self._tree_cache:
             return self._tree_cache[cache_key]
@@ -1258,7 +1413,7 @@ class PointCloudManager:
         # Check if this tree is part of an active / committed split edit
         edited_tree = self.get_edited_tree_info(itc_val)
         if edited_tree:
-            res = self._get_edited_tree_points(edited_tree, itc_val, rad_val, n_mode, g_rad_val)
+            res = self._get_edited_tree_points(edited_tree, itc_val, rad_val, n_mode, g_rad_val, full_neighbors=full_neighbors)
             if res:
                 self._tree_cache[cache_key] = res
                 return res
@@ -1313,22 +1468,49 @@ class PointCloudManager:
                 nc_tid = np.asarray(getattr(self.las_data, "tree_id", getattr(self.las_data, "treeID", t_itc)))
                 is_tree = (t_itc > 0) | (nc_tid > 0)
 
-                if n_mode == "all":
-                    n_mask = in_rad & not_target
-                elif n_mode == "trees_only":
-                    n_mask = in_rad & not_target & is_tree
-                    # Smart fallback: if no segmented trees are within radius, include surrounding canopy
-                    if not n_mask.any() and has_cls:
-                        n_mask = in_rad & not_target & (np.asarray(self.las_data.classification) == 5)
-                    if not n_mask.any():
-                        n_mask = in_rad & not_target & (np.asarray(self.las_data.z) >= t_cz - 8.0)
-                else:  # "canopy" (trees + canopy)
-                    is_canopy = is_tree
-                    if has_cls:
-                        is_canopy = is_canopy | (np.asarray(self.las_data.classification) == 5)
-                    n_mask = in_rad & not_target & is_canopy
-                    if not n_mask.any():
-                        n_mask = in_rad & not_target & (np.asarray(self.las_data.z) >= t_cz - 8.0)
+                if full_neighbors:
+                    # Identify which neighbor trees touch or intersect the search radius
+                    touching_tids = np.unique(t_itc[in_rad & not_target & (t_itc > 0)])
+                    is_full_neigh_tree = np.isin(t_itc, touching_tids) & not_target
+                    if has_alt_tid:
+                        touching_alt = np.unique(nc_tid[in_rad & not_target & (nc_tid > 0)])
+                        if len(touching_alt) > 0:
+                            is_full_neigh_tree = is_full_neigh_tree | (np.isin(nc_tid, touching_alt) & not_target)
+
+                    if n_mode == "all":
+                        # Full uncropped neighbor trees + remaining stand points (canopy/ground) within radius
+                        n_mask = is_full_neigh_tree | (in_rad & not_target)
+                    elif n_mode == "trees_only":
+                        # Exactly all points of all touching neighbor trees
+                        n_mask = is_full_neigh_tree
+                        if not n_mask.any() and has_cls:
+                            n_mask = in_rad & not_target & (np.asarray(self.las_data.classification) == 5)
+                        if not n_mask.any():
+                            n_mask = in_rad & not_target & (np.asarray(self.las_data.z) >= t_cz - 8.0)
+                    else:  # "canopy"
+                        is_canopy = is_full_neigh_tree
+                        if has_cls:
+                            is_canopy = is_canopy | (in_rad & not_target & (np.asarray(self.las_data.classification) == 5))
+                        n_mask = is_canopy
+                        if not n_mask.any():
+                            n_mask = in_rad & not_target & (np.asarray(self.las_data.z) >= t_cz - 8.0)
+                else:
+                    if n_mode == "all":
+                        n_mask = in_rad & not_target
+                    elif n_mode == "trees_only":
+                        n_mask = in_rad & not_target & is_tree
+                        # Smart fallback: if no segmented trees are within radius, include surrounding canopy
+                        if not n_mask.any() and has_cls:
+                            n_mask = in_rad & not_target & (np.asarray(self.las_data.classification) == 5)
+                        if not n_mask.any():
+                            n_mask = in_rad & not_target & (np.asarray(self.las_data.z) >= t_cz - 8.0)
+                    else:  # "canopy" (trees + canopy)
+                        is_canopy = is_tree
+                        if has_cls:
+                            is_canopy = is_canopy | (np.asarray(self.las_data.classification) == 5)
+                        n_mask = in_rad & not_target & is_canopy
+                        if not n_mask.any():
+                            n_mask = in_rad & not_target & (np.asarray(self.las_data.z) >= t_cz - 8.0)
 
             # Ground disc under the tree: ASPRS class 2 points within ground_radius
             g_mask = None
@@ -1500,13 +1682,46 @@ class PointCloudManager:
                     rad_sq = rad_val * rad_val
                     g_sq = g_rad_val * g_rad_val
 
+                    touching_tids_set = set()
+                    if full_neighbors and rad_val > 0.0:
+                        def _probe_chunk(p_chunk):
+                            px = np.asarray(p_chunk.x, dtype=np.float64)
+                            py = np.asarray(p_chunk.y, dtype=np.float64)
+                            m = ((px - t_cx) ** 2 + (py - t_cy) ** 2) <= rad_sq
+                            if not m.any():
+                                return
+                            p_itc = np.asarray(getattr(p_chunk, itc_name))
+                            tt = np.unique(p_itc[m & (p_itc > 0) & (p_itc != itc_val)])
+                            touching_tids_set.update(int(v) for v in tt)
+
+                        if self._chunk_index:
+                            probe_chunks = [
+                                c for c in self._chunk_index
+                                if not (c['max_x'] < t_cx - rad_val or c['min_x'] > t_cx + rad_val or
+                                        c['max_y'] < t_cy - rad_val or c['min_y'] > t_cy + rad_val)
+                            ]
+                            for c in probe_chunks:
+                                reader.seek(c["point_offset"])
+                                _probe_chunk(reader.read_points(c["count"]))
+                        else:
+                            reader.seek(0)
+                            for chk in reader.chunk_iterator(5_000_000):
+                                cx = np.asarray(chk.x, dtype=np.float64)
+                                cy = np.asarray(chk.y, dtype=np.float64)
+                                if (cx.max() < t_cx - rad_val or cx.min() > t_cx + rad_val or
+                                    cy.max() < t_cy - rad_val or cy.min() > t_cy + rad_val):
+                                    continue
+                                _probe_chunk(chk)
+
+                    scan_rad_eff = (scan_rad + 30.0) if full_neighbors else scan_rad
+
                     def _extract_from_chunk(n_chunk):
                         nc_x = np.asarray(n_chunk.x, dtype=np.float64)
                         nc_y = np.asarray(n_chunk.y, dtype=np.float64)
                         dx = nc_x - t_cx
                         dy = nc_y - t_cy
                         d2 = dx * dx + dy * dy
-                        in_scan = d2 <= (scan_rad * scan_rad)
+                        in_scan = d2 <= (scan_rad_eff * scan_rad_eff)
                         if not in_scan.any():
                             return
 
@@ -1519,21 +1734,30 @@ class PointCloudManager:
                         n_mask = np.zeros(nc_itc.shape, dtype=bool)
                         if rad_val > 0.0:
                             in_rad = d2 <= rad_sq
-                            if n_mode == "all":
-                                n_mask = in_rad & not_target
-                            elif n_mode == "trees_only":
-                                n_mask = in_rad & not_target & is_tree
-                                if not n_mask.any() and has_cls:
-                                    n_mask = in_rad & not_target & (np.asarray(n_chunk.classification) == 5)
-                                if not n_mask.any():
-                                    n_mask = in_rad & not_target & (np.asarray(n_chunk.z) >= t_cz - 8.0)
-                            else:  # "canopy"
-                                is_canopy = is_tree
-                                if has_cls:
-                                    is_canopy = is_canopy | (np.asarray(n_chunk.classification) == 5)
-                                n_mask = in_rad & not_target & is_canopy
-                                if not n_mask.any():
-                                    n_mask = in_rad & not_target & (np.asarray(n_chunk.z) >= t_cz - 8.0)
+                            if full_neighbors and len(touching_tids_set) > 0:
+                                is_full_tree = np.isin(nc_itc, list(touching_tids_set)) & not_target
+                                if n_mode == "all":
+                                    n_mask = is_full_tree | (in_rad & not_target)
+                                elif n_mode == "trees_only":
+                                    n_mask = is_full_tree
+                                else:  # canopy
+                                    n_mask = is_full_tree | (in_rad & not_target & (np.asarray(n_chunk.classification) == 5 if has_cls else False))
+                            else:
+                                if n_mode == "all":
+                                    n_mask = in_rad & not_target
+                                elif n_mode == "trees_only":
+                                    n_mask = in_rad & not_target & is_tree
+                                    if not n_mask.any() and has_cls:
+                                        n_mask = in_rad & not_target & (np.asarray(n_chunk.classification) == 5)
+                                    if not n_mask.any():
+                                        n_mask = in_rad & not_target & (np.asarray(n_chunk.z) >= t_cz - 8.0)
+                                else:  # "canopy"
+                                    is_canopy = is_tree
+                                    if has_cls:
+                                        is_canopy = is_canopy | (np.asarray(n_chunk.classification) == 5)
+                                    n_mask = in_rad & not_target & is_canopy
+                                    if not n_mask.any():
+                                        n_mask = in_rad & not_target & (np.asarray(n_chunk.z) >= t_cz - 8.0)
 
                         # Ground disc under the tree: ASPRS class 2 within ground_radius
                         if g_rad_val > 0.0:
@@ -1568,9 +1792,17 @@ class PointCloudManager:
                     if self._chunk_index:
                         neigh_chunks = [
                             c for c in self._chunk_index
-                            if not (c['max_x'] < t_cx - scan_rad or c['min_x'] > t_cx + scan_rad or
-                                    c['max_y'] < t_cy - scan_rad or c['min_y'] > t_cy + scan_rad)
+                            if not (c['max_x'] < t_cx - scan_rad_eff or c['min_x'] > t_cx + scan_rad_eff or
+                                    c['max_y'] < t_cy - scan_rad_eff or c['min_y'] > t_cy + scan_rad_eff)
                         ]
+                        if self._tree_index and touching_tids_set:
+                            extra_c_idxs = set()
+                            for tid in touching_tids_set:
+                                extra_c_idxs.update(self._tree_index.get(tid, []))
+                            existing_offsets = {c["point_offset"] for c in neigh_chunks}
+                            for c in self._chunk_index:
+                                if c.get("chunk_idx") in extra_c_idxs and c["point_offset"] not in existing_offsets:
+                                    neigh_chunks.append(c)
                         for c in neigh_chunks:
                             reader.seek(c["point_offset"])
                             n_chunk = reader.read_points(c["count"])
@@ -1580,8 +1812,8 @@ class PointCloudManager:
                         for n_chunk in reader.chunk_iterator(5_000_000):
                             nc_x_check = np.asarray(n_chunk.x, dtype=np.float64)
                             nc_y_check = np.asarray(n_chunk.y, dtype=np.float64)
-                            if (nc_x_check.max() < t_cx - scan_rad or nc_x_check.min() > t_cx + scan_rad or
-                                nc_y_check.max() < t_cy - scan_rad or nc_y_check.min() > t_cy + scan_rad):
+                            if (nc_x_check.max() < t_cx - scan_rad_eff or nc_x_check.min() > t_cx + scan_rad_eff or
+                                nc_y_check.max() < t_cy - scan_rad_eff or nc_y_check.min() > t_cy + scan_rad_eff):
                                 continue
                             _extract_from_chunk(n_chunk)
 
@@ -1630,6 +1862,7 @@ class PointCloudManager:
             "neighbor_count": neighbor_count,
             "radius": rad_val,
             "neighbor_mode": n_mode,
+            "full_neighbors": bool(full_neighbors),
             "indexing_active": getattr(self, "_is_indexing", False),
             "centroid": [float(centroid[0]), float(centroid[1]), float(centroid[2])],
             "xyz": np.ascontiguousarray(centered, dtype=np.float32),
@@ -1650,18 +1883,51 @@ class PointCloudManager:
                            x: Optional[float] = None, y: Optional[float] = None,
                            radius: float = 0.0, neighbor_mode: str = "canopy",
                            keep_tree_ids: Optional[List[int]] = None,
-                           ground_radius: float = 0.0) -> int:
-        """Extract the full-density tree/stand currently displayed in the
+                           ground_radius: float = 0.0,
+                           is_all_points: bool = False,
+                           full_neighbors: bool = False) -> int:
+        """Extract the full-density tree/stand or all points currently displayed in the
         Forestry tab from the LAS master and write it to a LAS/LAZ file.
 
-        Reuses `get_tree_points` (same query the WebGL viewer hit), so the
-        export carries every attribute at full density. When `keep_tree_ids`
-        is provided (an active Neighbor Stand Filter), only points whose ITC
+        Reuses `get_tree_points` or `get_all_points` (same query the WebGL viewer hit),
+        so the export carries every attribute at full density. When `keep_tree_ids`
+        is provided (an active Stand Filter), only points whose ITC or classification
         is in that set are written. Returns the number of points exported.
         """
+        if is_all_points or itc_value <= 0:
+            if self.las_data is None and self.las_path:
+                self.load_las(self.las_path)
+            if self.las_data is None:
+                return 0
+
+            if keep_tree_ids:
+                keep = np.asarray(sorted({int(t) for t in keep_tree_ids}))
+                extra_dims = [d.name for d in self.las_data.point_format.dimensions]
+                itc_name = next((n for n in ("itc", "treeID", "tree_id") if n in extra_dims), None)
+                if itc_name is not None:
+                    sel = np.isin(np.asarray(getattr(self.las_data, itc_name)), keep)
+                elif "classification" in extra_dims:
+                    sel = np.isin(np.asarray(self.las_data.classification), keep)
+                else:
+                    sel = np.ones(len(self.las_data), dtype=bool)
+
+                if not sel.any():
+                    return 0
+                out = self.las_data[sel]
+            else:
+                out = self.las_data
+
+            out.header.vlrs = [v for v in out.header.vlrs if getattr(v, "user_id", "") != "copc"]
+            if hasattr(out.header, "evlrs") and out.header.evlrs:
+                out.header.evlrs = [v for v in out.header.evlrs if getattr(v, "user_id", "") != "copc"]
+            out.write(output_path)
+            print(f"[PointCloudManager] Extracted {len(out):,} full-cloud points -> {output_path}")
+            return len(out)
+
         res = self.get_tree_points(itc_value, x=x, y=y, radius=radius,
                                    neighbor_mode=neighbor_mode,
-                                   ground_radius=ground_radius)
+                                   ground_radius=ground_radius,
+                                   full_neighbors=full_neighbors)
         if not res or res.get("count", 0) == 0:
             return 0
 
@@ -1672,22 +1938,27 @@ class PointCloudManager:
         classification = res.get("classification")
         scalars = res.get("scalars") or {}
 
-        # Apply the active stand filter: keep only the checked trees
+        # Apply the active stand filter: keep only the checked trees or classes
         if keep_tree_ids:
             keep = np.asarray(sorted({int(t) for t in keep_tree_ids}))
             itc_name = next((n for n in ("itc", "treeID", "tree_id") if n in scalars), None)
             if itc_name is not None:
                 sel = np.isin(np.asarray(scalars[itc_name]), keep)
-                if not sel.any():
-                    return 0
-                xyz = xyz[sel]
-                if rgb is not None:
-                    rgb = np.asarray(rgb)[sel]
-                if intensity is not None:
-                    intensity = np.asarray(intensity)[sel]
-                if classification is not None:
-                    classification = np.asarray(classification)[sel]
-                scalars = {k: np.asarray(v)[sel] for k, v in scalars.items()}
+            elif classification is not None:
+                sel = np.isin(np.asarray(classification), keep)
+            else:
+                sel = np.ones(xyz.shape[0], dtype=bool)
+
+            if not sel.any():
+                return 0
+            xyz = xyz[sel]
+            if rgb is not None:
+                rgb = np.asarray(rgb)[sel]
+            if intensity is not None:
+                intensity = np.asarray(intensity)[sel]
+            if classification is not None:
+                classification = np.asarray(classification)[sel]
+            scalars = {k: np.asarray(v)[sel] for k, v in scalars.items()}
 
         # Rebuild on the master header to preserve point format, scale & offset
         if self.las_data is not None:

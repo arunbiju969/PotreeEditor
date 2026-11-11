@@ -57,6 +57,16 @@
             </div>
         </div>
 
+        <!-- Floating Measure HUD Banner -->
+        <div id="measureHud" class="measure-hud" style="display:none;">
+            <span style="font-size:16px;">📏</span>
+            <div id="measureHudContent" style="display:inline-flex; flex-direction:column; gap:2px;">
+                <span id="measureHudText" style="font-weight:700; color:#f8fafc; font-size:13px;">Measure Tool Active</span>
+                <span id="measureHudSubtext" style="font-size:11px; color:#94a3b8;">Hold Ctrl and click Point 1 on point cloud to begin</span>
+            </div>
+            <button id="btnMeasureHudClear" class="hud-btn" style="background:#334155; border:1px solid #64748b; color:#f8fafc; margin-left:8px; padding:3px 8px; font-size:11px;" title="Clear current measurement">Clear</button>
+        </div>
+
         <!-- Inspection Readout Card -->
         <div id="inspectCard" class="inspect-card">
             <h4>

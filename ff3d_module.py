@@ -174,7 +174,14 @@ def _read_tagged(stdout, on_line=None, proc=None):
             tail.append(line)
             if on_line is not None:
                 on_line(line)
-    code = proc.poll() if proc is not None else None
+    if proc is not None:
+        try:
+            proc.wait(timeout=1.0)
+        except Exception:
+            pass
+        code = proc.poll()
+    else:
+        code = None
     hint = _EXIT_HINTS.get(code)
     detail = ""
     if code is not None:
@@ -190,6 +197,7 @@ class ForestFormer3DModule:
 
     def __init__(self):
         self._proc = None
+        self._parallel_proc = None
         self._tmp = tempfile.mkdtemp(prefix="ff3d_")
         runner = os.path.join(self._tmp, "_ff3d_runner.py")
         with open(runner, "w", encoding="utf-8") as f:
@@ -240,7 +248,8 @@ class ForestFormer3DModule:
 
     def predict_file(self, in_las: str, out_dir: str, mode: str = "tract", *,
                      tile_size: float = 70.0, overlap: float = 10.0,
-                     roi=None, model: dict = None, on_output=None) -> dict:
+                     roi=None, model: dict = None, workers: int = 1,
+                     on_output=None) -> dict:
         """Full-pipeline run over a LAS/LAZ file (blocks for minutes on a tract).
 
         mode="tract"  tiles the cloud, runs each tile, merges and seam-stitches
@@ -254,6 +263,11 @@ class ForestFormer3DModule:
         engine log line — tile progress, merge, stitch — as it is printed.
         Returns the worker's reply: {"ok": True, "out_las": path, "n_trees": int|None}.
         """
+        if mode == "tract" and int(workers) > 1:
+            return self._predict_tract_parallel(
+                in_las, out_dir, tile_size=tile_size, overlap=overlap,
+                model=model, workers=int(workers), on_output=on_output)
+
         self._ensure()
         os.makedirs(out_dir, exist_ok=True)
         payload = {"mode": mode,
@@ -273,8 +287,106 @@ class ForestFormer3DModule:
             raise ForestFormer3DError(f"ForestFormer3D {mode} run failed: {res.get('error') or res}")
         return res
 
+    def _predict_tract_parallel(self, in_las: str, out_dir: str, *,
+                                tile_size: float = 70.0, overlap: float = 10.0,
+                                model: dict = None, workers: int = 2,
+                                on_output=None) -> dict:
+        """Run parallel tract inference using run_parallel.py and finalize_parallel.py."""
+        if FF3D_REPO is None or FF3D_PYTHON is None:
+            raise RuntimeError("ForestFormer3D environment not found.")
+
+        run_par_script = os.path.join(FF3D_REPO, "run_parallel.py")
+        fin_par_script = os.path.join(FF3D_REPO, "finalize_parallel.py")
+        if not os.path.isfile(run_par_script) or not os.path.isfile(fin_par_script):
+            raise RuntimeError("run_parallel.py or finalize_parallel.py not found in ForestFormer3D.")
+
+        os.makedirs(out_dir, exist_ok=True)
+        cmd = [
+            FF3D_PYTHON, "-u", run_par_script,
+            "--input", os.path.abspath(in_las),
+            "--output-dir", os.path.abspath(out_dir),
+            "--workers", str(int(workers)),
+            "--tile-size", str(float(tile_size)),
+            "--tile-overlap", str(float(overlap)),
+        ]
+        if model:
+            if model.get("config"):
+                cmd.extend(["--config", str(model["config"])])
+            if model.get("checkpoint"):
+                cmd.extend(["--checkpoint", str(model["checkpoint"])])
+            if model.get("radius") is not None:
+                cmd.extend(["--radius", str(float(model["radius"]))])
+            if model.get("step_size") is not None:
+                cmd.extend(["--step-size", str(float(model["step_size"]))])
+            if model.get("score_th") is not None:
+                cmd.extend(["--score-th", str(float(model["score_th"]))])
+
+        env = dict(os.environ, PYTHONPATH=FF3D_REPO, PYTHONUNBUFFERED="1")
+        if on_output:
+            on_output(f"Launching ForestFormer3D with {workers} parallel workers...")
+
+        self._parallel_proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, env=env, cwd=FF3D_REPO, start_new_session=True
+        )
+        for line in self._parallel_proc.stdout:
+            line = line.strip()
+            if line and on_output:
+                on_output(line)
+        self._parallel_proc.wait()
+        rc = self._parallel_proc.returncode
+        self._parallel_proc = None
+        if rc != 0:
+            raise ForestFormer3DError(f"Parallel tract workers failed (exit code {rc})", exit_code=rc)
+
+        if on_output:
+            on_output("Finalizing parallel tiles and seam stitching...")
+        cmd_fin = [
+            FF3D_PYTHON, "-u", fin_par_script,
+            "--input", os.path.abspath(in_las),
+            "--output-dir", os.path.abspath(out_dir),
+            "--tile-size", str(float(tile_size)),
+        ]
+        self._parallel_proc = subprocess.Popen(
+            cmd_fin, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, env=env, cwd=FF3D_REPO, start_new_session=True
+        )
+        for line in self._parallel_proc.stdout:
+            line = line.strip()
+            if line and on_output:
+                on_output(line)
+        self._parallel_proc.wait()
+        rc = self._parallel_proc.returncode
+        self._parallel_proc = None
+        if rc != 0:
+            raise ForestFormer3DError(f"Finalize parallel tiles failed (exit code {rc})", exit_code=rc)
+
+        base = os.path.splitext(os.path.basename(in_las))[0]
+        stitched = os.path.join(out_dir, f"{base}_entire_tract_stitched.las")
+        merged = os.path.join(out_dir, f"{base}_entire_tract_segmented.las")
+        final_las = stitched if os.path.isfile(stitched) else merged
+        return {"ok": True, "out_las": final_las}
+
+    def stop(self):
+        """Cleanly abort any active run (parallel or single-worker)."""
+        self.close()
+
     def close(self):
-        """Terminate the CUDA child so the GPU is actually released."""
+        """Terminate active processes so GPU VRAM is completely released."""
+        if getattr(self, "_parallel_proc", None) is not None:
+            p = self._parallel_proc
+            self._parallel_proc = None
+            try:
+                import signal
+                os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+                p.wait(timeout=3)
+            except Exception:
+                try:
+                    import signal
+                    os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+                except Exception:
+                    pass
+
         proc, self._proc = self._proc, None
         if proc is None:
             return
