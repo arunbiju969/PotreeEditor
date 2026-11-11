@@ -20,4 +20,14 @@ export __GLX_VENDOR_LIBRARY_NAME=nvidia
 export DRI_PRIME=1
 export MPLCONFIGDIR="${MPLCONFIGDIR:-$PWD/.mplcache}"
 
+# QtWebEngine flicker workaround (Wayland): Qt 6's native Wayland backend
+# composites QWebEngineView through a separate sub-surface whose damage
+# commits race with the Qt frame, flickering the 3D viewport (QTBUG-111836).
+# Run on XWayland instead — the view is embedded via X11 reparenting there,
+# no surface race, and NVIDIA PRIME GLX offload is fully native on X11.
+# Side effect: the "GBM is not supported... Fallback to Vulkan" Chromium line
+# also disappears (ozone-x11 does not use GBM). Delete this line to go back
+# to native Wayland.
+export QT_QPA_PLATFORM=xcb
+
 exec .venv/bin/python main.py "$@"
