@@ -14,9 +14,9 @@
 url         = https://github.com/arunbiju969/ForestFormer3D.git
 path        = vendor/ForestFormer3D
 branch      = main
-commit      = da564030
-date        = 2026-11-04
-subject     = perf(predict_fast): batch the mask edge filter, fuse the decode transfers
+commit      = 9c0b7c9804cf39c29281229aafcd8370840a81fc
+date        = 2026-11-11
+subject     = feat(pipeline): streaming on-disk pre-tiler, pipelined engine, LPT parallel load balancing, and sweep runner
 
 # Upstream lineage (informational — the editor does not read these)
 upstream_repo   = https://github.com/bxiang233/FF3D.git
