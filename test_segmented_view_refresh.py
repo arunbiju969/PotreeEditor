@@ -50,7 +50,8 @@ class TestSegmentedViewRefresh(unittest.TestCase):
             "trees": trees
         })
         self.win.sidebar_tabs.setCurrentIndex(1)
-        self.assertFalse(self.win.grp_stand_filter.isHidden())
+        # Controls are hosted on the ribbon Filter page, so the sidebar card stays hidden.
+        self.assertTrue(self.win.review_panel.isAncestorOf(self.win.list_stand_trees))
         self.assertEqual(self.win.list_stand_trees.count(), 4)
         item0 = self.win.list_stand_trees.item(0)
         self.assertIn("Tree #1", item0.text())

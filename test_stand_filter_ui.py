@@ -57,7 +57,7 @@ class TestStandFilterUI(unittest.TestCase):
 
     def test_controls_exist(self):
         """Verify all Stand Filter UI controls exist in Forestry tab and Top Category Bar."""
-        self.assertTrue(hasattr(self.win, "grp_stand_filter"))
+        self.assertFalse(hasattr(self.win, "grp_stand_filter"))  # moved to Auto Review tab
         self.assertTrue(hasattr(self.win, "lbl_stand_filter_info"))
         self.assertTrue(hasattr(self.win, "btn_tree_filter_mode"))
         self.assertTrue(hasattr(self.win, "list_stand_trees"))
@@ -66,7 +66,6 @@ class TestStandFilterUI(unittest.TestCase):
         self.assertTrue(hasattr(self.win, "bar_stand_filter"))
         self.assertTrue(hasattr(self.win, "lbl_top_stand_info"))
         self.win.close_tree_view_action()
-        self.assertFalse(self.win.grp_stand_filter.isVisible())
         self.assertFalse(self.win.bar_stand_filter.isVisible())
 
     def test_stand_loaded_populates_list(self):
@@ -87,7 +86,10 @@ class TestStandFilterUI(unittest.TestCase):
         }
         self.win.signaler.tree_stand_loaded.emit(stand_data)
 
-        self.assertFalse(self.win.grp_stand_filter.isHidden())
+        # Neighbour filtering lives on the ribbon's Filter page: loading a stand
+        # populates the list and arms the toolbar, but never re-shows the old card.
+        self.assertTrue(self.win.review_panel.isAncestorOf(self.win.list_stand_trees))
+        self.assertTrue(self.win.btn_tree_filter_mode.isEnabled())
         self.assertFalse(self.win.bar_stand_filter.isHidden())
         self.assertIn("Tree #105", self.win.lbl_top_stand_info.text())
         self.assertEqual(self.win.list_stand_trees.count(), 4)
@@ -194,11 +196,9 @@ class TestStandFilterUI(unittest.TestCase):
     def test_close_tree_view_hides_filter_and_cleans_up(self):
         """Verify close_tree_view_action hides stand filter and clears state."""
         self.win.sidebar_tabs.setCurrentIndex(1)
-        self.win.grp_stand_filter.setVisible(True)
         self.win.btn_tree_filter_mode.setChecked(True)
 
         self.win.close_tree_view_action()
-        self.assertFalse(self.win.grp_stand_filter.isVisible())
         self.assertEqual(self.win.list_stand_trees.count(), 0)
         self.assertFalse(self.win.btn_tree_filter_mode.isChecked())
 
@@ -207,12 +207,17 @@ class TestStandFilterUI(unittest.TestCase):
         self.assertEqual(self.win.combo_neighbor_mode.currentData(), "all")
         self.assertEqual(self.win.combo_neighbor_mode.currentText(),
                          "All Stand Points (Canopy + Ground) (Recommended)")
-        # Neighbors stay off by default; the mode applies once the radius is in play.
+        # Neighbours are opt-in: opening a tree fetches just that tree. Ground stays on.
         self.assertFalse(self.win.chk_tree_neighbors.isChecked())
+        self.assertFalse(self.win.chk_full_neighbors.isChecked())
+        self.assertFalse(self.win.chk_full_neighbors.isEnabled())
+        self.assertTrue(self.win.chk_tree_ground.isChecked())
+        self.assertTrue(self.win.spin_tree_ground.isEnabled())
         self.assertFalse(self.win.combo_neighbor_mode.isEnabled())
 
         self.win.chk_tree_neighbors.setChecked(True)
         self.assertTrue(self.win.combo_neighbor_mode.isEnabled())
+        self.assertTrue(self.win.chk_full_neighbors.isEnabled())
         self.assertEqual(self.win.combo_neighbor_mode.currentData(), "all")
 
 

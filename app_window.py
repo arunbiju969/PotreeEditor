@@ -26,7 +26,7 @@ from PyQt6.QtWidgets import (
     QHeaderView, QAbstractItemView, QProgressDialog, QSizePolicy, QTabWidget, QGridLayout,
     QDialog
 )
-from PyQt6.QtCore import Qt, QUrl, QStandardPaths, QByteArray, pyqtSignal, QObject, QThread, QTimer
+from PyQt6.QtCore import Qt, QUrl, QByteArray, pyqtSignal, QObject, QThread, QTimer
 from PyQt6.QtGui import QFont, QIcon, QColor, QAction, QActionGroup, QPixmap
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWebEngineCore import QWebEngineSettings
@@ -873,6 +873,27 @@ class MainWindow(QMainWindow):
                 font-size: 11px;
                 max-height: 22px;
             }
+            /* QSpinBox does not inherit the QDoubleSpinBox type selector above, and the
+               untyped global rule (13px font, 4px padding) made it 33px tall -- taller
+               than the ribbon page can spare. */
+            QSpinBox.ribbonSpin {
+                background-color: #0b111c;
+                border: 1px solid #2b3d56;
+                border-radius: 4px;
+                color: #f8fafc;
+                padding: 2px 4px;
+                font-size: 11px;
+                max-height: 22px;
+            }
+            QLineEdit.ribbonEdit {
+                background-color: #0b111c;
+                border: 1px solid #2b3d56;
+                border-radius: 4px;
+                color: #f8fafc;
+                padding: 2px 6px;
+                font-size: 11px;
+                max-height: 22px;
+            }
             QPushButton.ribbonToolBtn {
                 background-color: #1f2c40;
                 border: 1px solid #334764;
@@ -1003,13 +1024,26 @@ class MainWindow(QMainWindow):
         self.web_view.loadFinished.connect(self._on_page_load_finished)
         self.web_view.load(QUrl(viewer_url))
 
+        # Right-hand review panel (Filter + Auto Review). It belongs to the tree
+        # overlay being inspected, so it mirrors the main sidebar across the viewport
+        # instead of competing for tabs with the dataset pages.
+        self.review_panel = self.create_review_panel()
+        self.review_panel.setMinimumWidth(300)
+        self.review_panel.setMaximumWidth(460)
+        self.review_panel.setVisible(True)
+
         splitter.addWidget(sidebar)
         splitter.addWidget(self.web_view)
+        splitter.addWidget(self.review_panel)
         splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 1)
-        # Open with the sidebar at its full width (persisted sizes take over
-        # after the first relaunch).
-        splitter.setSizes([450, 1200])
+        splitter.setStretchFactor(1, 1)   # the 3D view takes the slack
+        splitter.setStretchFactor(2, 0)
+        splitter.setCollapsible(0, True)
+        splitter.setCollapsible(1, False)
+        splitter.setCollapsible(2, True)
+        # Open with both panels at full width (persisted sizes take over after
+        # the first relaunch).
+        splitter.setSizes([420, 900, 380])
 
         # Main vertical splitter: top is sidebar+webview, bottom is resizable console drawer
         self.main_vsplitter = QSplitter(Qt.Orientation.Vertical)
@@ -1673,6 +1707,90 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.sidebar_tabs)
         return container
 
+    def _set_stand_filter_buttons_enabled(self, enabled: bool):
+        """Enable/disable the ribbon Stand Filter buttons (not just show/hide them)."""
+        for name in ("btn_tree_filter_mode", "btn_top_filter", "btn_top_reset"):
+            btn = getattr(self, name, None)
+            if btn is not None:
+                btn.setEnabled(enabled)
+
+    def _disable_tree_filter_mode(self):
+        if hasattr(self, "btn_tree_filter_mode") and self.btn_tree_filter_mode.isChecked():
+            self.btn_tree_filter_mode.blockSignals(True)
+            self.btn_tree_filter_mode.setChecked(False)
+            self.btn_tree_filter_mode.setText("Filter Mode")
+            self.btn_tree_filter_mode.blockSignals(False)
+        self._run_js("if (window.setTreeFilterMode) window.setTreeFilterMode(false);")
+
+    def start_auto_review(self):
+        """Begin walking the cloud's trees in ID order, one every N seconds."""
+        if not self.manager.las_path and self.manager.las_data is None:
+            self.status_bar.showMessage("Open a LAS/LAZ cloud before starting auto review.")
+            return
+        ids = self.manager.get_tree_ids() if hasattr(self.manager, "get_tree_ids") else []
+        if not ids:
+            self.status_bar.showMessage(
+                "Tree index not ready yet — it builds in the background just after opening a cloud.", 6000)
+            return
+        self._auto_active = True
+        self._auto_total = len(ids)
+        # Always start at the first tree so a run covers the whole tract.
+        self.spin_tree_view.setValue(ids[0])
+        # single_tree: show exactly this tree, not its neighbours. The walk covers
+        # every tree in the cloud, so each step must be one tree's own points.
+        self.view_tree_action(single_tree=True)
+        self._auto_visited = 1
+        self.btn_auto_start.setEnabled(False)
+        self.btn_auto_stop.setEnabled(True)
+        self._update_auto_status()
+        self._auto_timer.start(int(self.spin_auto_delay.value() * 1000))
+
+    def stop_auto_review(self):
+        """Cancel an auto-review run (leaves the current tree on screen)."""
+        if not self._auto_active:
+            return
+        self._auto_active = False
+        self._auto_timer.stop()
+        self.btn_auto_start.setEnabled(True)
+        self.btn_auto_stop.setEnabled(False)
+        self.lbl_auto_status.setText(
+            f"Stopped after {self._auto_visited} of {self._auto_total} trees. "
+            f"Showing Tree #{self.spin_tree_view.value()}.")
+        self.status_bar.showMessage("Auto review stopped.", 3000)
+
+    def _auto_step(self):
+        """Advance one tree, or finish once every ID has been shown."""
+        if not self._auto_active:
+            return
+        current = int(self.spin_tree_view.value())
+        nxt = self._next_tree_id(current)
+        # _next_tree_id wraps to the first ID, so a wrap means the walk is done.
+        if nxt is None or nxt <= current or self._auto_visited >= self._auto_total:
+            self._auto_active = False
+            self.btn_auto_start.setEnabled(True)
+            self.btn_auto_stop.setEnabled(False)
+            self.lbl_auto_status.setText(
+                f"Finished — reviewed all {self._auto_total} trees. Last shown: Tree #{current}.")
+            self.status_bar.showMessage(f"Auto review finished ({self._auto_total} trees).", 5000)
+            return
+        self.spin_tree_view.setValue(nxt)
+        self.view_tree_action(single_tree=True)
+        self._auto_visited += 1
+        self._update_auto_status()
+        self._auto_timer.start(int(self.spin_auto_delay.value() * 1000))
+
+    def _update_auto_status(self):
+        self.lbl_auto_status.setText(
+            f"Auto review: tree {self._auto_visited} of {self._auto_total} "
+            f"(#{self.spin_tree_view.value()}), single tree, every "
+            f"{self.spin_auto_delay.value():.1f}s.")
+
+    def _on_auto_delay_changed(self, value: float):
+        # Apply a delay change to a run in progress without restarting it.
+        if self._auto_active and self._auto_timer.isActive():
+            self._auto_timer.start(int(value * 1000))
+            self._update_auto_status()
+
     def _on_sidebar_tab_changed(self, index: int):
         # Ribbon "Filter" and "AI" menus are only visible while the Forestry tab is open
         is_forestry = (index == 1)
@@ -1694,21 +1812,6 @@ class MainWindow(QMainWindow):
             self._run_js("if (window.showTreeOverlayContext) window.showTreeOverlayContext(); else { if (document.getElementById('inspectCard')) document.getElementById('inspectCard').style.display = 'none'; }")
         else:
             self._disable_tree_filter_mode()
-
-    def _set_stand_filter_buttons_enabled(self, enabled: bool):
-        """Enable/disable the ribbon Stand Filter buttons (not just show/hide them)."""
-        for name in ("btn_tree_filter_mode", "btn_top_filter", "btn_top_reset"):
-            btn = getattr(self, name, None)
-            if btn is not None:
-                btn.setEnabled(enabled)
-
-    def _disable_tree_filter_mode(self):
-        if hasattr(self, "btn_tree_filter_mode") and self.btn_tree_filter_mode.isChecked():
-            self.btn_tree_filter_mode.blockSignals(True)
-            self.btn_tree_filter_mode.setChecked(False)
-            self.btn_tree_filter_mode.setText("Filter Mode")
-            self.btn_tree_filter_mode.blockSignals(False)
-        self._run_js("if (window.setTreeFilterMode) window.setTreeFilterMode(false);")
 
     def _layer_size_slider_row(self) -> QHBoxLayout:
         """Slider + live value badge for the Point Size quick-styling row."""
@@ -2016,7 +2119,9 @@ class MainWindow(QMainWindow):
         # Ground under the tree: ASPRS class 2 points within a radius of the tree
         h_ground = QHBoxLayout()
         self.chk_tree_ground = QCheckBox("Show Ground")
-        self.chk_tree_ground.setChecked(False)
+        # On by default so the ground plane comes with the stand; ForestFormer3D
+        # separates ground from trunks more reliably when it is present.
+        self.chk_tree_ground.setChecked(True)
         self.chk_tree_ground.setStyleSheet("color: #e2e8f0; font-size: 11px; font-weight: 600;")
         self.chk_tree_ground.setCursor(Qt.CursorShape.PointingHandCursor)
         h_ground.addWidget(self.chk_tree_ground)
@@ -2031,7 +2136,7 @@ class MainWindow(QMainWindow):
         self.spin_tree_ground.setSingleStep(5.0)
         self.spin_tree_ground.setSuffix(" m")
         self.spin_tree_ground.setStyleSheet("font-size: 11px; padding: 2px 4px; max-width: 65px;")
-        self.spin_tree_ground.setEnabled(False)  # matches the unchecked default
+        self.spin_tree_ground.setEnabled(True)  # matches the checked default
         h_ground.addWidget(self.spin_tree_ground)
         h_ground.addStretch()
         v_tree.addLayout(h_ground)
@@ -2086,33 +2191,18 @@ class MainWindow(QMainWindow):
         btn_view_tree.clicked.connect(self.view_tree_action)
         v_tree.addWidget(btn_view_tree)
 
-        # Bring in all points feature (under Forestry tab)
-        self.btn_bring_all_points = QPushButton("Bring in All Points (Full Cloud)")
-        self.btn_bring_all_points.setObjectName("btnPrimary")
-        self.btn_bring_all_points.setStyleSheet("""
-            QPushButton {
-                background-color: #0284c7;
-                color: #ffffff;
-                font-size: 11px;
-                font-weight: 700;
-                padding: 6px 12px;
-                border-radius: 4px;
-                border: 1px solid #38bdf8;
-            }
-            QPushButton:hover {
-                background-color: #0369a1;
-            }
-            QPushButton:pressed {
-                background-color: #075985;
-            }
-        """)
-        self.btn_bring_all_points.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_bring_all_points.setToolTip(
-            "Bring in all points of the loaded cloud into the Forestry tab in full density,\n"
-            "enabling points selection (box/polygon/pick) and filter options across all trees."
-        )
-        self.btn_bring_all_points.clicked.connect(self.view_all_points_action)
-        v_tree.addWidget(self.btn_bring_all_points)
+        # Step through the tract one tree at a time: advance the Tree ID to the next
+        # ID present in the cloud and render it, so a stand can be reviewed without
+        # typing IDs or picking each crown in 3D.
+        self.btn_next_tree = QPushButton("Next Tree")
+        self.btn_next_tree.setObjectName("btnSecondary")
+        self.btn_next_tree.setStyleSheet("padding: 5px 10px; font-size: 11px; font-weight: 600;")
+        self.btn_next_tree.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_next_tree.setToolTip(
+            "Advance the Tree ID to the next tree in the cloud and view it\n"
+            "(skips IDs that do not exist; wraps to the first tree at the end)")
+        self.btn_next_tree.clicked.connect(self.next_tree_action)
+        v_tree.addWidget(self.btn_next_tree)
 
         # Export the currently displayed full-density tree/stand back to LAS/LAZ
         # (extracted straight from the master file, honoring the stand filter)
@@ -2133,103 +2223,6 @@ class MainWindow(QMainWindow):
 
         v_tree.addSpacing(14)
 
-        # Stand Trees Filter Group (Only shown in Forestry tab when viewing a tree with neighbors)
-        self.grp_stand_filter = QGroupBox("FILTER NEIGHBOR TREES")
-        self.grp_stand_filter.setStyleSheet("""
-            QGroupBox {
-                border: 1px solid #0284c7;
-                border-radius: 8px;
-                margin-top: 26px;
-                padding-top: 34px;
-                font-weight: 700;
-                color: #38bdf8;
-                font-size: 11px;
-                background-color: rgba(2, 132, 199, 0.04);
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                subcontrol-position: top left;
-                left: 14px;
-                top: 6px;
-                padding: 1px 8px;
-                background-color: #141c28;
-                border: 1px solid #0284c7;
-                border-radius: 4px;
-                color: #38bdf8;
-                font-weight: 700;
-            }
-        """)
-        v_filter = QVBoxLayout(self.grp_stand_filter)
-        v_filter.setSpacing(6)
-        v_filter.setContentsMargins(8, 12, 8, 8)
-
-        self.lbl_stand_filter_info = QLabel("Filter Mode ON: click trees in 3D, or use checkboxes:")
-        self.lbl_stand_filter_info.setStyleSheet("color: #94a3b8; font-size: 11px;")
-        self.lbl_stand_filter_info.setWordWrap(True)
-        v_filter.addWidget(self.lbl_stand_filter_info)
-
-        # Quick Select buttons
-        h_fquick = QHBoxLayout()
-        btn_sel_all = QPushButton("Select All")
-        btn_sel_all.setStyleSheet("font-size: 10px; padding: 2px 6px;")
-        btn_sel_all.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_sel_all.clicked.connect(self._on_filter_select_all)
-        h_fquick.addWidget(btn_sel_all)
-
-        btn_sel_target = QPushButton("Target Tree Only")
-        btn_sel_target.setStyleSheet("font-size: 10px; padding: 2px 6px;")
-        btn_sel_target.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_sel_target.clicked.connect(self._on_filter_select_target_only)
-        h_fquick.addWidget(btn_sel_target)
-
-        btn_sel_none = QPushButton("Clear")
-        btn_sel_none.setStyleSheet("font-size: 10px; padding: 2px 6px;")
-        btn_sel_none.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_sel_none.setToolTip("Deselect all trees/items in filter list")
-        btn_sel_none.clicked.connect(self._on_filter_select_none)
-        h_fquick.addWidget(btn_sel_none)
-        v_filter.addLayout(h_fquick)
-
-        # Multi-select tree list with checkboxes
-        self.list_stand_trees = QListWidget()
-        self.list_stand_trees.setMaximumHeight(130)
-        self.list_stand_trees.setStyleSheet("""
-            QListWidget {
-                background-color: #0f172a;
-                border: 1px solid #334155;
-                border-radius: 4px;
-                color: #e2e8f0;
-                font-size: 11px;
-            }
-            QListWidget::item {
-                padding: 2px 4px;
-            }
-            QListWidget::item:hover {
-                background-color: #1e293b;
-            }
-        """)
-        self.list_stand_trees.itemChanged.connect(self._on_stand_tree_item_changed)
-        v_filter.addWidget(self.list_stand_trees)
-
-        # Filter and Reset buttons
-        h_factions = QHBoxLayout()
-        self.btn_apply_tree_filter = QPushButton("Filter")
-        self.btn_apply_tree_filter.setObjectName("btnSuccess")
-        self.btn_apply_tree_filter.setStyleSheet("padding: 4px 10px; font-size: 11px; font-weight: 700;")
-        self.btn_apply_tree_filter.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_apply_tree_filter.clicked.connect(self._apply_tree_filter)
-        h_factions.addWidget(self.btn_apply_tree_filter)
-
-        self.btn_reset_tree_filter = QPushButton("Reset")
-        self.btn_reset_tree_filter.setObjectName("btnSecondary")
-        self.btn_reset_tree_filter.setStyleSheet("padding: 4px 8px; font-size: 11px;")
-        self.btn_reset_tree_filter.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_reset_tree_filter.clicked.connect(self._reset_tree_filter)
-        h_factions.addWidget(self.btn_reset_tree_filter)
-        v_filter.addLayout(h_factions)
-
-        self.grp_stand_filter.setVisible(False)
-        v_tree.addWidget(self.grp_stand_filter)
 
         layout.addWidget(grp_tree)
 
@@ -2363,6 +2356,235 @@ class MainWindow(QMainWindow):
 
         scroll.setWidget(content)
         return scroll
+
+    # -------------------------------------------------------------------------
+    # Right-hand review panel: neighbour trees (Filter) + Auto Review
+    # -------------------------------------------------------------------------
+    def create_review_panel(self) -> QWidget:
+        """The right-hand side panel: Filter (neighbour trees) and Auto Review.
+
+        These are real-time tools for the tree overlay you are inspecting, so they sit
+        opposite the viewport from the main sidebar rather than buried among the
+        dataset tabs.
+        """
+        container = QWidget()
+        container.setObjectName("reviewPanel")
+        v = QVBoxLayout(container)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(0)
+
+        self.review_tabs = QTabWidget()
+        self.review_tabs.setObjectName("reviewTabs")
+        self.review_tabs.addTab(self._create_filter_panel(), "Filter")
+        self.review_tabs.addTab(self.create_auto_review_tab(), "Auto Review")
+        v.addWidget(self.review_tabs)
+        return container
+
+    def _create_filter_panel(self) -> QWidget:
+        """Filter Mode switch plus the per-stand Filter / Reset actions."""
+        page = QWidget()
+        v = QVBoxLayout(page)
+        v.setContentsMargins(10, 10, 10, 10)
+        v.setSpacing(8)
+
+        lbl = QLabel("FILTER MODE")
+        lbl.setStyleSheet(
+            "color: #38bdf8; font-size: 11px; font-weight: 700; letter-spacing: 0.06em;")
+        v.addWidget(lbl)
+
+        self.lbl_filter_panel_info = QLabel(
+            "Turn Filter Mode on, then click trees in the 3D view to add or remove them "
+            "from the selection. Use the Auto Review tab for the full tree list.")
+        self.lbl_filter_panel_info.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        self.lbl_filter_panel_info.setWordWrap(True)
+        v.addWidget(self.lbl_filter_panel_info)
+
+        # Mirror the ribbon Filter Mode toggle on this panel.
+        self.btn_review_filter_mode = QPushButton("Filter Mode")
+        self.btn_review_filter_mode.setCheckable(True)
+        self.btn_review_filter_mode.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_review_filter_mode.setStyleSheet("padding: 6px 10px; font-size: 11px; font-weight: 600;")
+        self.btn_review_filter_mode.toggled.connect(self._on_review_filter_mode_toggled)
+        v.addWidget(self.btn_review_filter_mode)
+
+        h = QHBoxLayout()
+        h.setSpacing(6)
+        self.btn_review_filter = QPushButton("Filter")
+        self.btn_review_filter.setObjectName("btnSuccess")
+        self.btn_review_filter.setStyleSheet("padding: 5px 10px; font-size: 11px; font-weight: 700;")
+        self.btn_review_filter.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_review_filter.clicked.connect(self._apply_tree_filter)
+        h.addWidget(self.btn_review_filter)
+
+        self.btn_review_reset = QPushButton("Reset")
+        self.btn_review_reset.setStyleSheet("padding: 5px 10px; font-size: 11px;")
+        self.btn_review_reset.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_review_reset.clicked.connect(self._reset_tree_filter)
+        h.addWidget(self.btn_review_reset)
+        self.btn_review_filter.setEnabled(False)
+        self.btn_review_reset.setEnabled(False)
+        v.addLayout(h)
+        v.addStretch()
+        return page
+
+    def _on_review_filter_mode_toggled(self, checked: bool):
+        # Drive the ribbon toggle so a single handler owns the state.
+        if hasattr(self, "btn_tree_filter_mode") and self.btn_tree_filter_mode.isChecked() != checked:
+            self.btn_tree_filter_mode.setChecked(checked)
+        elif checked and hasattr(self, "sidebar_tabs"):
+            # Already on: just surface the tree list.
+            self.open_auto_review_review_tab()
+
+    def open_auto_review_review_tab(self):
+        """Switch the right-hand panel to its Auto Review page."""
+        if hasattr(self, "review_tabs"):
+            for i in range(self.review_tabs.count()):
+                if self.review_tabs.tabText(i) == "Auto Review":
+                    self.review_tabs.setCurrentIndex(i)
+                    break
+        self.show_review_panel()
+
+    def show_review_panel(self):
+        """Ensure the right-hand panel is visible."""
+        panel = getattr(self, "review_panel", None)
+        if panel is not None:
+            panel.setVisible(True)
+
+    def create_auto_review_tab(self) -> QWidget:
+        """Full-height home for the neighbour-tree list and the one-by-one walk.
+
+        The list used to sit inside the 92px Filter ribbon page, where it could only
+        be a short scrollbox. Here it gets the whole sidebar height, next to the
+        controls that step through trees.
+        """
+        container = QWidget()
+        v = QVBoxLayout(container)
+        v.setContentsMargins(10, 10, 10, 10)
+        v.setSpacing(8)
+
+        lbl_trees = QLabel("NEIGHBOUR TREES")
+        lbl_trees.setStyleSheet(
+            "color: #38bdf8; font-size: 11px; font-weight: 700; letter-spacing: 0.06em;")
+        v.addWidget(lbl_trees)
+
+        self.lbl_stand_filter_info = QLabel("Filter Mode ON: click trees in 3D, or use checkboxes:")
+        self.lbl_stand_filter_info.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        self.lbl_stand_filter_info.setWordWrap(True)
+        v.addWidget(self.lbl_stand_filter_info)
+
+        h_sel = QHBoxLayout()
+        h_sel.setSpacing(4)
+        for text, slot, tip in (
+                ("Select All", self._on_filter_select_all, "Select every tree in the stand"),
+                ("Target Only", self._on_filter_select_target_only,
+                 "Select only the tree currently being viewed"),
+                ("Clear", self._on_filter_select_none, "Deselect all trees")):
+            btn = QPushButton(text)
+            btn.setStyleSheet("font-size: 10px; padding: 3px 6px;")
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setToolTip(tip)
+            btn.clicked.connect(slot)
+            h_sel.addWidget(btn)
+        v.addLayout(h_sel)
+
+        # Full height: this is the point of moving the list out of the ribbon. The
+        # object itself is shared with the manager's selection sync, so it keeps its
+        # identity and only its layout changes.
+        self.list_stand_trees = QListWidget()
+        self.list_stand_trees.setStyleSheet("""
+            QListWidget {
+                background-color: #0f172a;
+                border: 1px solid #334155;
+                border-radius: 4px;
+                color: #e2e8f0;
+                font-size: 11px;
+            }
+            QListWidget::item {
+                padding: 2px 4px;
+            }
+            QListWidget::item:hover {
+                background-color: #1e293b;
+            }
+        """)
+        self.list_stand_trees.itemChanged.connect(self._on_stand_tree_item_changed)
+        self.list_stand_trees.setMaximumHeight(16_777_215)
+        self.list_stand_trees.setMinimumHeight(140)
+        v.addWidget(self.list_stand_trees, 1)
+
+        h_factions = QHBoxLayout()
+        h_factions.setSpacing(6)
+        self.btn_apply_tree_filter = QPushButton("Filter")
+        self.btn_apply_tree_filter.setObjectName("btnSuccess")
+        self.btn_apply_tree_filter.setStyleSheet(
+            "padding: 4px 10px; font-size: 11px; font-weight: 700;")
+        self.btn_apply_tree_filter.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_apply_tree_filter.clicked.connect(self._apply_tree_filter)
+        h_factions.addWidget(self.btn_apply_tree_filter)
+
+        self.btn_reset_tree_filter = QPushButton("Reset")
+        self.btn_reset_tree_filter.setObjectName("btnSecondary")
+        self.btn_reset_tree_filter.setStyleSheet("padding: 4px 8px; font-size: 11px;")
+        self.btn_reset_tree_filter.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_reset_tree_filter.clicked.connect(self._reset_tree_filter)
+        h_factions.addWidget(self.btn_reset_tree_filter)
+        v.addLayout(h_factions)
+
+        # ---- Auto mode: walk the tract one tree at a time ----
+        v.addSpacing(10)
+        lbl_auto = QLabel("AUTO REVIEW")
+        lbl_auto.setStyleSheet(
+            "color: #38bdf8; font-size: 11px; font-weight: 700; letter-spacing: 0.06em;")
+        v.addWidget(lbl_auto)
+
+        self.lbl_auto_status = QLabel("Idle — press Start to step through every tree.")
+        self.lbl_auto_status.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        self.lbl_auto_status.setWordWrap(True)
+        v.addWidget(self.lbl_auto_status)
+
+        h_delay = QHBoxLayout()
+        h_delay.setSpacing(6)
+        lbl_delay = QLabel("Delay:")
+        lbl_delay.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        h_delay.addWidget(lbl_delay)
+        self.spin_auto_delay = QDoubleSpinBox()
+        self.spin_auto_delay.setRange(0.5, 30.0)
+        self.spin_auto_delay.setValue(2.0)
+        self.spin_auto_delay.setSingleStep(0.5)
+        self.spin_auto_delay.setDecimals(1)
+        self.spin_auto_delay.setSuffix(" s")
+        self.spin_auto_delay.setStyleSheet("font-size: 11px; padding: 2px 4px; max-width: 70px;")
+        self.spin_auto_delay.valueChanged.connect(self._on_auto_delay_changed)
+        h_delay.addWidget(self.spin_auto_delay)
+        h_delay.addStretch()
+        v.addLayout(h_delay)
+
+        h_auto = QHBoxLayout()
+        h_auto.setSpacing(6)
+        self.btn_auto_start = QPushButton("Start Auto Review")
+        self.btn_auto_start.setObjectName("btnSuccess")
+        self.btn_auto_start.setStyleSheet(
+            "padding: 5px 10px; font-size: 11px; font-weight: 700;")
+        self.btn_auto_start.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_auto_start.setToolTip("Step through every tree in the cloud, one at a time")
+        self.btn_auto_start.clicked.connect(self.start_auto_review)
+        h_auto.addWidget(self.btn_auto_start)
+
+        self.btn_auto_stop = QPushButton("Stop")
+        self.btn_auto_stop.setStyleSheet("padding: 5px 10px; font-size: 11px;")
+        self.btn_auto_stop.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_auto_stop.setEnabled(False)
+        self.btn_auto_stop.clicked.connect(self.stop_auto_review)
+        h_auto.addWidget(self.btn_auto_stop)
+        v.addLayout(h_auto)
+
+        self._auto_timer = QTimer(self)
+        self._auto_timer.setSingleShot(True)
+        self._auto_timer.timeout.connect(self._auto_step)
+        self._auto_active = False
+        self._auto_visited = 0
+        self._auto_total = 0
+        return container
+
 
     def create_dataset_tab(self) -> QWidget:
         scroll = QScrollArea()
@@ -2525,50 +2747,23 @@ class MainWindow(QMainWindow):
     # Dataset Loading & Fast Header-Only Inspection
     # -------------------------------------------------------------------------
     # -------------------------------------------------------------------------
-    # File Dialogs (with a useful sidebar)
+    # File Dialogs
     # -------------------------------------------------------------------------
-    def _default_sidebar_urls(self):
-        """Sidebar locations shared by every file dialog.
-
-        The Qt file dialog keeps its own bookmark list and does not read
-        Dolphin's Places, so seed it with the folders used most in this app.
-        """
-        home = os.path.expanduser("~")
-        cands = [
-            home,
-            QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DocumentsLocation),
-            QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation),
-            "/mnt/omen/Data",
-            os.path.dirname(os.path.abspath(self.potree_dir)),
-        ]
-        seen, urls = set(), []
-        for p in cands:
-            if p and os.path.isdir(p) and p not in seen:
-                seen.add(p)
-                urls.append(QUrl.fromLocalFile(p))
-        return urls
-
+    # These deliberately use the static QFileDialog helpers so the platform gets
+    # to supply its *native* picker (Dolphin on KDE, Finder on macOS, the Explorer
+    # shell on Windows) with the full Places sidebar, bookmarks and menus.
+    #
+    # Do not reintroduce `setSidebarUrls()`: that is a Qt-dialog-only API and its
+    # presence silently forces DontUseNativeDialog for the whole dialog, which was
+    # what turned these pickers into a bare Qt list view with no quick folders.
+    # Do not instantiate QFileDialog here either, for the same reason.
     def _pick_file(self, caption: str, start_dir: str = "", filter_str: str = "All Files (*)") -> str:
-        dlg = QFileDialog(self, caption, start_dir, filter_str)
-        dlg.setAcceptMode(QFileDialog.AcceptMode.AcceptOpen)
-        urls = self._default_sidebar_urls()
-        if urls:
-            dlg.setSidebarUrls(urls)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            files = dlg.selectedFiles()
-            return files[0] if files else ""
-        return ""
+        path, _ = QFileDialog.getOpenFileName(self, caption, start_dir, filter_str)
+        return path or ""
 
     def _save_file(self, caption: str, start_file: str, filter_str: str = "") -> str:
-        dlg = QFileDialog(self, caption, start_file, filter_str)
-        dlg.setAcceptMode(QFileDialog.AcceptMode.AcceptSave)
-        urls = self._default_sidebar_urls()
-        if urls:
-            dlg.setSidebarUrls(urls)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            files = dlg.selectedFiles()
-            return files[0] if files else ""
-        return ""
+        path, _ = QFileDialog.getSaveFileName(self, caption, start_file, filter_str)
+        return path or ""
 
     def open_potree_file(self):
         """Open an existing Potree metadata.json / cloud.js, or a COPC (.copc.laz).
@@ -3303,8 +3498,7 @@ class MainWindow(QMainWindow):
         if hasattr(self, "btn_confirm_segmentation"):
             self.btn_confirm_segmentation.setEnabled(False)
             self.btn_confirm_segmentation.setText("Confirm & Stage Split Edits")
-        if hasattr(self, "grp_stand_filter"):
-            self.grp_stand_filter.setVisible(False)
+        if hasattr(self, "list_stand_trees"):
             self.list_stand_trees.clear()
         if hasattr(self, "bar_stand_filter"):
             self.bar_stand_filter.setVisible(True)
@@ -3365,10 +3559,18 @@ class MainWindow(QMainWindow):
             self.chk_ai_full_neighbors.setEnabled(checked)
 
     def _on_full_neighbors_toggled(self, checked: bool):
+        # Neighbour trees only exist when a stand radius is queried, so asking for
+        # full (uncropped) neighbours implies turning neighbours on.
+        if checked and hasattr(self, "chk_tree_neighbors") and not self.chk_tree_neighbors.isChecked():
+            self.chk_tree_neighbors.setChecked(True)
         if hasattr(self, "chk_ai_full_neighbors") and self.chk_ai_full_neighbors.isChecked() != checked:
             self.chk_ai_full_neighbors.blockSignals(True)
             self.chk_ai_full_neighbors.setChecked(checked)
             self.chk_ai_full_neighbors.blockSignals(False)
+        if hasattr(self, "chk_ai_neighbors") and self.chk_ai_neighbors.isChecked() != checked and checked:
+            self.chk_ai_neighbors.blockSignals(True)
+            self.chk_ai_neighbors.setChecked(True)
+            self.chk_ai_neighbors.blockSignals(False)
         self._run_js(f"if (window.setFullNeighbors) window.setFullNeighbors({'true' if checked else 'false'});")
         # Automatically re-render if currently viewing a tree with neighbors
         state = getattr(self, "_tree_view_state", None) or {}
@@ -3388,9 +3590,15 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage(
             "Measure: Ctrl+Click 2 points to measure 3D distance (double-click to clear)" if on else "Measure: off")
 
-    def view_tree_action(self):
+    def view_tree_action(self, single_tree: bool = False):
         """Render the full point set of one tree (queried from the LAS master)
-        as an isolated cloud and switch to the Forestry tab."""
+        as an isolated cloud and switch to the Forestry tab.
+
+        `single_tree=True` ignores the Include Neighbors / Show Ground / Full Neighbors
+        settings and fetches only that tree's own points. Auto review uses it so each
+        step shows exactly one tree, and so the walk does not re-query a whole stand
+        for every ID it visits.
+        """
         itc = int(self.spin_tree_view.value())
         if itc <= 0:
             self.status_bar.showMessage("Set a Tree ID (ITC) first, or Ctrl+Click a tree point.")
@@ -3404,10 +3612,13 @@ class MainWindow(QMainWindow):
         if hasattr(self, "sidebar_tabs"):
             self.sidebar_tabs.setCurrentIndex(1)
 
-        radius = float(self.spin_tree_radius.value()) if (hasattr(self, "chk_tree_neighbors") and self.chk_tree_neighbors.isChecked()) else 0.0
-        n_mode = self.combo_neighbor_mode.currentData() if hasattr(self, "combo_neighbor_mode") else "all"
-        g_rad = float(self.spin_tree_ground.value()) if (hasattr(self, "chk_tree_ground") and self.chk_tree_ground.isChecked()) else 0.0
-        full_neigh = bool(self.chk_full_neighbors.isChecked()) if (hasattr(self, "chk_full_neighbors") and radius > 0) else False
+        if single_tree:
+            radius, n_mode, g_rad, full_neigh = 0.0, "all", 0.0, False
+        else:
+            radius = float(self.spin_tree_radius.value()) if (hasattr(self, "chk_tree_neighbors") and self.chk_tree_neighbors.isChecked()) else 0.0
+            n_mode = self.combo_neighbor_mode.currentData() if hasattr(self, "combo_neighbor_mode") else "all"
+            g_rad = float(self.spin_tree_ground.value()) if (hasattr(self, "chk_tree_ground") and self.chk_tree_ground.isChecked()) else 0.0
+            full_neigh = bool(self.chk_full_neighbors.isChecked()) if (hasattr(self, "chk_full_neighbors") and radius > 0) else False
 
         hint_x = f"{self._last_picked_x}" if (hasattr(self, "_last_picked_itc") and self._last_picked_itc == itc and hasattr(self, "_last_picked_x")) else "null"
         hint_y = f"{self._last_picked_y}" if (hasattr(self, "_last_picked_itc") and self._last_picked_itc == itc and hasattr(self, "_last_picked_y")) else "null"
@@ -3434,43 +3645,42 @@ class MainWindow(QMainWindow):
 
         self._run_js(f"window.viewTreeById({itc}, {hint_x}, {hint_y}, {radius:.1f}, '{n_mode}', {g_rad:.1f}, '/api/get_tree', null, {'true' if full_neigh else 'false'});")
 
-    def view_all_points_action(self):
-        """Bring in all points of the loaded cloud into memory and render them
-        in full density in the Forestry tab, enabling in-memory point selection
-        (box/polygon) and stand filter options across the entire dataset."""
+    def _next_tree_id(self, current: int) -> Optional[int]:
+        """The smallest real tree ID greater than `current`, else the first one.
+
+        Uses the manager's exact tree index so gaps from deleted or merged crowns are
+        skipped rather than queried as empty trees. Returns None when no index exists.
+        """
+        ids = self.manager.get_tree_ids() if hasattr(self.manager, "get_tree_ids") else []
+        if not ids:
+            return None
+        for tid in ids:
+            if tid > current:
+                return tid
+        return ids[0]  # past the last tree: wrap around to the first
+
+    def next_tree_action(self):
+        """Show the tree after the current one, stepping through the tract in ID order."""
         if not self.manager.las_path and self.manager.las_data is None:
-            self.status_bar.showMessage("No LAS/LAZ source file is bound to bring in all points from.")
-            self.lbl_tree_view_status.setText("No LAS/LAZ source file bound. Open a LAS/LAZ or converted dataset with sibling LAS.")
+            self.status_bar.showMessage("No LAS/LAZ source file is bound to step through trees.")
             return
-
-        if hasattr(self, "sidebar_tabs"):
-            self.sidebar_tabs.setCurrentIndex(1)  # Switch to Forestry tab
-
-        self.lbl_tree_view_status.setText("Bringing in all points of the cloud into memory and 3D view...")
-        self.status_bar.showMessage("Loading all points into Forestry tab (full density)...", 8000)
-        QApplication.processEvents()
-
-        # Load LAS into memory if not already in RAM so polygon/box selection has point access
-        if self.manager.las_data is None and self.manager.las_path:
-            try:
-                self.manager.load_las(self.manager.las_path)
-            except Exception as e:
-                self.lbl_tree_view_status.setText(f"Error loading points into RAM: {e}")
-                self.status_bar.showMessage(f"Failed to load points: {e}", 5000)
-                return
-
-        self._tree_view_state = {
-            "itc": 0,
-            "is_all_points": True,
-            "radius": 0.0,
-            "mode": "all",
-            "ground": 0.0,
-            "x": None,
-            "y": None
-        }
-
-        self.btn_extract_tree.setEnabled(True)
-        self._run_js("if (window.viewAllPoints) window.viewAllPoints(); else if (window.viewTreeById) window.viewTreeById(0, null, null, 0, 'all', 0, '/api/get_all_points');")
+        current = int(self.spin_tree_view.value())
+        nxt = self._next_tree_id(current)
+        note = ""
+        if nxt is None:
+            # No exact index yet (still building, or a cloud without ITC): fall back
+            # to the next sequential ID and let the normal "no points" path report it.
+            nxt = current + 1
+            note = (f"Tree index not available yet — trying Tree #{nxt}. "
+                    "It is built in the background just after opening a cloud. ")
+        elif nxt <= current:
+            note = f"Tree #{current} was the last tree — wrapped to Tree #{nxt}. "
+        self.spin_tree_view.setValue(nxt)
+        self.view_tree_action()
+        # view_tree_action writes its own status line, so append the step note after it.
+        if note:
+            self.lbl_tree_view_status.setText(note + self.lbl_tree_view_status.text())
+            self.status_bar.showMessage(note.strip(), 6000)
 
     def segment_tree_action(self):
         """Segment the displayed tree/stand with ForestFormer3D (separate
@@ -3513,14 +3723,14 @@ class MainWindow(QMainWindow):
             "keep_ids": keep_ids,
         }
         status_target = f"Tree #{itc}" if (keep_ids is None or itc in keep_ids) else f"selected stand points near Tree #{itc}"
-        self.lbl_tree_view_status.setText(f"ForestFormer3D segmenting {status_target}... (first run loads the model, ~15 s)")
-        self.status_bar.showMessage(f"ForestFormer3D segmentation running on {status_target} (~10 s)...", 15000)
+        self.lbl_tree_view_status.setText(f"ForestFormer3D touch-up segmenting {status_target}... (first run loads the model, ~15 s)")
+        self.status_bar.showMessage(f"ForestFormer3D touch-up (single cloud) running on {status_target} (~10 s)...", 15000)
 
         # Open activity console so the user sees live steps streaming
         if hasattr(self, "console_panel") and not self.console_panel.isVisible():
             self.toggle_console_panel()
 
-        self.log_console("AI", f"Initiating ForestFormer3D AI segmentation for {status_target} (radius={radius:.0f}m, mode={n_mode})...", level="info")
+        self.log_console("AI", f"Initiating ForestFormer3D touch-up segmentation (single cloud, no tiling) for {status_target} (radius={radius:.0f}m, mode={n_mode})...", level="info")
         if keep_ids:
             self.log_console("STAND", f"Stand Filter active: isolating {len(keep_ids)} selected IDs: {keep_ids}", level="info")
 
@@ -3898,8 +4108,7 @@ class MainWindow(QMainWindow):
                 self.status_bar.showMessage(
                     f"Viewing Tree #{itc} ({t_cnt:,} full-density points){fallback_notice}.", 6000
                 )
-        if hasattr(self, "grp_stand_filter") and n_cnt <= 0 and not is_all_points:
-            self.grp_stand_filter.setVisible(False)
+        if hasattr(self, "list_stand_trees") and n_cnt <= 0 and not is_all_points:
             self.list_stand_trees.clear()
         if hasattr(self, "bar_stand_filter") and n_cnt <= 0 and not is_all_points:
             # Keep the Stand Filter buttons present on the Filter page, just not highlighted
@@ -3914,11 +4123,10 @@ class MainWindow(QMainWindow):
         trees = data.get("trees", [])
         is_all_points = bool(data.get("is_all_points", False) or target_itc == 0)
 
-        if not hasattr(self, "grp_stand_filter"):
+        if not hasattr(self, "list_stand_trees"):
             return
 
         if not is_all_points and ((n_cnt <= 0 and len(trees) <= 1) or not trees):
-            self.grp_stand_filter.setVisible(False)
             self.list_stand_trees.clear()
             if hasattr(self, "bar_stand_filter"):
                 # Buttons stay visible on the Filter page, dimmed until neighbors exist
@@ -3954,7 +4162,14 @@ class MainWindow(QMainWindow):
             self.bar_stand_filter.setVisible(True)
             self._set_stand_filter_buttons_enabled(True)
 
-        self.grp_stand_filter.setVisible(True)
+        if hasattr(self, "bar_stand_filter"):
+            # The pick controls live on the Auto Review sidebar tab, which the Filter
+            # Mode toggle opens. Loading a tree only arms them, so it never yanks the
+            # user off whatever sidebar tab they were using.
+            self._set_stand_filter_buttons_enabled(True)
+            if hasattr(self, "btn_tab_filter"):
+                hint = "Filter Mode to pick neighbours in the 3D view."
+                self.btn_tab_filter.setToolTip(f"{len(trees)} item(s) loaded — {hint}")
         self.lbl_stand_filter_info.setText(info_label)
 
         self.list_stand_trees.blockSignals(True)
@@ -3990,10 +4205,17 @@ class MainWindow(QMainWindow):
             if checked:
                 self.btn_tree_filter_mode.setText("Filter Mode ON")
                 self.status_bar.showMessage("Filter mode active: Ctrl+Click or click neighbor trees in the 3D viewport to toggle selection.", 4000)
+                # Bring the right-hand review panel forward with its tree list.
+                self.open_auto_review_review_tab()
             else:
                 self.btn_tree_filter_mode.setText("Filter Mode")
                 self.status_bar.showMessage("Filter mode deactivated (Ctrl+Click picks single points).", 3000)
         self._run_js(f"if (window.setTreeFilterMode) window.setTreeFilterMode({'true' if checked else 'false'});")
+
+    def open_auto_review(self):
+        """Surface the right-hand panel's Auto Review page and start the walk."""
+        self.open_auto_review_review_tab()
+        self.start_auto_review()
 
     def _on_tree_filter_mode_toggled_from_hud(self, data: dict):
         mode = bool(data.get("filter_mode", False))
@@ -4774,10 +4996,18 @@ class MainWindow(QMainWindow):
         # still be dragged within its 340-450 px range during the session; that
         # choice is no longer persisted. (Older builds stored it under the
         # "splitter" key - deliberately ignored here.)
+        #
+        # The splitter holds three panes: main sidebar, 3D viewport, review panel.
+        # Passing only two sizes would leave the third (review panel) at zero width,
+        # which is invisible and looks like the feature is missing -- always give
+        # every pane a size.
         sidebar = self.splitter.widget(0)
         full = sidebar.maximumWidth()
         total = sum(self.splitter.sizes()) or self.width()
-        self.splitter.setSizes([full, max(total - full, 800)])
+        review = getattr(self, "review_panel", None)
+        review_w = review.maximumWidth() if review is not None else 0
+        # Keep the review panel at its preferred width and give the viewport the rest.
+        self.splitter.setSizes([full, max(total - full - review_w, 400), review_w])
 
     def _wire_settings_persistence(self):
         """Every ribbon setting change schedules a debounced save."""
@@ -4896,7 +5126,9 @@ class MainWindow(QMainWindow):
         self.btn_tab_file.setCheckable(True)
         self.btn_tab_file.setProperty("class", "ribbonCategoryTab")
 
-        self.btn_tab_point = QPushButton("Point")
+        # Labelled "Appearance": this page is the look of the cloud (shape, size, colour,
+        # LOD/EDL), not point editing. The attribute/block id stay `btn_tab_point` / 1.
+        self.btn_tab_point = QPushButton("Appearance")
         self.btn_tab_point.setCheckable(True)
         self.btn_tab_point.setChecked(True)
         self.btn_tab_point.setProperty("class", "ribbonCategoryTab")
@@ -4937,11 +5169,14 @@ class MainWindow(QMainWindow):
         h_tabs.addWidget(self.btn_tab_file)
         h_tabs.addWidget(self.btn_tab_point)
         h_tabs.addWidget(self.btn_tab_layers)
-        h_tabs.addWidget(self.btn_tab_settings)
+        # Filter and AI sit next to the editing tabs; Settings is pushed to the far
+        # right corner of the bar so it reads as app-wide configuration, apart from
+        # the per-dataset tools.
         h_tabs.addWidget(self.btn_tab_filter)
         h_tabs.addWidget(self.btn_tab_ai)
         h_tabs.addWidget(self.btn_tab_segmentation)
         h_tabs.addStretch()
+        h_tabs.addWidget(self.btn_tab_settings)
 
         v_main.addWidget(category_bar)
 
@@ -4963,7 +5198,7 @@ class MainWindow(QMainWindow):
         self.ribbon_stack.addWidget(page_layers)     # Index 2
         self.ribbon_stack.addWidget(page_settings)   # Index 3
         self.ribbon_stack.addWidget(page_filter)     # Index 4 (Stand Filter)
-        self.ribbon_stack.addWidget(page_ai)         # Index 5 (AI Segmentation Toolset)
+        self.ribbon_stack.addWidget(page_ai)         # Index 5 (Touch-up: single-cloud AI)
         self.ribbon_stack.addWidget(page_segmentation)  # Index 6 (Full ForestFormer3D pipeline)
 
         self.ribbon_tab_group.idClicked.connect(self._on_ribbon_category_clicked)
@@ -5506,7 +5741,7 @@ class MainWindow(QMainWindow):
         h_layout.setContentsMargins(8, 6, 8, 6)
         h_layout.setSpacing(8)
 
-        # Stand Filter Group (moved from the ribbon category row top bar)
+        # --- Group 1: Stand Filter (mode toggle + apply/reset, moved from the tab row)
         grp_filter = QFrame()
         grp_filter.setProperty("class", "ribbonGroup")
         grp_filter.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
@@ -5520,7 +5755,7 @@ class MainWindow(QMainWindow):
         h_sfb.setSpacing(6)
 
         # Info label kept alive for status updates, but not shown in the ribbon
-        self.lbl_top_stand_info = QLabel("🌲 Stand: Tree #- (0 neighbors)")
+        self.lbl_top_stand_info = QLabel("Stand: Tree #- (0 neighbors)")
 
         # Mode toggle (moved here from the Forestry sidebar group)
         self.btn_tree_filter_mode = QPushButton("Filter Mode")
@@ -5557,10 +5792,14 @@ class MainWindow(QMainWindow):
         v_filter_grp.addWidget(lbl_filter)
 
         h_layout.addWidget(grp_filter)
+
+        # Neighbour Trees moved to its own sidebar tab (see create_auto_review_tab):
+        # a long scrollable tree list needs full sidebar height, which the 92px ribbon
+        # page cannot give it.
         h_layout.addStretch()
         return page
 
-    # Category 6: AI Page (shown under the ribbon "AI" menu)
+    # Category 6: Touch-up Page (shown under the ribbon "AI" menu)
     def _create_ribbon_ai_page(self) -> QWidget:
         page = QFrame()
         page.setFixedHeight(92)
@@ -5568,7 +5807,7 @@ class MainWindow(QMainWindow):
         h_layout.setContentsMargins(8, 6, 8, 6)
         h_layout.setSpacing(8)
 
-        # 1. AI Segmentation Toolset Group
+        # 1. Touch-up Group (single-cloud ForestFormer3D pass on the tree/stand in view)
         grp_ai = QFrame()
         grp_ai.setProperty("class", "ribbonGroup")
         grp_ai.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
@@ -5601,11 +5840,22 @@ class MainWindow(QMainWindow):
         btn_ai_view.clicked.connect(self.view_tree_action)
         h_ai.addWidget(btn_ai_view)
 
+        self.btn_ai_auto_review = QPushButton("Auto Review")
+        self.btn_ai_auto_review.setProperty("class", "ribbonToolBtn")
+        self.btn_ai_auto_review.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_ai_auto_review.setToolTip(
+            "Open the Auto Review sidebar and walk every tree in the cloud one by one")
+        self.btn_ai_auto_review.clicked.connect(self.open_auto_review)
+        h_ai.addWidget(self.btn_ai_auto_review)
+
         self.btn_segment_tree = QPushButton("Segment (ForestFormer3D)")
         self.btn_segment_tree.setProperty("class", "ribbonToolBtn")
         self.btn_segment_tree.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_segment_tree.setStyleSheet("font-weight: 600;")
-        self.btn_segment_tree.setToolTip("Run ForestFormer3D deep learning instance segmentation to split merged trees")
+        self.btn_segment_tree.setToolTip(
+            "Single-cloud ForestFormer3D pass over just the selected tree/stand in view "
+            "(no tiling) — for correcting merged or mis-split crowns. Use the "
+            "Segmentation tab for whole-cloud / tiled-tract runs.")
         self.btn_segment_tree.clicked.connect(self.segment_tree_action)
         h_ai.addWidget(self.btn_segment_tree)
 
@@ -5638,9 +5888,11 @@ class MainWindow(QMainWindow):
         v_ai.addLayout(h_ai)
         v_ai.addStretch()
 
-        lbl_ai_title = QLabel("AI SEGMENTATION TOOLSET")
+        lbl_ai_title = QLabel("TOUCH-UP")
         lbl_ai_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lbl_ai_title.setProperty("class", "ribbonTitle")
+        lbl_ai_title.setToolTip("Single-cloud segmentation of the tree/stand in view — "
+                               "runs one ForestFormer3D pass, never the tiled-tract pipeline")
         v_ai.addWidget(lbl_ai_title)
         h_layout.addWidget(grp_ai)
 
@@ -5656,6 +5908,9 @@ class MainWindow(QMainWindow):
         h_stand.setSpacing(6)
 
         self.chk_ai_neighbors = QCheckBox("Neighbors")
+        # Off by default: opening a tree queries just that tree. Ticking this (or
+        # "Full Neighbors" on the Forestry tab) brings the surrounding stand in.
+        self.chk_ai_neighbors.setChecked(False)
         self.chk_ai_neighbors.setStyleSheet("color: #e2e8f0; font-size: 11px; font-weight: 500;")
         self.chk_ai_neighbors.setCursor(Qt.CursorShape.PointingHandCursor)
         self.chk_ai_neighbors.toggled.connect(self._on_ai_neighbors_toggled)
@@ -5667,7 +5922,7 @@ class MainWindow(QMainWindow):
         self.spin_ai_radius.setSingleStep(5.0)
         self.spin_ai_radius.setSuffix(" m")
         self.spin_ai_radius.setStyleSheet("font-size: 11px; padding: 2px 4px; max-width: 60px;")
-        self.spin_ai_radius.setEnabled(False)
+        self.spin_ai_radius.setEnabled(False)  # matches the unchecked Neighbors default
         self.spin_ai_radius.valueChanged.connect(self._on_ai_radius_changed)
         h_stand.addWidget(self.spin_ai_radius)
 
@@ -5675,6 +5930,8 @@ class MainWindow(QMainWindow):
         self.chk_ai_full_neighbors.setToolTip("Full uncropped neighbor trees")
         self.chk_ai_full_neighbors.setStyleSheet("color: #38bdf8; font-size: 11px; font-weight: 500;")
         self.chk_ai_full_neighbors.setCursor(Qt.CursorShape.PointingHandCursor)
+        # Mirrors chk_full_neighbors, which is unchecked by default.
+        self.chk_ai_full_neighbors.setChecked(False)
         self.chk_ai_full_neighbors.setEnabled(False)
         self.chk_ai_full_neighbors.toggled.connect(self._on_ai_full_neighbors_toggled)
         h_stand.addWidget(self.chk_ai_full_neighbors)
@@ -5728,27 +5985,34 @@ class MainWindow(QMainWindow):
         h_layout.setSpacing(8)
 
         def _lbl(text):
+            # ribbonLabel rather than an inline stylesheet: an inline font-size:11px
+            # overrides the stylesheet and its line box is taller than the metric the
+            # ribbon's fixed 92px page is budgeted for, which overflowed the group card.
             l = QLabel(text)
-            l.setStyleSheet("color: #94a3b8; font-size: 11px;")
+            l.setProperty("class", "ribbonLabel")
             return l
 
         def _spin(minv, maxv, val, step=1.0, suffix="", width=62):
             s = QDoubleSpinBox()
+            # ribbonSpin caps the height at 22px; the untyped global spin/line-edit rule
+            # renders at 33px, which overflowed the fixed-height ribbon groups.
+            s.setProperty("class", "ribbonSpin")
             s.setRange(minv, maxv)
             s.setValue(val)
             s.setSingleStep(step)
             s.setDecimals(2 if step < 1 else 1)
             if suffix:
                 s.setSuffix(suffix)
-            s.setStyleSheet(f"font-size: 11px; padding: 2px 4px; max-width: {width}px;")
+            s.setMinimumWidth(width - 12)
             s.valueChanged.connect(self._schedule_save_settings)
             return s
 
         def _ispin(minv, maxv, val, width=50):
             s = QSpinBox()
+            s.setProperty("class", "ribbonSpin")
             s.setRange(minv, maxv)
             s.setValue(val)
-            s.setStyleSheet(f"font-size: 11px; padding: 2px 4px; max-width: {width}px;")
+            s.setMinimumWidth(width - 12)
             s.valueChanged.connect(self._schedule_save_settings)
             return s
 
@@ -5775,7 +6039,7 @@ class MainWindow(QMainWindow):
         self.seg_edit_input.setPlaceholderText("Point cloud (LAS/LAZ)...")
         self.seg_edit_input.setReadOnly(True)
         self.seg_edit_input.setMinimumWidth(210)
-        self.seg_edit_input.setStyleSheet("font-size: 11px; padding: 3px 6px;")
+        self.seg_edit_input.setProperty("class", "ribbonEdit")
         btn_seg_browse = QPushButton("Browse...")
         btn_seg_browse.setProperty("class", "ribbonToolBtn")
         btn_seg_browse.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -5793,7 +6057,7 @@ class MainWindow(QMainWindow):
         row_mode.setSpacing(4)
         row_mode.addWidget(_lbl("Pipeline:"))
         self.combo_seg_mode = QComboBox()
-        self.combo_seg_mode.setStyleSheet("font-size: 11px; padding: 2px 6px;")
+        self.combo_seg_mode.setProperty("class", "ribbonCombo")
         self.combo_seg_mode.addItem("Tiled Tract (tiles + merge + seam stitch)", "tract")
         self.combo_seg_mode.addItem("Single Cloud (one cylinder pass)", "single")
         self.combo_seg_mode.currentIndexChanged.connect(self._schedule_save_settings)
@@ -6387,11 +6651,11 @@ class MainWindow(QMainWindow):
         self.set_color_mode(attr)
 
     def _sync_viewer_render_widgets(self, info):
-        """Mirror the scene-wide half of a render mode into the Point tab.
+        """Mirror the scene-wide half of a render mode into the Appearance tab.
 
         Budget, minimum node size, splat quality and EDL belong to the viewer rather
         than to a layer, so the per-layer sync cannot reach them.  Without this the
-        Settings combo says Quality while the Point tab still reads 2.5 M / 10 px.
+        Settings combo says Quality while the Appearance tab still reads 2.5 M / 10 px.
         """
         for name, key in (("ribbon_combo_budget", "pointBudget"),
                           ("ribbon_combo_node", "minNodeSize"),
@@ -6413,7 +6677,7 @@ class MainWindow(QMainWindow):
     def _on_ribbon_render_mode_changed(self):
         """Performance / Balanced / Quality, applied to every layer at once.
 
-        The viewer hands back the layer list, so the Point tab's shape, sizing and size
+        The viewer hands back the layer list, so the Appearance tab's shape, sizing and size
         widgets land on the new mode's values; a second read pulls the scene-wide half
         (budget, node size, splat quality, EDL) so nothing in the ribbon is left stale.
         """

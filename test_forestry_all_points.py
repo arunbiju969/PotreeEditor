@@ -73,10 +73,82 @@ class TestForestryAllPoints(unittest.TestCase):
     def tearDown(self):
         self.win._run_js = self.win._orig_run_js
 
-    def test_btn_bring_all_points_exists(self):
-        """Verify the Bring in All Points button exists in Forestry tab."""
-        self.assertTrue(hasattr(self.win, "btn_bring_all_points"))
-        self.assertIn("All Points", self.win.btn_bring_all_points.text())
+    def test_bring_all_points_button_removed(self):
+        """The "Bring in All Points (Full Cloud)" button was removed from the Forestry tab.
+
+        The backend capability (/api/get_all_points + manager.get_all_points) is still
+        exercised by the tests below; only the UI entry point is gone.
+        """
+        self.assertFalse(hasattr(self.win, "btn_bring_all_points"))
+        self.assertFalse(hasattr(self.win, "view_all_points_action"))
+
+    def test_next_tree_button_advances_to_next_existing_id(self):
+        """Next Tree steps to the next real ITC, skipping gaps, and wraps at the end."""
+        self.assertTrue(hasattr(self.win, "btn_next_tree"))
+        self.assertIn("Next Tree", self.win.btn_next_tree.text())
+
+        original_index = self.mgr._tree_index
+        try:
+            # Deliberate gaps: 10 -> 20 -> 45 (30 is absent).
+            self.mgr._tree_index = {10: [0], 20: [1], 45: [2]}
+
+            self.win.spin_tree_view.setValue(10)
+            self.win.next_tree_action()
+            self.assertEqual(self.win.spin_tree_view.value(), 20)
+
+            self.win.next_tree_action()
+            self.assertEqual(self.win.spin_tree_view.value(), 45, "must skip the missing ID 30")
+
+            # Past the last tree it wraps back to the first.
+            self.win.next_tree_action()
+            self.assertEqual(self.win.spin_tree_view.value(), 10)
+            self.assertIn("wrapped", self.win.lbl_tree_view_status.text().lower())
+        finally:
+            self.mgr._tree_index = original_index
+
+    def test_auto_review_visits_every_tree_as_a_single_tree(self):
+        """Auto review walks 1..N and asks for one tree at a time, never its stand.
+
+        Regression: auto mode used to route through view_tree_action() with the
+        Include Neighbors setting still applied, so every step rendered the
+        surrounding neighbour trees instead of the tree being reviewed.
+        """
+        original_index = self.mgr._tree_index
+        original_neighbors = self.win.chk_tree_neighbors.isChecked()
+        try:
+            self.mgr._tree_index = {1: [0], 2: [1], 3: [2], 4: [3]}
+            # Neighbours ON: auto mode must ignore this and still ask for one tree.
+            self.win.chk_tree_neighbors.setChecked(True)
+            self.win._js_calls.clear()
+
+            self.win.start_auto_review()
+            self.assertTrue(self.win._auto_active)
+            self.assertEqual(self.win.spin_tree_view.value(), 1, "a run starts at the first tree")
+
+            # Drive the walk to completion without waiting on the timer.
+            for _ in range(10):
+                if not self.win._auto_active:
+                    break
+                self.win._auto_timer.stop()
+                self.win._auto_step()
+
+            self.assertFalse(self.win._auto_active, "walk should finish at the last tree")
+            self.assertEqual(self.win.spin_tree_view.value(), 4)
+            self.assertIn("Finished", self.win.lbl_auto_status.text())
+
+            calls = [c for c in self.win._js_calls if "viewTreeById" in c]
+            self.assertEqual(len(calls), 4, f"expected one view per tree, got {calls}")
+            for expected_itc, call in zip((1, 2, 3, 4), calls):
+                self.assertIn(f"viewTreeById({expected_itc},", call)
+                # radius 0 + ground 0 + full=false => just this tree's own points.
+                self.assertIn(", 0.0, 'all', 0.0,", call,
+                              f"tree #{expected_itc} was queried with a stand radius: {call}")
+                self.assertTrue(call.rstrip().endswith("false);"), f"full neighbours leaked: {call}")
+        finally:
+            self.mgr._tree_index = original_index
+            self.win.chk_tree_neighbors.setChecked(original_neighbors)
+            if self.win._auto_active:
+                self.win.stop_auto_review()
 
     def test_get_all_points_manager(self):
         """Verify get_all_points retrieves full point cloud payload with correct structure."""
@@ -111,15 +183,6 @@ class TestForestryAllPoints(unittest.TestCase):
         self.assertGreater(poly_res["count"], 0)
         self.assertIn(10, poly_res["itc_values"])
 
-    def test_view_all_points_action(self):
-        """Verify view_all_points_action switches to Forestry tab and triggers JS viewAllPoints."""
-        self.win.sidebar_tabs.setCurrentIndex(0)  # On Layers tab
-        self.win.view_all_points_action()
-        self.assertEqual(self.win.sidebar_tabs.currentIndex(), 1)  # Switched to Forestry
-        self.assertTrue(any("viewAllPoints" in c for c in self.win._js_calls))
-        self.assertEqual(self.win._tree_view_state.get("is_all_points"), True)
-        self.assertTrue(self.win.btn_extract_tree.isEnabled())
-
     def test_stand_loaded_all_points_populates_list_and_enables_filter(self):
         """Verify tree_stand_loaded with is_all_points=True shows Stand Filter and lists all trees."""
         self.win.sidebar_tabs.setCurrentIndex(1)  # Forestry tab
@@ -138,7 +201,10 @@ class TestForestryAllPoints(unittest.TestCase):
             ]
         }
         self.win.signaler.tree_stand_loaded.emit(data)
-        self.assertFalse(self.win.grp_stand_filter.isHidden())
+        # The pick controls live on the ribbon Filter page now, not in the sidebar:
+        # the card stays hidden while the list is populated and the toolbar arms.
+        self.assertTrue(self.win.review_panel.isAncestorOf(self.win.list_stand_trees))
+        self.assertTrue(self.win.btn_tree_filter_mode.isEnabled())
         self.assertEqual(self.win.list_stand_trees.count(), 4)
         self.assertIn("All Points", self.win.lbl_top_stand_info.text())
 

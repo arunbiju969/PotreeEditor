@@ -82,6 +82,18 @@ class PointCloudManager:
             "last_event": getattr(self, "_last_indexing_event", None)
         }
 
+    def get_tree_ids(self) -> List[int]:
+        """Ascending list of the ITC/tree IDs present in the loaded cloud.
+
+        Sourced from the exact tree index. Tree IDs are not always contiguous
+        (deleted or merged crowns leave gaps), so callers that step through trees
+        should prefer this over `id + 1`. Empty when the index is not built yet.
+        """
+        with self._lock:
+            if self._tree_index:
+                return sorted(self._tree_index.keys())
+        return []
+
     @property
     def xyz(self) -> Optional[np.ndarray]:
         """Backward-compatible on-demand coordinate array. Not stored permanently in RAM."""

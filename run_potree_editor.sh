@@ -30,4 +30,20 @@ export MPLCONFIGDIR="${MPLCONFIGDIR:-$PWD/.mplcache}"
 # to native Wayland.
 export QT_QPA_PLATFORM=xcb
 
+# KDE theme + native file dialogs (Linux). PyQt6 bundles its own Qt and only
+# searches its private plugin dir, which ships GTK/portal themes but NOT
+# KDEPlasmaPlatformTheme6.so. Without the system plugin path Qt falls back to
+# the Fusion style and draws its own file picker with no Places/quick folders.
+# Adding the distro dir lets Qt load the real KDE theme, so Open/Save use
+# Dolphin's native picker (with bookmarks, Recent, Devices). Harmless when the
+# directory is absent (non-KDE desktops, Windows/macOS); override by exporting
+# POTREEEDITOR_KEEP_QT_PLUGINS=1 before launching.
+if [ "${POTREEEDITOR_KEEP_QT_PLUGINS:-0}" != "1" ]; then
+    for _qt6_dir in /usr/lib/qt6/plugins /usr/lib/x86_64-linux-gnu/qt6/plugins; do
+        if [ -d "$_qt6_dir" ]; then
+            export QT_PLUGIN_PATH="${QT_PLUGIN_PATH:+$QT_PLUGIN_PATH:}$_qt6_dir"
+        fi
+    done
+fi
+
 exec .venv/bin/python main.py "$@"

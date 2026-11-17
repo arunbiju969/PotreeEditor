@@ -1649,12 +1649,15 @@ if (btnQuickNoise) {
 // A mode is a scene-wide change: it restyles every layer and becomes the starting style
 // for the next cloud opened.  Mixing one layer in Quality with another in Performance
 // reads as a rendering glitch rather than a deliberate choice.
+// Quality deliberately uses round CIRCLE points rather than PARABOLOID splats: the
+// paraboloid depth-correction disc reads as faceted "diamond" points at the small
+// FIXED sizes Quality uses, and HQ splatting is handled separately by splatQuality.
 const RENDER_MODES = {
     performance: { pointType: 'SQUARE', pointSizeType: 'ADAPTIVE', pointSize: 1.0,
                    splatQuality: 'standard', pointBudget: 2_500_000, minNodeSize: 10 },
     balanced: { pointType: 'CIRCLE', pointSizeType: 'ADAPTIVE', pointSize: 0.8,
                 splatQuality: 'standard', pointBudget: 5_000_000, minNodeSize: 10 },
-    quality: { pointType: 'PARABOLOID', pointSizeType: 'FIXED', pointSize: 0.45,
+    quality: { pointType: 'CIRCLE', pointSizeType: 'FIXED', pointSize: 0.45,
                splatQuality: 'standard', pointBudget: 15_000_000, minNodeSize: 5 }
 };
 
@@ -3045,6 +3048,8 @@ window.invalidateTreeCache = function (itcValue) {
     console.log(`[PotreeHybrid] Invalidated treeBufferCache for Tree #${num}`);
 };
 
+// Neighbour trees are opt-in, matching the Forestry tab's "Include Neighbors"
+// checkbox (off by default); this default applies only when no explicit value is sent.
 let treeFullNeighborsDefault = false;
 window.setFullNeighbors = function (enabled) {
     treeFullNeighborsDefault = Boolean(enabled);
