@@ -66,6 +66,7 @@ class BridgeSignaler(QObject):
     segmentation_step = pyqtSignal(dict)
     console_log = pyqtSignal(dict)
     measurement_completed = pyqtSignal(dict)
+    crown_map_toggled = pyqtSignal(dict)
 
 
 class CommitWorker(QThread):
@@ -166,6 +167,54 @@ class SegmentationWorker(QThread):
                 self.finished.emit({"stopped": True, "elapsed_seconds": time.time() - t0, "mode": self.mode})
             else:
                 self.error.emit(str(e))
+
+
+class CrownExtractionWorker(QThread):
+    """Runs semantic-guided crown polygon extraction off the GUI thread."""
+    progress = pyqtSignal(int, str)
+    finished = pyqtSignal(dict)
+    error = pyqtSignal(str)
+    cancelled = pyqtSignal()
+
+    def __init__(self, las_path: Optional[str], las_data: Any = None, *,
+                 semantic_mode: str = "leaf", method: str = "concave",
+                 alpha: float = 1.5, min_points: int = 15,
+                 simplify_tol: float = 0.15):
+        super().__init__()
+        self.las_path = las_path
+        self.las_data = las_data
+        self.semantic_mode = semantic_mode
+        self.method = method
+        self.alpha = alpha
+        self.min_points = min_points
+        self.simplify_tol = simplify_tol
+        self._cancel_event = threading.Event()
+
+    def stop(self):
+        self._cancel_event.set()
+
+    def run(self):
+        from crown_extractor import CrownExtractionCancelled, extract_crowns_from_las
+        try:
+            res = extract_crowns_from_las(
+                self.las_path,
+                las_data=self.las_data,
+                semantic_mode=self.semantic_mode,
+                method=self.method,
+                alpha=self.alpha,
+                min_points=self.min_points,
+                simplify_tol=self.simplify_tol,
+                progress_cb=lambda pct, msg: self.progress.emit(int(pct), str(msg)),
+                cancel_check=self._cancel_event.is_set,
+            )
+            if self._cancel_event.is_set():
+                self.cancelled.emit()
+            else:
+                self.finished.emit(res)
+        except CrownExtractionCancelled:
+            self.cancelled.emit()
+        except Exception as e:
+            self.error.emit(str(e))
 
 
 class ConfirmSplitDialog(QDialog):
@@ -476,6 +525,9 @@ class MainWindow(QMainWindow):
         self._seg_timer = QTimer(self)
         self._seg_timer.setInterval(1200)
         self._seg_timer.timeout.connect(self._on_seg_tick)
+        # Crown Extraction tab state
+        self.crown_worker: Optional[CrownExtractionWorker] = None
+        self._crown_result: Optional[Dict[str, Any]] = None
         self.commit_dialog: Optional[QProgressDialog] = None
         self.commit_worker: Optional[CommitWorker] = None
         self.conversion_dialog: Optional[ConversionDialog] = None
@@ -507,6 +559,7 @@ class MainWindow(QMainWindow):
         self.signaler.indexing_event.connect(self.on_indexing_event)
         self.signaler.segmentation_step.connect(self._on_segmentation_step)
         self.signaler.console_log.connect(self._on_console_log_event)
+        self.signaler.crown_map_toggled.connect(self._on_crown_map_toggled_from_web)
 
         # Wire server events to Qt signals (thread-safe UI updates)
         self.server.on_event(self._on_server_event)
@@ -648,6 +701,8 @@ class MainWindow(QMainWindow):
             self.signaler.segmentation_step.emit(data)
         elif event_name == "console_log":
             self.signaler.console_log.emit(data)
+        elif event_name == "crown_map_toggled":
+            self.signaler.crown_map_toggled.emit(data)
         elif event_name in ("measurement_completed", "measure_completed", "measurement"):
             self.signaler.measurement_completed.emit(data)
             msg = data.get("msg", "")
@@ -1683,6 +1738,21 @@ class MainWindow(QMainWindow):
         act_clear_staged.triggered.connect(self.clear_all_staged_edits)
         menu_edit.addAction(act_clear_staged)
 
+        # 3. Crown Menu
+        menu_crown = menubar.addMenu("&Crown")
+
+        act_crown_extract = QAction("Crown Extraction", self)
+        act_crown_extract.triggered.connect(self.run_crown_extraction_action)
+        menu_crown.addAction(act_crown_extract)
+
+        act_crown_clear = QAction("Clear Crown Polygons", self)
+        act_crown_clear.triggered.connect(lambda: self.clear_crown_polygons_action(silent=False))
+        menu_crown.addAction(act_crown_clear)
+
+        act_crown_export = QAction("Export Crown Polygons...", self)
+        act_crown_export.triggered.connect(self.export_crown_polygons_action)
+        menu_crown.addAction(act_crown_export)
+
     # -------------------------------------------------------------------------
     # Sidebar Construction
     # -------------------------------------------------------------------------
@@ -1729,8 +1799,13 @@ class MainWindow(QMainWindow):
             return
         ids = self.manager.get_tree_ids() if hasattr(self.manager, "get_tree_ids") else []
         if not ids:
-            self.status_bar.showMessage(
-                "Tree index not ready yet — it builds in the background just after opening a cloud.", 6000)
+            has_itc = bool((self.manager.header_info or {}).get("has_itc", False))
+            if not has_itc:
+                self.status_bar.showMessage(
+                    "Auto review requires an ITC segmented cloud (none found).", 6000)
+            else:
+                self.status_bar.showMessage(
+                    "Tree index not ready yet — it builds in the background just after opening a cloud.", 6000)
             return
         self._auto_active = True
         self._auto_total = len(ids)
@@ -2184,11 +2259,23 @@ class MainWindow(QMainWindow):
         h_tools.addStretch()
         v_tree.addLayout(h_tools)
 
+        self.btn_view_all_points = QPushButton("View Entire Cloud (All Points)")
+        self.btn_view_all_points.setObjectName("btnPrimary")
+        self.btn_view_all_points.setStyleSheet("padding: 5px 10px; font-size: 11px; font-weight: 600;")
+        self.btn_view_all_points.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_view_all_points.setToolTip(
+            "Stream and render all points of the current cloud directly into the 3D viewport\n"
+            "(works on any LAS/LAZ file, with or without ITC tree segmentation)"
+        )
+        self.btn_view_all_points.clicked.connect(self.view_all_points_action)
+        v_tree.addWidget(self.btn_view_all_points)
+
         btn_view_tree = QPushButton("View Tree (All Points)")
         btn_view_tree.setObjectName("btnSuccess")
         btn_view_tree.setStyleSheet("padding: 5px 10px; font-size: 11px; font-weight: 600;")
         btn_view_tree.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_view_tree.clicked.connect(self.view_tree_action)
+        self.btn_view_tree = btn_view_tree
         v_tree.addWidget(btn_view_tree)
 
         # Step through the tract one tree at a time: advance the Tree ID to the next
@@ -2782,8 +2869,12 @@ class MainWindow(QMainWindow):
 
     def open_potree_path(self, file_path: str):
         """Programmatic half of open_potree_file — usable from CLI auto-load too."""
-        folder = os.path.dirname(os.path.abspath(file_path))
         entry_file = os.path.basename(file_path)
+        if entry_file.lower().endswith((".las", ".laz")) and not entry_file.lower().endswith(".copc.laz"):
+            self.open_las_path(file_path)
+            return
+
+        folder = os.path.dirname(os.path.abspath(file_path))
         self.current_potree_dir = folder
         if self.manager:
             self.manager.potree_dir = folder
@@ -2897,31 +2988,83 @@ class MainWindow(QMainWindow):
             self.server.register_pointcloud_dir(alias, converted_dir)
             url = f"http://127.0.0.1:{self.server.port}/clouds/{alias}/{entry_file}"
             self.load_url_in_potree(url, os.path.basename(converted_dir))
-        elif offer_conversion:
-            reply = QMessageBox.question(
-                self,
-                "Convert Point Cloud for Potree?",
-                f"To stream '{os.path.basename(las_path)}' with Potree's LOD octree, it needs conversion.\n\n"
-                f"Would you like to convert it now using PotreeConverter?\n"
-                f"(Output: {converted_dir})",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        else:
+            total_pts = (getattr(self.manager, "header_info", None) or {}).get("total_points", 0)
+            if offer_conversion:
+                msg_box = QMessageBox(self)
+                msg_box.setWindowTitle("Open Point Cloud")
+                msg_box.setIcon(QMessageBox.Icon.Question)
+                msg_box.setText(f"How would you like to open '{os.path.basename(las_path)}'?")
+                pts_str = f" ({total_pts:,} points)" if total_pts else ""
+                msg_box.setInformativeText(
+                    f"This point cloud{pts_str} does not have a pre-built Potree octree.\n\n"
+                    "• Convert to Octree (LOD Streaming): Runs PotreeConverter to build multi-resolution LOD tiles on disk (recommended for large 15M+ point clouds).\n\n"
+                    "• Open Directly (Fast View): Streams points directly into the 3D viewport in seconds (recommended for clips, stands, and clouds up to ~15M points)."
+                )
+                btn_convert = msg_box.addButton("Convert to Octree (LOD)", QMessageBox.ButtonRole.AcceptRole)
+                btn_direct = msg_box.addButton("Open Directly (Fast View)", QMessageBox.ButtonRole.ActionRole)
+                msg_box.addButton(QMessageBox.StandardButton.Cancel)
+                if total_pts and total_pts > 10_000_000:
+                    msg_box.setDefaultButton(btn_convert)
+                else:
+                    msg_box.setDefaultButton(btn_direct)
+                msg_box.exec()
+                clicked = msg_box.clickedButton()
+                if clicked == btn_convert:
+                    self.start_conversion(las_path, converted_dir)
+                elif clicked == btn_direct:
+                    self.load_las_for_editing(las_path)
+                    self.view_all_points_action()
+            elif 0 < total_pts <= 15_000_000:
+                self.load_las_for_editing(las_path)
+                self.view_all_points_action()
+            else:
+                reply = QMessageBox.question(
+                    self,
+                    "Convert Point Cloud for Potree?",
+                    f"'{os.path.basename(las_path)}' has {total_pts:,} points.\n"
+                    f"To stream it smoothly with Potree's LOD octree, it needs conversion.\n\n"
+                    f"Would you like to convert it now using PotreeConverter?\n"
+                    f"(Output: {converted_dir})",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                )
+                if reply == QMessageBox.StandardButton.Yes:
+                    self.start_conversion(las_path, converted_dir)
+                else:
+                    self.load_las_for_editing(las_path)
+                    self.view_all_points_action()
+
+    def _update_non_itc_status_banner(self, has_itc: bool):
+        """Update Forestry tab status prompt based on whether ITC segmentation is present."""
+        if not hasattr(self, "lbl_tree_view_status"):
+            return
+        if has_itc:
+            self.lbl_tree_view_status.setText(
+                "Ctrl+Click a tree point or enter Tree ID to view in full density."
             )
-            if reply == QMessageBox.StandardButton.Yes:
-                self.start_conversion(las_path, converted_dir)
+        else:
+            self.lbl_tree_view_status.setText(
+                "Cloud has no ITC tree segmentation. Click 'View Entire Cloud' to view points, or run ForestFormer3D in the Segmentation tab."
+            )
 
     def load_las_header_only(self, las_path: str):
         """Instantly read metadata header without loading heavy point arrays into RAM."""
         try:
+            prev_path = os.path.abspath(self.current_las_path) if self.current_las_path else None
             info = self.manager.load_las_header(las_path)
             self.current_las_path = las_path
             self._attach_workspace(las_path)
-            itc_status = "Yes (Available)" if info.get("has_itc") else "Will be added on commit"
+            if prev_path and prev_path != os.path.abspath(las_path):
+                self.clear_crown_polygons_action(silent=True)
+            has_itc = bool(info.get("has_itc"))
+            itc_status = "Yes (Available)" if has_itc else "No (Not segmented)"
             self.lbl_cloud_info.setText(
                 f"<b>File:</b> {info['filename']}<br>"
                 f"<b>Points:</b> {info['total_points']:,} (Streaming LOD)<br>"
                 f"<b>ITC Field:</b> {itc_status}<br>"
                 f"<b>Mode:</b> Optimistic Visual Staging"
             )
+            self._update_non_itc_status_banner(has_itc)
             if hasattr(self, "lbl_layer_cloud_name"):
                 self.lbl_layer_cloud_name.setText(info['filename'])
             if hasattr(self, "lbl_layer_cloud_pts"):
@@ -2936,15 +3079,20 @@ class MainWindow(QMainWindow):
     def load_las_for_editing(self, las_path: str):
         """Full in-memory load for smaller clouds."""
         try:
+            prev_path = os.path.abspath(self.current_las_path) if self.current_las_path else None
             info = self.manager.load_las(las_path)
             self.current_las_path = las_path
             self._attach_workspace(las_path)
+            if prev_path and prev_path != os.path.abspath(las_path):
+                self.clear_crown_polygons_action(silent=True)
+            has_itc = bool(info.get("has_itc"))
             self.lbl_cloud_info.setText(
                 f"<b>File:</b> {info['filename']}<br>"
                 f"<b>Points:</b> {info['total_points']:,}<br>"
                 f"<b>Classes:</b> {info.get('classes', [])}<br>"
-                f"<b>Has ITC Field:</b> {'Yes' if info.get('has_itc') else 'No (auto-created)'}"
+                f"<b>Has ITC Field:</b> {'Yes' if has_itc else 'No (Not segmented)'}"
             )
+            self._update_non_itc_status_banner(has_itc)
             if hasattr(self, "lbl_layer_cloud_name"):
                 self.lbl_layer_cloud_name.setText(info['filename'])
             if hasattr(self, "lbl_layer_cloud_pts"):
@@ -3193,7 +3341,8 @@ class MainWindow(QMainWindow):
                 cur_tree_sel = combo_tree.currentData() or "auto"
                 combo_tree.clear()
                 combo_tree.addItem("Match Main Layer (Auto)", "auto")
-                combo_tree.addItem("Tree / ITC (Segmented Stand)", "itc")
+                if any(a in sorted_attrs for a in ("itc", "tree_id", "treeID")):
+                    combo_tree.addItem("Tree / ITC (Segmented Stand)", "itc")
                 combo_tree.addItem("Natural Foliage Green", "green")
                 combo_tree.addItem("Viridis Heatmap", "viridis")
                 for a in sorted_attrs:
@@ -3590,6 +3739,33 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage(
             "Measure: Ctrl+Click 2 points to measure 3D distance (double-click to clear)" if on else "Measure: off")
 
+    def _has_itc_segmentation(self) -> bool:
+        """Return True if the active cloud has an ITC/tree ID attribute or discovered tree IDs."""
+        if not self.manager:
+            return False
+        if (self.manager.header_info or {}).get("has_itc"):
+            return True
+        if hasattr(self.manager, "get_tree_ids") and self.manager.get_tree_ids():
+            return True
+        return False
+
+    def view_all_points_action(self):
+        """Render all points of the current cloud directly in 3D (works with or without ITC)."""
+        if not self.manager or (not self.manager.las_path and self.manager.las_data is None):
+            self.status_bar.showMessage("No LAS/LAZ point cloud loaded.")
+            return
+        if hasattr(self, "sidebar_tabs"):
+            self.sidebar_tabs.setCurrentIndex(1)
+        self._tree_view_state = {
+            "itc": 0, "radius": 0.0, "mode": "all", "ground": 0.0,
+            "full_neighbors": False, "x": None, "y": None,
+            "is_all_points": True,
+        }
+        if hasattr(self, "lbl_tree_view_status"):
+            self.lbl_tree_view_status.setText("Fetching all cloud points for 3D viewport...")
+        self.status_bar.showMessage("Loading all cloud points into 3D view...", 5000)
+        self._run_js("if (window.viewAllPoints) window.viewAllPoints();")
+
     def view_tree_action(self, single_tree: bool = False):
         """Render the full point set of one tree (queried from the LAS master)
         as an isolated cloud and switch to the Forestry tab.
@@ -3599,13 +3775,18 @@ class MainWindow(QMainWindow):
         step shows exactly one tree, and so the walk does not re-query a whole stand
         for every ID it visits.
         """
-        itc = int(self.spin_tree_view.value())
-        if itc <= 0:
-            self.status_bar.showMessage("Set a Tree ID (ITC) first, or Ctrl+Click a tree point.")
-            return
         if not self.manager.las_path and self.manager.las_data is None:
             self.status_bar.showMessage("No LAS/LAZ source file is bound to query full tree points from.")
             self.lbl_tree_view_status.setText("No LAS/LAZ source file bound. Open a LAS/LAZ or converted dataset with sibling LAS.")
+            return
+        if not self._has_itc_segmentation():
+            msg = "Cloud has no ITC tree segmentation. Use 'View Entire Cloud' or the Segmentation tab."
+            self.lbl_tree_view_status.setText(msg)
+            self.status_bar.showMessage(msg, 6000)
+            return
+        itc = int(self.spin_tree_view.value())
+        if itc <= 0:
+            self.status_bar.showMessage("Set a Tree ID (ITC) first, or Ctrl+Click a tree point.")
             return
 
         # Automatically switch to Forestry tab
@@ -3663,6 +3844,12 @@ class MainWindow(QMainWindow):
         """Show the tree after the current one, stepping through the tract in ID order."""
         if not self.manager.las_path and self.manager.las_data is None:
             self.status_bar.showMessage("No LAS/LAZ source file is bound to step through trees.")
+            return
+        if not self._has_itc_segmentation():
+            msg = "No trees to step through: this cloud has no ITC segmentation."
+            self.status_bar.showMessage(msg, 6000)
+            if hasattr(self, "lbl_tree_view_status"):
+                self.lbl_tree_view_status.setText(msg)
             return
         current = int(self.spin_tree_view.value())
         nxt = self._next_tree_id(current)
@@ -5042,6 +5229,10 @@ class MainWindow(QMainWindow):
             pass
         if running:
             worker.wait(5000)
+        crown_w = getattr(self, "crown_worker", None)
+        if crown_w is not None and crown_w.isRunning():
+            crown_w.stop()
+            crown_w.wait(3000)
         self.settings_store.close()
         super().closeEvent(event)
 
@@ -5158,6 +5349,11 @@ class MainWindow(QMainWindow):
         self.btn_tab_segmentation.setCheckable(True)
         self.btn_tab_segmentation.setProperty("class", "ribbonCategoryTab")
 
+        # Crown Extraction category (uses semantic_pred + segmentation tree IDs)
+        self.btn_tab_crown = QPushButton("Crown")
+        self.btn_tab_crown.setCheckable(True)
+        self.btn_tab_crown.setProperty("class", "ribbonCategoryTab")
+
         self.ribbon_tab_group.addButton(self.btn_tab_file, 0)
         self.ribbon_tab_group.addButton(self.btn_tab_point, 1)
         self.ribbon_tab_group.addButton(self.btn_tab_layers, 2)
@@ -5165,6 +5361,7 @@ class MainWindow(QMainWindow):
         self.ribbon_tab_group.addButton(self.btn_tab_filter, 4)
         self.ribbon_tab_group.addButton(self.btn_tab_ai, 5)
         self.ribbon_tab_group.addButton(self.btn_tab_segmentation, 6)
+        self.ribbon_tab_group.addButton(self.btn_tab_crown, 7)
 
         h_tabs.addWidget(self.btn_tab_file)
         h_tabs.addWidget(self.btn_tab_point)
@@ -5175,6 +5372,7 @@ class MainWindow(QMainWindow):
         h_tabs.addWidget(self.btn_tab_filter)
         h_tabs.addWidget(self.btn_tab_ai)
         h_tabs.addWidget(self.btn_tab_segmentation)
+        h_tabs.addWidget(self.btn_tab_crown)
         h_tabs.addStretch()
         h_tabs.addWidget(self.btn_tab_settings)
 
@@ -5192,6 +5390,7 @@ class MainWindow(QMainWindow):
         page_filter = self._create_ribbon_filter_page()
         page_ai = self._create_ribbon_ai_page()
         page_segmentation = self._create_ribbon_segmentation_page()
+        page_crown = self._create_ribbon_crown_page()
 
         self.ribbon_stack.addWidget(page_file)       # Index 0
         self.ribbon_stack.addWidget(page_point)      # Index 1
@@ -5200,6 +5399,7 @@ class MainWindow(QMainWindow):
         self.ribbon_stack.addWidget(page_filter)     # Index 4 (Stand Filter)
         self.ribbon_stack.addWidget(page_ai)         # Index 5 (Touch-up: single-cloud AI)
         self.ribbon_stack.addWidget(page_segmentation)  # Index 6 (Full ForestFormer3D pipeline)
+        self.ribbon_stack.addWidget(page_crown)      # Index 7 (Semantic Crown Extraction)
 
         self.ribbon_tab_group.idClicked.connect(self._on_ribbon_category_clicked)
         self.ribbon_stack.setCurrentIndex(1)
@@ -6720,3 +6920,513 @@ class MainWindow(QMainWindow):
             is_active = (name == self._active_tool) or (self._active_tool == "measure" and name in ("measure", "forestry_measure"))
             btn.setChecked(is_active)
             btn.blockSignals(False)
+
+    # -------------------------------------------------------------------------
+    # Crown ribbon page: semantic-guided Crown Extraction from segmentation
+    # -------------------------------------------------------------------------
+    def _create_ribbon_crown_page(self) -> QWidget:
+        page = QFrame()
+        page.setFixedHeight(92)
+        h_layout = QHBoxLayout(page)
+        h_layout.setContentsMargins(8, 6, 8, 6)
+        h_layout.setSpacing(8)
+
+        def _lbl(text):
+            l = QLabel(text)
+            l.setProperty("class", "ribbonLabel")
+            return l
+
+        def _spin(minv, maxv, val, step=0.25, suffix="", width=60):
+            s = QDoubleSpinBox()
+            s.setProperty("class", "ribbonSpin")
+            s.setRange(minv, maxv)
+            s.setValue(val)
+            s.setSingleStep(step)
+            s.setDecimals(2)
+            if suffix:
+                s.setSuffix(suffix)
+            s.setMinimumWidth(width - 10)
+            return s
+
+        def _ispin(minv, maxv, val, width=52):
+            s = QSpinBox()
+            s.setProperty("class", "ribbonSpin")
+            s.setRange(minv, maxv)
+            s.setValue(val)
+            s.setMinimumWidth(width - 10)
+            return s
+
+        def _group():
+            grp = QFrame()
+            grp.setProperty("class", "ribbonGroup")
+            grp.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
+            v = QVBoxLayout(grp)
+            v.setContentsMargins(10, 6, 10, 6)
+            v.setSpacing(3)
+            return grp, v
+
+        def _title(v, text):
+            t = QLabel(text)
+            t.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            t.setProperty("class", "ribbonTitle")
+            v.addWidget(t)
+
+        # ---- 1. Crown Extraction Actions ----------------------------------
+        grp_act, v_act = _group()
+        row_act = QHBoxLayout()
+        row_act.setSpacing(5)
+
+        self.btn_crown_extract = QPushButton("Crown Extraction")
+        self.btn_crown_extract.setObjectName("btnCrownExtract")
+        self.btn_crown_extract.setFixedHeight(28)
+        self.btn_crown_extract.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_crown_extract.setToolTip(
+            "Extract canopy crown polygons per tree using semantic_pred (leaf vs wood/ground) and segmentation IDs"
+        )
+        self.btn_crown_extract.setStyleSheet("""
+            QPushButton#btnCrownExtract {
+                background-color: #059669;
+                border: 1px solid #10b981;
+                color: #ffffff;
+                font-size: 11px;
+                font-weight: 700;
+                padding: 4px 12px;
+                border-radius: 4px;
+            }
+            QPushButton#btnCrownExtract:hover {
+                background-color: #10b981;
+                border-color: #34d399;
+            }
+            QPushButton#btnCrownExtract:pressed {
+                background-color: #047857;
+            }
+            QPushButton#btnCrownExtract:disabled {
+                background-color: #14352a;
+                border: 1px solid #0f5132;
+                color: #4ade80;
+            }
+        """)
+        self.btn_crown_extract.clicked.connect(self.run_crown_extraction_action)
+
+        self.btn_crown_stop = QPushButton("Stop")
+        self.btn_crown_stop.setObjectName("btnCrownStop")
+        self.btn_crown_stop.setFixedHeight(28)
+        self.btn_crown_stop.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_crown_stop.setEnabled(False)
+        self.btn_crown_stop.setStyleSheet("""
+            QPushButton#btnCrownStop {
+                background-color: #dc2626;
+                border: 1px solid #ef4444;
+                color: #ffffff;
+                font-size: 11px;
+                font-weight: 700;
+                padding: 4px 10px;
+                border-radius: 4px;
+            }
+            QPushButton#btnCrownStop:hover {
+                background-color: #ef4444;
+                border-color: #f87171;
+            }
+            QPushButton#btnCrownStop:disabled {
+                background-color: #1e293b;
+                border: 1px solid #334764;
+                color: #475569;
+            }
+        """)
+        self.btn_crown_stop.clicked.connect(self.stop_crown_extraction_action)
+
+        self.btn_crown_clear = QPushButton("Clear")
+        self.btn_crown_clear.setProperty("class", "ribbonToolBtn")
+        self.btn_crown_clear.setFixedHeight(28)
+        self.btn_crown_clear.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_crown_clear.setEnabled(False)
+        self.btn_crown_clear.clicked.connect(lambda: self.clear_crown_polygons_action(silent=False))
+
+        row_act.addWidget(self.btn_crown_extract)
+        row_act.addWidget(self.btn_crown_stop)
+        row_act.addWidget(self.btn_crown_clear)
+        v_act.addLayout(row_act)
+
+        row_prog = QHBoxLayout()
+        row_prog.setSpacing(6)
+        self.bar_crown_progress = QProgressBar()
+        self.bar_crown_progress.setRange(0, 100)
+        self.bar_crown_progress.setValue(0)
+        self.bar_crown_progress.setTextVisible(False)
+        self.bar_crown_progress.setFixedHeight(8)
+        self.bar_crown_progress.setFixedWidth(110)
+        self.bar_crown_progress.setStyleSheet("""
+            QProgressBar {
+                background-color: #0b111c;
+                border: 1px solid #283952;
+                border-radius: 4px;
+            }
+            QProgressBar::chunk {
+                background-color: #10b981;
+                border-radius: 3px;
+            }
+        """)
+        self.lbl_crown_status = _lbl("Ready")
+        row_prog.addWidget(self.bar_crown_progress)
+        row_prog.addWidget(self.lbl_crown_status, 1)
+        v_act.addLayout(row_prog)
+
+        _title(v_act, "CROWN EXTRACTION")
+        h_layout.addWidget(grp_act)
+
+        # ---- 2. Extraction Parameters -------------------------------------
+        grp_param, v_param = _group()
+        grid_param = QGridLayout()
+        grid_param.setHorizontalSpacing(5)
+        grid_param.setVerticalSpacing(3)
+
+        self.combo_crown_semantic = QComboBox()
+        self.combo_crown_semantic.setProperty("class", "ribbonCombo")
+        self.combo_crown_semantic.addItem("Leaf / Crown (sem=2)", "leaf")
+        self.combo_crown_semantic.addItem("Wood + Crown (sem=1,2)", "wood_and_leaf")
+        self.combo_crown_semantic.addItem("All Tree Points", "all")
+        self.combo_crown_semantic.setToolTip(
+            "Filter points using semantic_pred: separate canopy leaves (2) from trunks/twigs (1) and ground (0)"
+        )
+
+        self.combo_crown_method = QComboBox()
+        self.combo_crown_method.setProperty("class", "ribbonCombo")
+        self.combo_crown_method.addItem("Concave (Alpha)", "concave")
+        self.combo_crown_method.addItem("Convex Hull", "convex")
+        self.combo_crown_method.currentIndexChanged.connect(self._on_crown_method_changed)
+
+        self.spin_crown_alpha = _spin(0.3, 15.0, 1.5, 0.25, " m", width=66)
+        self.spin_crown_alpha.setToolTip("Concave alpha radius (smaller hugs crown indentations tighter)")
+        self.spin_crown_min_pts = _ispin(3, 500, 15, width=54)
+        self.spin_crown_min_pts.setToolTip("Minimum semantic crown points required per tree")
+        self.spin_crown_simplify = _spin(0.0, 2.0, 0.15, 0.05, " m", width=66)
+        self.spin_crown_simplify.setToolTip("Polygon simplification tolerance (0 = unsimplified boundary)")
+
+        grid_param.addWidget(_lbl("Points:"), 0, 0)
+        grid_param.addWidget(self.combo_crown_semantic, 0, 1, 1, 3)
+        grid_param.addWidget(_lbl("Alpha:"), 0, 4)
+        grid_param.addWidget(self.spin_crown_alpha, 0, 5)
+
+        grid_param.addWidget(_lbl("Shape:"), 1, 0)
+        grid_param.addWidget(self.combo_crown_method, 1, 1)
+        grid_param.addWidget(_lbl("Min pts:"), 1, 2)
+        grid_param.addWidget(self.spin_crown_min_pts, 1, 3)
+        grid_param.addWidget(_lbl("Simplify:"), 1, 4)
+        grid_param.addWidget(self.spin_crown_simplify, 1, 5)
+
+        v_param.addLayout(grid_param)
+        _title(v_param, "EXTRACTION PARAMETERS")
+        h_layout.addWidget(grp_param)
+
+        # ---- 3. Polygon Display -------------------------------------------
+        grp_disp, v_disp = _group()
+        grid_disp = QGridLayout()
+        grid_disp.setHorizontalSpacing(6)
+        grid_disp.setVerticalSpacing(3)
+
+        self.chk_crown_visible = QCheckBox("Show")
+        self.chk_crown_visible.setChecked(True)
+        self.chk_crown_visible.setStyleSheet("font-size: 11px; color: #e2e8f0;")
+        self.chk_crown_visible.toggled.connect(self._on_crown_display_changed)
+
+        self.chk_crown_fill = QCheckBox("Fill")
+        self.chk_crown_fill.setChecked(True)
+        self.chk_crown_fill.setStyleSheet("font-size: 11px; color: #e2e8f0;")
+        self.chk_crown_fill.toggled.connect(self._on_crown_display_changed)
+
+        self.chk_crown_labels = QCheckBox("Labels")
+        self.chk_crown_labels.setChecked(False)
+        self.chk_crown_labels.setStyleSheet("font-size: 11px; color: #e2e8f0;")
+        self.chk_crown_labels.toggled.connect(self._on_crown_display_changed)
+
+        self.combo_crown_height = QComboBox()
+        self.combo_crown_height.setProperty("class", "ribbonCombo")
+        self.combo_crown_height.addItem("Crown Top", "top")
+        self.combo_crown_height.addItem("Crown Mean", "mean")
+        self.combo_crown_height.addItem("Crown Base", "base")
+        self.combo_crown_height.currentIndexChanged.connect(self._on_crown_display_changed)
+
+        self.spin_crown_opacity = _spin(0.05, 0.90, 0.25, 0.05, "", width=58)
+        self.spin_crown_opacity.valueChanged.connect(self._on_crown_display_changed)
+
+        row_chk = QHBoxLayout()
+        row_chk.setSpacing(8)
+        row_chk.addWidget(self.chk_crown_visible)
+        row_chk.addWidget(self.chk_crown_fill)
+        row_chk.addWidget(self.chk_crown_labels)
+        row_chk.addStretch()
+        grid_disp.addLayout(row_chk, 0, 0, 1, 4)
+
+        grid_disp.addWidget(_lbl("Height:"), 1, 0)
+        grid_disp.addWidget(self.combo_crown_height, 1, 1)
+        grid_disp.addWidget(_lbl("Opacity:"), 1, 2)
+        grid_disp.addWidget(self.spin_crown_opacity, 1, 3)
+
+        v_disp.addLayout(grid_disp)
+        _title(v_disp, "POLYGON DISPLAY")
+        h_layout.addWidget(grp_disp)
+
+        # ---- 4. Map & Export ----------------------------------------------
+        grp_exp, v_exp = _group()
+        row_map = QHBoxLayout()
+        row_map.setSpacing(4)
+
+        self.btn_crown_map = QPushButton("2D Map View")
+        self.btn_crown_map.setProperty("class", "ribbonToolBtn")
+        self.btn_crown_map.setCheckable(True)
+        self.btn_crown_map.setFixedHeight(24)
+        self.btn_crown_map.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_crown_map.setToolTip("Display extracted crown polygons on an interactive 2D Satellite / OSM / XY map")
+        self.btn_crown_map.toggled.connect(self.toggle_crown_map_action)
+
+        self.btn_crown_top_view = QPushButton("Top-Down 3D")
+        self.btn_crown_top_view.setProperty("class", "ribbonToolBtn")
+        self.btn_crown_top_view.setFixedHeight(24)
+        self.btn_crown_top_view.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_crown_top_view.setToolTip("Move the 3D camera straight overhead for a top-down canopy view")
+        self.btn_crown_top_view.clicked.connect(self.crown_top_down_view_action)
+
+        row_map.addWidget(self.btn_crown_map)
+        row_map.addWidget(self.btn_crown_top_view)
+        v_exp.addLayout(row_map)
+
+        self.btn_crown_export = QPushButton("Export GeoJSON / CSV...")
+        self.btn_crown_export.setProperty("class", "ribbonToolBtn")
+        self.btn_crown_export.setFixedHeight(24)
+        self.btn_crown_export.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_crown_export.setEnabled(False)
+        self.btn_crown_export.clicked.connect(self.export_crown_polygons_action)
+        v_exp.addWidget(self.btn_crown_export)
+        _title(v_exp, "MAP & EXPORT")
+        h_layout.addWidget(grp_exp)
+
+        h_layout.addStretch()
+        return page
+
+    def _on_crown_method_changed(self):
+        if hasattr(self, "combo_crown_method") and hasattr(self, "spin_crown_alpha"):
+            self.spin_crown_alpha.setEnabled(self.combo_crown_method.currentData() == "concave")
+
+    def _crown_display_payload(self) -> dict:
+        return {
+            "visible": bool(self.chk_crown_visible.isChecked()) if hasattr(self, "chk_crown_visible") else True,
+            "showFill": bool(self.chk_crown_fill.isChecked()) if hasattr(self, "chk_crown_fill") else True,
+            "showLabels": bool(self.chk_crown_labels.isChecked()) if hasattr(self, "chk_crown_labels") else False,
+            "heightMode": self.combo_crown_height.currentData() if hasattr(self, "combo_crown_height") else "top",
+            "fillOpacity": float(self.spin_crown_opacity.value()) if hasattr(self, "spin_crown_opacity") else 0.25,
+        }
+
+    def _on_crown_display_changed(self, *_):
+        style = self._crown_display_payload()
+        self._run_js(f"if (window.setCrownPolygonsStyle) window.setCrownPolygonsStyle({json.dumps(style)});")
+
+    def run_crown_extraction_action(self):
+        """Extract 2D/3D crown polygons for the loaded dataset on a worker thread."""
+        if getattr(self, "crown_worker", None) is not None and self.crown_worker.isRunning():
+            return
+
+        if hasattr(self, "btn_tab_crown") and hasattr(self, "ribbon_stack"):
+            self.btn_tab_crown.setChecked(True)
+            self.ribbon_stack.setCurrentIndex(7)
+
+        las_path = self.current_las_path or (self.manager.las_path if self.manager else None)
+        las_data = self.manager.las_data if self.manager else None
+        if not las_path and las_data is None:
+            msg = "Open a segmented LAS/LAZ point cloud first."
+            if hasattr(self, "lbl_crown_status"):
+                self.lbl_crown_status.setText("No cloud loaded")
+            self.status_bar.showMessage(msg, 6000)
+            self.log_console("CROWN", msg, level="warn")
+            self._set_console_open(True)
+            return
+
+        sem_mode = self.combo_crown_semantic.currentData()
+        method = self.combo_crown_method.currentData()
+        alpha = float(self.spin_crown_alpha.value())
+        min_pts = int(self.spin_crown_min_pts.value())
+        simplify_tol = float(self.spin_crown_simplify.value())
+
+        self.crown_worker = CrownExtractionWorker(
+            las_path,
+            las_data=las_data,
+            semantic_mode=sem_mode,
+            method=method,
+            alpha=alpha,
+            min_points=min_pts,
+            simplify_tol=simplify_tol,
+        )
+        self.crown_worker.progress.connect(self._on_crown_progress)
+        self.crown_worker.finished.connect(self._on_crown_finished)
+        self.crown_worker.error.connect(self._on_crown_error)
+        self.crown_worker.cancelled.connect(self._on_crown_cancelled)
+
+        self.btn_crown_extract.setEnabled(False)
+        self.btn_crown_stop.setEnabled(True)
+        self.btn_crown_export.setEnabled(False)
+        self.bar_crown_progress.setValue(0)
+        self.lbl_crown_status.setText("Extracting...")
+        src_name = os.path.basename(las_path) if las_path else "in-memory cloud"
+        self.log_console(
+            "CROWN",
+            f"Started Crown Extraction on {src_name} (points={sem_mode}, shape={method}, "
+            f"alpha={alpha:.2f}m, min_pts={min_pts}, simplify={simplify_tol:.2f}m)",
+            level="info",
+        )
+        self.crown_worker.start()
+
+    def stop_crown_extraction_action(self):
+        worker = getattr(self, "crown_worker", None)
+        if worker is None or not worker.isRunning():
+            return
+        self.btn_crown_stop.setEnabled(False)
+        self.lbl_crown_status.setText("Stopping...")
+        worker.stop()
+
+    def _on_crown_progress(self, pct: int, msg: str):
+        if hasattr(self, "bar_crown_progress"):
+            self.bar_crown_progress.setValue(max(0, min(100, int(pct))))
+        if hasattr(self, "lbl_crown_status"):
+            self.lbl_crown_status.setText(f"{int(pct)}%")
+        self.status_bar.showMessage(msg, 4000)
+
+    def _on_crown_finished(self, result: dict):
+        self._crown_result = result
+        if self.manager:
+            self.manager.set_crown_polygons(result)
+
+        if hasattr(self, "btn_crown_extract"):
+            self.btn_crown_extract.setEnabled(True)
+        if hasattr(self, "btn_crown_stop"):
+            self.btn_crown_stop.setEnabled(False)
+        if hasattr(self, "bar_crown_progress"):
+            self.bar_crown_progress.setValue(100)
+
+        summary = result.get("summary") or {}
+        count = int(summary.get("count", 0))
+        skipped = int(summary.get("skipped_trees", 0))
+        total_area = float(summary.get("total_area_m2", 0.0))
+        mean_area = float(summary.get("mean_area_m2", 0.0))
+        elapsed = float(summary.get("elapsed_s", 0.0))
+
+        if hasattr(self, "btn_crown_clear"):
+            self.btn_crown_clear.setEnabled(count > 0)
+        if hasattr(self, "btn_crown_export"):
+            self.btn_crown_export.setEnabled(count > 0)
+        if hasattr(self, "btn_crown_map") and count > 0:
+            self.btn_crown_map.setEnabled(True)
+        if hasattr(self, "btn_crown_top_view") and count > 0:
+            self.btn_crown_top_view.setEnabled(True)
+
+        if hasattr(self, "lbl_crown_status"):
+            self.lbl_crown_status.setText(f"{count:,} crowns · {total_area:,.1f} m²")
+
+        msg = (
+            f"Extracted {count:,} crown polygons ({total_area:,.1f} m² total, "
+            f"avg {mean_area:.1f} m², skipped {skipped:,}) in {elapsed:.2f}s."
+        )
+        self.status_bar.showMessage(msg, 8000)
+        self.log_console("CROWN", msg, level="success" if count > 0 else "warn")
+
+        style = self._crown_display_payload()
+        self._run_js(f"if (window.setCrownPolygonsStyle) window.setCrownPolygonsStyle({json.dumps(style)});")
+        self._run_js("if (window.loadCrownPolygonsFromServer) window.loadCrownPolygonsFromServer();")
+
+    def _on_crown_error(self, msg: str):
+        if hasattr(self, "btn_crown_extract"):
+            self.btn_crown_extract.setEnabled(True)
+        if hasattr(self, "btn_crown_stop"):
+            self.btn_crown_stop.setEnabled(False)
+        if hasattr(self, "bar_crown_progress"):
+            self.bar_crown_progress.setValue(0)
+        if hasattr(self, "lbl_crown_status"):
+            self.lbl_crown_status.setText("Error")
+        self.status_bar.showMessage(f"Crown extraction error: {msg}", 8000)
+        self.log_console("CROWN", f"Crown extraction failed: {msg}", level="error")
+        self._set_console_open(True)
+
+    def _on_crown_cancelled(self):
+        if hasattr(self, "btn_crown_extract"):
+            self.btn_crown_extract.setEnabled(True)
+        if hasattr(self, "btn_crown_stop"):
+            self.btn_crown_stop.setEnabled(False)
+        if hasattr(self, "bar_crown_progress"):
+            self.bar_crown_progress.setValue(0)
+        if hasattr(self, "lbl_crown_status"):
+            self.lbl_crown_status.setText("Cancelled")
+        self.status_bar.showMessage("Crown extraction cancelled.", 5000)
+        self.log_console("CROWN", "Crown extraction cancelled.", level="warn")
+
+    def clear_crown_polygons_action(self, silent: bool = False):
+        self._crown_result = None
+        if self.manager:
+            self.manager.clear_crown_polygons()
+        if hasattr(self, "btn_crown_clear"):
+            self.btn_crown_clear.setEnabled(False)
+        if hasattr(self, "btn_crown_export"):
+            self.btn_crown_export.setEnabled(False)
+        if hasattr(self, "bar_crown_progress"):
+            self.bar_crown_progress.setValue(0)
+        if hasattr(self, "lbl_crown_status"):
+            self.lbl_crown_status.setText("Ready")
+        self._run_js("if (window.clearCrownPolygons) window.clearCrownPolygons();")
+        if not silent:
+            self.status_bar.showMessage("Cleared crown polygon overlay.", 4000)
+            self.log_console("CROWN", "Cleared crown polygon overlay.", level="info")
+
+    def export_crown_polygons_action(self):
+        if not self._crown_result or not (self._crown_result.get("crowns")):
+            self.status_bar.showMessage("No extracted crown polygons to export.", 5000)
+            return
+
+        src = self.current_las_path or self._crown_result.get("source") or ""
+        stem = os.path.splitext(os.path.basename(src))[0] if src else "dataset"
+        ws = getattr(self, "workspace", None)
+        out_dir = ws.root if ws is not None else (os.path.dirname(src) if src else os.getcwd())
+        default_path = os.path.join(out_dir, f"{stem}_crowns.geojson")
+
+        save_path = self._save_file(
+            "Export Crown Polygons (Point Cloud)",
+            default_path,
+            "GeoJSON Polygons (*.geojson);;CSV Table with WKT (*.csv)",
+        )
+        if not save_path:
+            return
+
+        try:
+            from crown_extractor import export_crowns_csv, export_crowns_geojson
+            h_mode = self.combo_crown_height.currentData() if hasattr(self, "combo_crown_height") else "top"
+            if save_path.lower().endswith(".csv"):
+                written = export_crowns_csv(self._crown_result, save_path)
+            else:
+                if not save_path.lower().endswith((".geojson", ".json")):
+                    save_path += ".geojson"
+                written = export_crowns_geojson(self._crown_result, save_path, include_z=True, height_mode=h_mode)
+            msg = f"Exported {written:,} crown polygons to {save_path}"
+            self.status_bar.showMessage(msg, 7000)
+            self.log_console("CROWN", msg, level="success")
+        except Exception as exc:
+            self.status_bar.showMessage(f"Export failed: {exc}", 7000)
+            self.log_console("CROWN", f"Export failed: {exc}", level="error")
+
+    def toggle_crown_map_action(self, checked: Optional[bool] = None):
+        """Show or hide the interactive 2D OpenLayers Crown Map overlay."""
+        if checked is None:
+            is_open = not bool(self.btn_crown_map.isChecked()) if hasattr(self, "btn_crown_map") else True
+            if hasattr(self, "btn_crown_map"):
+                self.btn_crown_map.blockSignals(True)
+                self.btn_crown_map.setChecked(is_open)
+                self.btn_crown_map.blockSignals(False)
+        else:
+            is_open = bool(checked)
+        self._run_js(f"if (window.openCrownMap) window.openCrownMap({'true' if is_open else 'false'});")
+
+    def crown_top_down_view_action(self):
+        """Move the Potree 3D camera straight overhead centered on extracted crown polygons."""
+        self._run_js("if (window.crownTopDownView) window.crownTopDownView();")
+
+    def _on_crown_map_toggled_from_web(self, data: dict):
+        is_open = bool((data or {}).get("open", False))
+        if hasattr(self, "btn_crown_map"):
+            self.btn_crown_map.blockSignals(True)
+            self.btn_crown_map.setChecked(is_open)
+            self.btn_crown_map.blockSignals(False)

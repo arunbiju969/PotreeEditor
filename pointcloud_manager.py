@@ -49,6 +49,17 @@ class PointCloudManager:
         self._is_indexing: bool = False
         self._indexing_stage: str = "idle"
         self._last_indexing_event: Optional[Dict[str, Any]] = None
+        self.crown_polygons: Optional[Dict[str, Any]] = None
+
+    @_synchronized
+    def set_crown_polygons(self, data: Optional[Dict[str, Any]]):
+        """Store extracted crown polygons payload served at /api/crowns."""
+        self.crown_polygons = data
+
+    @_synchronized
+    def clear_crown_polygons(self):
+        """Clear stored crown polygons."""
+        self.crown_polygons = None
 
     def add_indexing_callback(self, cb: Callable[[Dict[str, Any]], None]):
         """Register a callback for automatic background indexing lifecycle and progress events."""
@@ -87,11 +98,18 @@ class PointCloudManager:
 
         Sourced from the exact tree index. Tree IDs are not always contiguous
         (deleted or merged crowns leave gaps), so callers that step through trees
-        should prefer this over `id + 1`. Empty when the index is not built yet.
+        should prefer this over `id + 1`. Empty when the index is not built yet
+        or if the point cloud contains no ITC tree segmentation.
         """
         with self._lock:
             if self._tree_index:
                 return sorted(self._tree_index.keys())
+            if self.las_data is not None:
+                extra_dims = [d.name for d in self.las_data.point_format.dimensions]
+                itc_name = next((n for n in ("itc", "treeID", "tree_id") if n in extra_dims), None)
+                if itc_name is not None:
+                    tids = np.unique(np.asarray(getattr(self.las_data, itc_name)))
+                    return sorted([int(tid) for tid in tids if tid > 0])
         return []
 
     @property
@@ -121,8 +139,9 @@ class PointCloudManager:
             scales = [float(s) for s in hdr.scales]
             offsets = [float(o) for o in hdr.offsets]
 
+            all_dims = [dim.name for dim in hdr.point_format.dimensions]
             extra_dims = [dim.name for dim in hdr.point_format.extra_dimensions]
-            has_itc = ("itc" in extra_dims) or ("treeID" in extra_dims) or ("tree_id" in extra_dims)
+            has_itc = any(d in all_dims for d in ("itc", "treeID", "tree_id"))
 
             info = {
                 "path": path,
@@ -137,6 +156,9 @@ class PointCloudManager:
                 "is_header_only": True
             }
 
+            prev_abs = os.path.abspath(self.las_path) if self.las_path else None
+            if prev_abs != os.path.abspath(path):
+                self.crown_polygons = None
             self.las_path = path
             self.header_info = info
             self.las_data = None
@@ -245,6 +267,9 @@ class PointCloudManager:
                         valid = tids[tids > 0]
                         c_info["min_itc"] = int(valid.min()) if len(valid) > 0 else 0
                         c_info["max_itc"] = int(valid.max()) if len(valid) > 0 else 0
+                    else:
+                        c_info["min_itc"] = 0
+                        c_info["max_itc"] = 0
                     chunks.append(c_info)
 
                     pct = int(round((i + 1) / total_chunks * 100))
@@ -375,6 +400,9 @@ class PointCloudManager:
             raise FileNotFoundError(f"File not found: {path}")
 
         print(f"[PointCloudManager] Reading LAS file into RAM: {path}...")
+        prev_abs = os.path.abspath(self.las_path) if self.las_path else None
+        if prev_abs != os.path.abspath(path):
+            self.crown_polygons = None
         self.las_data = laspy.read(path)
         self.las_path = path
         self.selected_indices = np.array([], dtype=int)
@@ -1612,7 +1640,7 @@ class PointCloudManager:
                     else:
                         candidates = []
                 elif self._chunk_index:
-                    candidates = [c for c in self._chunk_index if c["min_itc"] <= itc_val <= c["max_itc"]]
+                    candidates = [c for c in self._chunk_index if c.get("min_itc", 0) <= itc_val <= c.get("max_itc", 0)]
                     if x is not None and y is not None:
                         spat = [c for c in candidates if (c["min_x"] - 35 <= x <= c["max_x"] + 35 and
                                                           c["min_y"] - 35 <= y <= c["max_y"] + 35)]

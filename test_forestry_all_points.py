@@ -73,14 +73,15 @@ class TestForestryAllPoints(unittest.TestCase):
     def tearDown(self):
         self.win._run_js = self.win._orig_run_js
 
-    def test_bring_all_points_button_removed(self):
-        """The "Bring in All Points (Full Cloud)" button was removed from the Forestry tab.
+    def test_view_all_points_button_available(self):
+        """The "View Entire Cloud (All Points)" entry point is available in Forestry tab."""
+        self.assertTrue(hasattr(self.win, "btn_view_all_points"))
+        self.assertIn("All Points", self.win.btn_view_all_points.text())
+        self.assertTrue(hasattr(self.win, "view_all_points_action"))
 
-        The backend capability (/api/get_all_points + manager.get_all_points) is still
-        exercised by the tests below; only the UI entry point is gone.
-        """
-        self.assertFalse(hasattr(self.win, "btn_bring_all_points"))
-        self.assertFalse(hasattr(self.win, "view_all_points_action"))
+        self.win._js_calls.clear()
+        self.win.view_all_points_action()
+        self.assertTrue(any("window.viewAllPoints()" in c for c in self.win._js_calls))
 
     def test_next_tree_button_advances_to_next_existing_id(self):
         """Next Tree steps to the next real ITC, skipping gaps, and wraps at the end."""

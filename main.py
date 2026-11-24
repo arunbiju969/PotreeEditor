@@ -6,10 +6,11 @@ Launches the hybrid architecture:
 - Direct LAS/LAZ point cloud spatial analysis and editing bridge
 """
 
+import os
 import sys
 from pathlib import Path
 from PyQt6.QtWidgets import QApplication
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QLibraryInfo, Qt
 
 from pointcloud_manager import PointCloudManager
 from server import HybridServer
@@ -50,6 +51,30 @@ def resolve_potree_dir(app_dir: Path):
     if ok:
         return vendored, "pinned ./potree clone"
     return None, f"vendored ./potree unusable: {reason}"
+
+
+def _configure_linux_platform_theme():
+    """Use PyQt6's bundled xdgdesktopportal plugin for native file dialogs on Linux
+    when no explicit platform theme or custom QT_PLUGIN_PATH is configured."""
+    if not sys.platform.startswith("linux"):
+        return
+    if os.environ.get("POTREEEDITOR_KEEP_QT_PLUGINS") == "1":
+        return
+    if os.environ.get("QT_QPA_PLATFORMTHEME") or os.environ.get("QT_PLUGIN_PATH"):
+        return
+    if os.environ.get("QT_QPA_PLATFORM") in ("offscreen", "minimal"):
+        return
+
+    plugins_dir = QLibraryInfo.path(QLibraryInfo.LibraryPath.PluginsPath)
+    portal_plugin = Path(plugins_dir) / "platformthemes" / "libqxdgdesktopportal.so"
+    if not portal_plugin.is_file():
+        return
+
+    has_dbus = bool(os.environ.get("DBUS_SESSION_BUS_ADDRESS")) or (
+        hasattr(os, "getuid") and os.path.exists(f"/run/user/{os.getuid()}/bus")
+    )
+    if has_dbus:
+        os.environ["QT_QPA_PLATFORMTHEME"] = "xdgdesktopportal"
 
 
 def main():
@@ -104,6 +129,7 @@ def main():
     server.start()
 
     # Launch PyQt6 Application
+    _configure_linux_platform_theme()
     app = QApplication(sys.argv)
     app.setApplicationName("Potree Hybrid Editor")
 

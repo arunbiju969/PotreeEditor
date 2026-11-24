@@ -392,3 +392,186 @@ html, body {
     accent-color: #2563eb;
     cursor: pointer;
 }
+
+/* Interactive 2D Crown Map Overlay */
+.crown-map-overlay {
+    position: absolute;
+    inset: 0;
+    z-index: 45;
+    display: flex;
+    flex-direction: column;
+    background: #0b111c;
+    border-top: 1px solid #1e293b;
+}
+
+.crown-map-overlay.split-mode {
+    left: 50%;
+    border-left: 2px solid #334155;
+    box-shadow: -8px 0 24px rgba(0, 0, 0, 0.45);
+}
+
+.crown-map-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 7px 12px;
+    background: #0f172a;
+    border-bottom: 1px solid #1e293b;
+}
+
+.crown-map-title-wrap {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.crown-map-title {
+    font-size: 13px;
+    font-weight: 700;
+    color: #f8fafc;
+}
+
+.crown-map-stats {
+    font-size: 11px;
+    font-weight: 600;
+    color: #6ee7b7;
+    background: rgba(16, 185, 129, 0.14);
+    border: 1px solid rgba(16, 185, 129, 0.35);
+    border-radius: 10px;
+    padding: 2px 8px;
+}
+
+.crown-map-controls {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.crown-map-lbl {
+    font-size: 11px;
+    color: #94a3b8;
+    font-weight: 600;
+}
+
+.crown-map-select {
+    background: #1e293b;
+    color: #f1f5f9;
+    border: 1px solid #334155;
+    border-radius: 4px;
+    font-size: 11px;
+    padding: 3px 6px;
+    outline: none;
+    cursor: pointer;
+}
+
+.crown-map-select:focus {
+    border-color: #38bdf8;
+}
+
+.crown-map-btn {
+    background: #1e293b;
+    color: #e2e8f0;
+    border: 1px solid #334155;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 4px 9px;
+    cursor: pointer;
+}
+
+.crown-map-btn:hover {
+    background: #334155;
+    border-color: #38bdf8;
+}
+
+.crown-map-btn.active {
+    background: #0284c7;
+    border-color: #38bdf8;
+    color: #ffffff;
+}
+
+.crown-map-btn-close:hover {
+    background: #991b1b;
+    border-color: #ef4444;
+    color: #ffffff;
+}
+
+.crown-map-body {
+    position: relative;
+    flex: 1 1 auto;
+    min-height: 0;
+    width: 100%;
+    height: 100%;
+}
+
+.crown-map-canvas {
+    width: 100%;
+    height: 100%;
+    background: #0b111c;
+}
+
+.crown-map-info {
+    position: absolute;
+    bottom: 18px;
+    right: 18px;
+    width: 245px;
+    background: rgba(15, 23, 42, 0.94);
+    backdrop-filter: blur(8px);
+    border: 1px solid #334155;
+    border-radius: 8px;
+    padding: 10px 12px;
+    color: #f1f5f9;
+    font-size: 12px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+    z-index: 60;
+}
+
+.crown-map-info-hdr {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 6px;
+    font-weight: 700;
+    color: #34d399;
+    font-size: 13px;
+}
+
+.crown-map-info-tbl {
+    width: 100%;
+    border-collapse: collapse;
+    margin-bottom: 8px;
+}
+
+.crown-map-info-tbl td {
+    padding: 2px 0;
+}
+
+.crown-map-info-tbl td:first-child {
+    color: #94a3b8;
+    width: 48%;
+}
+
+.crown-map-info-tbl td:last-child {
+    color: #f8fafc;
+    font-family: monospace;
+    text-align: right;
+}
+
+.crown-map-fly-btn {
+    width: 100%;
+    padding: 6px 10px;
+    background: #059669;
+    border: 1px solid #10b981;
+    border-radius: 5px;
+    color: #ffffff;
+    font-size: 11px;
+    font-weight: 700;
+    cursor: pointer;
+}
+
+.crown-map-fly-btn:hover {
+    background: #10b981;
+}

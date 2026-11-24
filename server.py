@@ -82,6 +82,19 @@ class HybridRequestHandler(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps(status).encode("utf-8"))
             return
 
+        if path == "/api/crowns":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_cors_headers()
+            self.end_headers()
+            payload = (
+                self.manager.crown_polygons
+                if (self.manager and self.manager.crown_polygons is not None)
+                else {"crowns": [], "origin": [0, 0, 0], "summary": {"count": 0}}
+            )
+            self.wfile.write(json.dumps(payload).encode("utf-8"))
+            return
+
         # 2. Web UI files (e.g. /, /index.html, /app.js, /style.css)
         if path == "/" or path == "/index.html":
             file_path = os.path.join(self.web_root, "index.html")

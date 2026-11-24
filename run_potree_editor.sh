@@ -30,20 +30,37 @@ export MPLCONFIGDIR="${MPLCONFIGDIR:-$PWD/.mplcache}"
 # to native Wayland.
 export QT_QPA_PLATFORM=xcb
 
-# KDE theme + native file dialogs (Linux). PyQt6 bundles its own Qt and only
-# searches its private plugin dir, which ships GTK/portal themes but NOT
-# KDEPlasmaPlatformTheme6.so. Without the system plugin path Qt falls back to
-# the Fusion style and draws its own file picker with no Places/quick folders.
-# Adding the distro dir lets Qt load the real KDE theme, so Open/Save use
-# Dolphin's native picker (with bookmarks, Recent, Devices). Harmless when the
-# directory is absent (non-KDE desktops, Windows/macOS); override by exporting
-# POTREEEDITOR_KEEP_QT_PLUGINS=1 before launching.
+# Native file dialogs (Linux). PyQt6 bundles its own Qt and only searches its
+# private plugin dir, which ships GTK/portal themes but NOT KDEPlasmaPlatformTheme6.so.
+# When the system Qt6 minor version matches PyQt6's bundled Qt version, adding the
+# distro plugin dir lets Qt load the native KDE/Dolphin theme. When system Qt6 has
+# upgraded past PyQt6's bundled Qt (incompatible minor versions), or on desktops
+# without KDEPlasmaPlatformTheme6.so (such as Ubuntu/GNOME), Qt rejects the system
+# plugins and would otherwise fall back to Fusion's bare dialog; in that case use
+# PyQt6's own version-matched xdgdesktopportal plugin over D-Bus instead.
+# Override by exporting POTREEEDITOR_KEEP_QT_PLUGINS=1 before launching.
 if [ "${POTREEEDITOR_KEEP_QT_PLUGINS:-0}" != "1" ]; then
-    for _qt6_dir in /usr/lib/qt6/plugins /usr/lib/x86_64-linux-gnu/qt6/plugins; do
-        if [ -d "$_qt6_dir" ]; then
-            export QT_PLUGIN_PATH="${QT_PLUGIN_PATH:+$QT_PLUGIN_PATH:}$_qt6_dir"
-        fi
-    done
+    _venv_qt="$(.venv/bin/python -c 'from PyQt6.QtCore import QT_VERSION_STR; print(".".join(QT_VERSION_STR.split(".")[:2]))' 2>/dev/null || true)"
+    _sys_qt=""
+    if command -v qmake6 >/dev/null 2>&1; then
+        _sys_qt="$(qmake6 -query QT_VERSION 2>/dev/null | cut -d. -f1,2 || true)"
+    elif command -v qtpaths6 >/dev/null 2>&1; then
+        _sys_qt="$(qtpaths6 --qt-version 2>/dev/null | cut -d. -f1,2 || true)"
+    fi
+
+    _loaded_sys_kde=0
+    if [ -n "$_venv_qt" ] && [ "$_venv_qt" = "$_sys_qt" ]; then
+        for _qt6_dir in /usr/lib/qt6/plugins /usr/lib/x86_64-linux-gnu/qt6/plugins; do
+            if [ -f "$_qt6_dir/platformthemes/KDEPlasmaPlatformTheme6.so" ]; then
+                export QT_PLUGIN_PATH="${QT_PLUGIN_PATH:+$QT_PLUGIN_PATH:}$_qt6_dir"
+                _loaded_sys_kde=1
+            fi
+        done
+    fi
+
+    if [ "$_loaded_sys_kde" -eq 0 ] && [ -z "${QT_QPA_PLATFORMTHEME:-}" ]; then
+        export QT_QPA_PLATFORMTHEME=xdgdesktopportal
+    fi
 fi
 
 exec .venv/bin/python main.py "$@"

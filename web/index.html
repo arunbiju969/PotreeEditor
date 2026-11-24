@@ -9,6 +9,7 @@
     <link rel="stylesheet" type="text/css" href="/libs/jquery-ui/jquery-ui.min.css">
     <link rel="stylesheet" type="text/css" href="/libs/spectrum/spectrum.css">
     <link rel="stylesheet" type="text/css" href="/libs/jstree/themes/mixed/style.css">
+    <link rel="stylesheet" type="text/css" href="/libs/openlayers3/ol.css">
     <link rel="stylesheet" type="text/css" href="/web/style.css">
 </head>
 <body>
@@ -19,6 +20,7 @@
     <script src="/libs/tween/tween.min.js"></script>
     <script src="/libs/d3/d3.js"></script>
     <script src="/libs/proj4/proj4.js"></script>
+    <script src="/libs/openlayers3/ol.js"></script>
     <!-- COPC/EPT streaming: potree.js reads window.Copc (EptLoader.js:24). Without this
          library a .copc.laz URL fails with "Cannot destructure property 'Copc'". -->
     <script src="/libs/copc/index.js"></script>
@@ -83,6 +85,55 @@
                 <tbody id="inspExtraAttrs"></tbody>
             </table>
             <button id="btnInspectViewTree" style="display:none; margin-top:10px; width:100%; padding:7px 10px; background:#10b981; color:#ffffff; border:none; border-radius:6px; font-weight:600; cursor:pointer; font-size:12px; box-shadow: 0 2px 6px rgba(16,185,129,0.3);">View Tree (All Points)</button>
+        </div>
+
+        <!-- Interactive 2D Crown Map Overlay (OpenLayers 3 + proj4) -->
+        <div id="crownMapOverlay" class="crown-map-overlay" style="display:none;">
+            <div class="crown-map-header">
+                <div class="crown-map-title-wrap">
+                    <span class="crown-map-title">2D Crown Map</span>
+                    <span id="crownMapStats" class="crown-map-stats">0 crowns</span>
+                </div>
+                <div class="crown-map-controls">
+                    <label for="crownMapBasemap" class="crown-map-lbl">Basemap:</label>
+                    <select id="crownMapBasemap" class="crown-map-select">
+                        <option value="satellite" selected>Satellite (Esri)</option>
+                        <option value="osm">OpenStreetMap</option>
+                        <option value="local">Dark Canvas (Local XY)</option>
+                    </select>
+                    <label for="crownMapCrs" class="crown-map-lbl">CRS:</label>
+                    <select id="crownMapCrs" class="crown-map-select">
+                        <option value="auto" selected>Auto / Detected</option>
+                        <option value="+proj=utm +zone=20 +datum=NAD83 +units=m +no_defs">UTM 20N (NAD83 / NS)</option>
+                        <option value="+proj=utm +zone=19 +datum=NAD83 +units=m +no_defs">UTM 19N (NAD83)</option>
+                        <option value="+proj=utm +zone=18 +datum=NAD83 +units=m +no_defs">UTM 18N (NAD83)</option>
+                        <option value="+proj=utm +zone=17 +datum=NAD83 +units=m +no_defs">UTM 17N (NAD83)</option>
+                        <option value="+proj=utm +zone=21 +datum=NAD83 +units=m +no_defs">UTM 21N (NAD83)</option>
+                        <option value="local">Local XY (Meters)</option>
+                    </select>
+                    <button id="btnCrownMapSplit" class="crown-map-btn" title="Toggle split screen alongside 3D viewport">Split Screen</button>
+                    <button id="btnCrownMapFit" class="crown-map-btn" title="Zoom to fit all crown polygons">Fit Bounds</button>
+                    <button id="btnCrownMapClose" class="crown-map-btn crown-map-btn-close" title="Close 2D Map">✕ Close</button>
+                </div>
+            </div>
+            <div class="crown-map-body">
+                <div id="crownMapCanvas" class="crown-map-canvas"></div>
+                <div id="crownMapInfo" class="crown-map-info" style="display:none;">
+                    <div class="crown-map-info-hdr">
+                        <span id="crownInfoTitle">Crown #—</span>
+                        <button id="btnCrownInfoClose" class="close-btn" title="Dismiss">✕</button>
+                    </div>
+                    <table class="crown-map-info-tbl">
+                        <tr><td>Area:</td><td id="crownInfoArea">-</td></tr>
+                        <tr><td>Diameter:</td><td id="crownInfoDiam">-</td></tr>
+                        <tr><td>Perimeter:</td><td id="crownInfoPerim">-</td></tr>
+                        <tr><td>Top Z:</td><td id="crownInfoZTop">-</td></tr>
+                        <tr><td>Crown Depth:</td><td id="crownInfoDepth">-</td></tr>
+                        <tr><td>Leaf Points:</td><td id="crownInfoPts">-</td></tr>
+                    </table>
+                    <button id="btnCrownMapFly3D" class="crown-map-fly-btn">Fly to Tree in 3D</button>
+                </div>
+            </div>
         </div>
     </div>
 

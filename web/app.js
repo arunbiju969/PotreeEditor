@@ -689,6 +689,627 @@ window.loadStagedVisuals = (editsList) => {
 };
 
 // ---------------------------------------------------------------------------
+// 3D Crown Polygon Extraction Overlay API
+// ---------------------------------------------------------------------------
+let crownPolygonsData = null;
+let crownPolygonsGroup = null;
+let crownPolygonsStyle = {
+    visible: true,
+    showFill: true,
+    fillOpacity: 0.25,
+    showLabels: false,
+    heightMode: 'top'
+};
+
+function crownColorForTreeId(tid) {
+    const idx = (Math.abs(Math.round(Number(tid) || 1)) % (FORESTRY_TREE_STOPS - 1)) + 1;
+    return FORESTRY_TREE_GRADIENT[idx][1];
+}
+
+function disposeCrownPolygonsGroup() {
+    if (!crownPolygonsGroup) return;
+    overlayScene.remove(crownPolygonsGroup);
+    crownPolygonsGroup.traverse(child => {
+        if (child.geometry) child.geometry.dispose();
+        if (child.material) {
+            if (Array.isArray(child.material)) {
+                child.material.forEach(m => {
+                    if (m.map) m.map.dispose();
+                    m.dispose();
+                });
+            } else {
+                if (child.material.map) child.material.map.dispose();
+                child.material.dispose();
+            }
+        }
+    });
+    crownPolygonsGroup = null;
+}
+
+function crownElevationForRecord(crown, mode) {
+    if (mode === 'base') return Number(crown.z_base ?? crown.z_top ?? 0);
+    if (mode === 'mean') return Number(crown.z_mean ?? crown.z_top ?? 0);
+    return Number(crown.z_top ?? 0);
+}
+
+function rebuildCrownPolygonsMesh() {
+    disposeCrownPolygonsGroup();
+    if (!crownPolygonsData || !Array.isArray(crownPolygonsData.crowns) || crownPolygonsData.crowns.length === 0) {
+        if (viewer && viewer.render) viewer.render();
+        return;
+    }
+
+    const origin = crownPolygonsData.origin || [0, 0, 0];
+    const ox = Number(origin[0]) || 0;
+    const oy = Number(origin[1]) || 0;
+    const oz = Number(origin[2]) || 0;
+    const hMode = crownPolygonsStyle.heightMode || 'top';
+
+    const group = new THREE.Group();
+    group.name = 'crown_polygons_group';
+    group.position.set(ox, oy, oz);
+    group.visible = Boolean(crownPolygonsStyle.visible);
+
+    const crowns = crownPolygonsData.crowns;
+    let totalSegments = 0;
+    for (const c of crowns) {
+        if (c.coords && c.coords.length >= 3) {
+            totalSegments += c.coords.length;
+        }
+    }
+
+    // 1. Batched outline LineSegments across all crowns
+    if (totalSegments > 0) {
+        const linePos = new Float32Array(totalSegments * 2 * 3);
+        const lineCol = new Float32Array(totalSegments * 2 * 3);
+        let ptr = 0;
+
+        for (const c of crowns) {
+            const coords = c.coords;
+            if (!coords || coords.length < 3) continue;
+            const col = crownColorForTreeId(c.tree_id);
+            const zRel = crownElevationForRecord(c, hMode) - oz;
+            const n = coords.length;
+            for (let i = 0; i < n; i++) {
+                const a = coords[i];
+                const b = coords[(i + 1) % n];
+                linePos[ptr]     = a[0] - ox;
+                linePos[ptr + 1] = a[1] - oy;
+                linePos[ptr + 2] = zRel;
+                lineCol[ptr]     = col.r;
+                lineCol[ptr + 1] = col.g;
+                lineCol[ptr + 2] = col.b;
+
+                linePos[ptr + 3] = b[0] - ox;
+                linePos[ptr + 4] = b[1] - oy;
+                linePos[ptr + 5] = zRel;
+                lineCol[ptr + 3] = col.r;
+                lineCol[ptr + 4] = col.g;
+                lineCol[ptr + 5] = col.b;
+                ptr += 6;
+            }
+        }
+
+        const lineGeom = new THREE.BufferGeometry();
+        lineGeom.setAttribute('position', new THREE.BufferAttribute(linePos, 3));
+        lineGeom.setAttribute('color', new THREE.BufferAttribute(lineCol, 3));
+        lineGeom.computeBoundingSphere();
+
+        const lineMat = new THREE.LineBasicMaterial({
+            vertexColors: true,
+            depthTest: false,
+            depthWrite: false,
+            transparent: false
+        });
+        const lines = new THREE.LineSegments(lineGeom, lineMat);
+        lines.renderOrder = 951;
+        lines.frustumCulled = false;
+        group.add(lines);
+    }
+
+    // 2. Batched translucent polygon fills
+    if (crownPolygonsStyle.showFill) {
+        const triChunks = [];
+        let totalTriVerts = 0;
+
+        for (const c of crowns) {
+            const coords = c.coords;
+            if (!coords || coords.length < 3) continue;
+            try {
+                const contour = coords.map(p => new THREE.Vector2(p[0] - ox, p[1] - oy));
+                const faces = THREE.ShapeUtils.triangulateShape(contour, []);
+                if (faces && faces.length > 0) {
+                    const col = crownColorForTreeId(c.tree_id);
+                    const zRel = crownElevationForRecord(c, hMode) - oz;
+                    triChunks.push({ contour, faces, col, zRel });
+                    totalTriVerts += faces.length * 3;
+                }
+            } catch (_) {}
+        }
+
+        if (totalTriVerts > 0) {
+            const fillPos = new Float32Array(totalTriVerts * 3);
+            const fillCol = new Float32Array(totalTriVerts * 3);
+            let fPtr = 0;
+
+            for (const item of triChunks) {
+                const { contour, faces, col, zRel } = item;
+                for (const face of faces) {
+                    for (let k = 0; k < 3; k++) {
+                        const v = contour[face[k]];
+                        fillPos[fPtr]     = v.x;
+                        fillPos[fPtr + 1] = v.y;
+                        fillPos[fPtr + 2] = zRel;
+                        fillCol[fPtr]     = col.r;
+                        fillCol[fPtr + 1] = col.g;
+                        fillCol[fPtr + 2] = col.b;
+                        fPtr += 3;
+                    }
+                }
+            }
+
+            const fillGeom = new THREE.BufferGeometry();
+            fillGeom.setAttribute('position', new THREE.BufferAttribute(fillPos, 3));
+            fillGeom.setAttribute('color', new THREE.BufferAttribute(fillCol, 3));
+            fillGeom.computeBoundingSphere();
+
+            const fillMat = new THREE.MeshBasicMaterial({
+                vertexColors: true,
+                transparent: true,
+                opacity: Math.max(0.02, Math.min(0.95, Number(crownPolygonsStyle.fillOpacity) || 0.25)),
+                side: THREE.DoubleSide,
+                depthTest: false,
+                depthWrite: false
+            });
+            const fillMesh = new THREE.Mesh(fillGeom, fillMat);
+            fillMesh.renderOrder = 950;
+            fillMesh.frustumCulled = false;
+            group.add(fillMesh);
+        }
+    }
+
+    // 3. Optional tree ID labels (capped at 400 largest crowns to preserve WebGL memory)
+    if (crownPolygonsStyle.showLabels) {
+        const MAX_LABELS = 400;
+        const ranked = crowns.length > MAX_LABELS
+            ? crowns.slice().sort((a, b) => (b.area_m2 || 0) - (a.area_m2 || 0)).slice(0, MAX_LABELS)
+            : crowns;
+        if (crowns.length > MAX_LABELS) {
+            showToast(`Crown labels capped at top ${MAX_LABELS} crowns by area (${crowns.length} total).`, 4000);
+        }
+        for (const c of ranked) {
+            if (!c.centroid) continue;
+            const col = crownColorForTreeId(c.tree_id);
+            const hex = '#' + col.getHexString();
+            const zRel = crownElevationForRecord(c, hMode) - oz + 0.8;
+            const sprite = makeTextSprite(`#${c.tree_id}`, hex);
+            sprite.position.set(c.centroid[0] - ox, c.centroid[1] - oy, zRel);
+            sprite.renderOrder = 952;
+            group.add(sprite);
+        }
+    }
+
+    overlayScene.add(group);
+    crownPolygonsGroup = group;
+    if (viewer && viewer.render) viewer.render();
+}
+
+window.setCrownPolygons = function (payload) {
+    crownPolygonsData = payload || null;
+    rebuildCrownPolygonsMesh();
+    if (crownMapOpen) {
+        window.refreshCrownMap();
+    }
+};
+
+window.loadCrownPolygonsFromServer = async function () {
+    try {
+        const res = await fetch('/api/crowns');
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        window.setCrownPolygons(data);
+        const cnt = (data.summary && data.summary.count) || (data.crowns ? data.crowns.length : 0);
+        const meanArea = (data.summary && data.summary.mean_area_m2) || 0;
+        if (cnt > 0) {
+            showToast(`Crown Extraction: ${cnt} polygons rendered (avg ${Number(meanArea).toFixed(1)} m²)`, 5000);
+        } else {
+            showToast('Crown Extraction: no crown polygons generated for the selected filters.', 4000);
+        }
+    } catch (err) {
+        console.error('Failed to load crown polygons:', err);
+        showToast('Failed to load crown polygons: ' + err.message, 5000);
+    }
+};
+
+window.setCrownPolygonsStyle = function (style) {
+    if (!style || typeof style !== 'object') return;
+    const keys = Object.keys(style);
+    const onlyVis = keys.length > 0 && keys.every(k => k === 'visible');
+    Object.assign(crownPolygonsStyle, style);
+    if (onlyVis && crownPolygonsGroup) {
+        crownPolygonsGroup.visible = Boolean(crownPolygonsStyle.visible);
+        if (viewer && viewer.render) viewer.render();
+    } else {
+        rebuildCrownPolygonsMesh();
+    }
+    if (crownMapOpen && crownMapVectorLayer) {
+        crownMapVectorLayer.changed();
+    }
+};
+
+window.setCrownPolygonsVisibility = function (visible) {
+    window.setCrownPolygonsStyle({ visible: Boolean(visible) });
+};
+
+window.clearCrownPolygons = function () {
+    crownPolygonsData = null;
+    disposeCrownPolygonsGroup();
+    if (viewer && viewer.render) viewer.render();
+    crownMapSelectedTreeId = null;
+    if (crownMapVectorSource) crownMapVectorSource.clear();
+    const statsEl = document.getElementById('crownMapStats');
+    if (statsEl) statsEl.textContent = '0 crowns';
+    const infoEl = document.getElementById('crownMapInfo');
+    if (infoEl) infoEl.style.display = 'none';
+};
+
+// ---------------------------------------------------------------------------
+// Interactive 2D Crown Map (OpenLayers v3.11.2 + proj4) & Top-Down 3D View
+// ---------------------------------------------------------------------------
+let crownMap = null;
+let crownMapTileLayer = null;
+let crownMapVectorSource = null;
+let crownMapVectorLayer = null;
+let crownMapOpen = false;
+let crownMapSplit = false;
+let crownMapViewProj = 'EPSG:3857';
+let crownMapSelectedTreeId = null;
+let crownMapSelectedCrown = null;
+const crownMapStyleCache = new Map();
+
+function createBasemapSource(kind) {
+    if (kind === 'osm') {
+        return new ol.source.OSM();
+    }
+    return new ol.source.XYZ({
+        url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+        maxZoom: 20,
+        attributions: [new ol.Attribution({ html: 'Tiles &copy; Esri' })]
+    });
+}
+
+function resolveCrownMapSourceProj() {
+    const crsSel = document.getElementById('crownMapCrs');
+    const chosen = crsSel ? crsSel.value : 'auto';
+    if (chosen && chosen !== 'auto') {
+        return chosen; // either a '+proj=utm ...' string or 'local'
+    }
+    if (crownPolygonsData && crownPolygonsData.proj4_hint) {
+        return crownPolygonsData.proj4_hint;
+    }
+    const origin = (crownPolygonsData && crownPolygonsData.origin) || [0, 0, 0];
+    const ox = Number(origin[0]) || 0;
+    const oy = Number(origin[1]) || 0;
+    if (ox >= 100000 && ox <= 900000 && oy > 0 && oy <= 10000000) {
+        return '+proj=utm +zone=20 +datum=NAD83 +units=m +no_defs';
+    }
+    return 'local';
+}
+
+function showCrownMapInfoCard(crown) {
+    const infoEl = document.getElementById('crownMapInfo');
+    if (!infoEl) return;
+    if (!crown) {
+        infoEl.style.display = 'none';
+        crownMapSelectedCrown = null;
+        return;
+    }
+    crownMapSelectedCrown = crown;
+    document.getElementById('crownInfoTitle').textContent = `Crown #${crown.tree_id}`;
+    document.getElementById('crownInfoArea').textContent = `${Number(crown.area_m2 || 0).toFixed(2)} m²`;
+    document.getElementById('crownInfoDiam').textContent = `${Number(crown.crown_diameter_m || 0).toFixed(2)} m`;
+    document.getElementById('crownInfoPerim').textContent = `${Number(crown.perimeter_m || 0).toFixed(2)} m`;
+    document.getElementById('crownInfoZTop').textContent = `${Number(crown.z_top || 0).toFixed(2)} m`;
+    document.getElementById('crownInfoDepth').textContent = `${Number(crown.crown_depth_m || 0).toFixed(2)} m`;
+    document.getElementById('crownInfoPts').textContent = `${Number(crown.point_count || 0).toLocaleString()}`;
+    infoEl.style.display = 'block';
+}
+
+function ensureCrownMapInitialized() {
+    if (crownMap) return;
+    if (typeof ol === 'undefined') {
+        showToast('OpenLayers library not loaded.', 4000);
+        return;
+    }
+
+    const baseSel = document.getElementById('crownMapBasemap');
+    const initialBase = baseSel ? baseSel.value : 'satellite';
+
+    crownMapTileLayer = new ol.layer.Tile({
+        source: createBasemapSource(initialBase),
+        visible: initialBase !== 'local'
+    });
+
+    crownMapVectorSource = new ol.source.Vector();
+    crownMapVectorLayer = new ol.layer.Vector({
+        source: crownMapVectorSource,
+        style: function (feature, resolution) {
+            const c = feature.get('crown');
+            if (!c) return null;
+            const tid = c.tree_id;
+            const isSel = crownMapSelectedTreeId !== null && Number(tid) === Number(crownMapSelectedTreeId);
+            const showFill = Boolean(crownPolygonsStyle.showFill) || isSel;
+            const op = isSel ? Math.min(0.65, Math.max(0.35, Number(crownPolygonsStyle.fillOpacity) || 0.25))
+                             : (showFill ? (Number(crownPolygonsStyle.fillOpacity) || 0.25) : 0);
+            const showLbl = isSel || (Boolean(crownPolygonsStyle.showLabels) && resolution < 0.8);
+            const key = `${Math.abs(Math.round(tid)) % 64}_${isSel ? 1 : 0}_${op.toFixed(2)}_${showLbl ? tid : ''}`;
+
+            let cached = crownMapStyleCache.get(key);
+            if (!cached) {
+                const col = crownColorForTreeId(tid);
+                const r = Math.round(col.r * 255);
+                const g = Math.round(col.g * 255);
+                const b = Math.round(col.b * 255);
+                const strokeCol = isSel ? '#fde047' : `rgb(${r},${g},${b})`;
+                const fill = showFill ? new ol.style.Fill({ color: `rgba(${r},${g},${b},${op})` }) : undefined;
+                const text = showLbl
+                    ? new ol.style.Text({
+                        text: `#${tid}`,
+                        font: 'bold 11px system-ui, sans-serif',
+                        fill: new ol.style.Fill({ color: '#f8fafc' }),
+                        stroke: new ol.style.Stroke({ color: '#0f172a', width: 3 })
+                    })
+                    : undefined;
+                cached = [new ol.style.Style({
+                    stroke: new ol.style.Stroke({ color: strokeCol, width: isSel ? 3 : 1.75 }),
+                    fill,
+                    text
+                })];
+                if (crownMapStyleCache.size > 2000) crownMapStyleCache.clear();
+                crownMapStyleCache.set(key, cached);
+            }
+            return cached;
+        }
+    });
+
+    crownMap = new ol.Map({
+        target: 'crownMapCanvas',
+        layers: [crownMapTileLayer, crownMapVectorLayer],
+        view: new ol.View({
+            projection: 'EPSG:3857',
+            center: [0, 0],
+            zoom: 2
+        })
+    });
+
+    crownMap.on('singleclick', (evt) => {
+        let clicked = null;
+        crownMap.forEachFeatureAtPixel(evt.pixel, (feat) => {
+            clicked = feat.get('crown');
+            return true;
+        });
+        crownMapSelectedTreeId = clicked ? clicked.tree_id : null;
+        showCrownMapInfoCard(clicked);
+        if (crownMapVectorLayer) crownMapVectorLayer.changed();
+    });
+
+    const crsSel = document.getElementById('crownMapCrs');
+    if (baseSel) {
+        baseSel.addEventListener('change', () => {
+            window.refreshCrownMap();
+        });
+    }
+    if (crsSel) {
+        crsSel.addEventListener('change', () => {
+            window.refreshCrownMap();
+        });
+    }
+    const btnFit = document.getElementById('btnCrownMapFit');
+    if (btnFit) {
+        btnFit.addEventListener('click', () => fitCrownMapExtent());
+    }
+    const btnSplit = document.getElementById('btnCrownMapSplit');
+    if (btnSplit) {
+        btnSplit.addEventListener('click', () => {
+            crownMapSplit = !crownMapSplit;
+            const overlay = document.getElementById('crownMapOverlay');
+            if (overlay) overlay.classList.toggle('split-mode', crownMapSplit);
+            btnSplit.classList.toggle('active', crownMapSplit);
+            btnSplit.textContent = crownMapSplit ? 'Full Map' : 'Split Screen';
+            setTimeout(() => {
+                if (crownMap) crownMap.updateSize();
+                fitCrownMapExtent();
+            }, 40);
+        });
+    }
+    const btnClose = document.getElementById('btnCrownMapClose');
+    if (btnClose) {
+        btnClose.addEventListener('click', () => {
+            window.openCrownMap(false);
+            postJSON('/api/event', { event: 'crown_map_toggled', open: false }).catch(() => {});
+        });
+    }
+    const btnInfoClose = document.getElementById('btnCrownInfoClose');
+    if (btnInfoClose) {
+        btnInfoClose.addEventListener('click', () => {
+            crownMapSelectedTreeId = null;
+            showCrownMapInfoCard(null);
+            if (crownMapVectorLayer) crownMapVectorLayer.changed();
+        });
+    }
+    const btnFly = document.getElementById('btnCrownMapFly3D');
+    if (btnFly) {
+        btnFly.addEventListener('click', () => {
+            if (!crownMapSelectedCrown || !viewer || !viewer.scene) return;
+            const c = crownMapSelectedCrown;
+            const tx = Number(c.centroid[0]);
+            const ty = Number(c.centroid[1]);
+            const tz = Number(c.z_mean ?? c.z_top ?? 0);
+            const dist = Math.max(12, Number(c.crown_diameter_m || 4) * 3.5);
+            viewer.scene.view.position.set(tx, ty - dist * 0.7, Number(c.z_top || tz) + dist * 0.9);
+            viewer.scene.view.lookAt(new THREE.Vector3(tx, ty, tz));
+            viewer.render();
+            if (!crownMapSplit) {
+                crownMapSplit = true;
+                const overlay = document.getElementById('crownMapOverlay');
+                const splitBtn = document.getElementById('btnCrownMapSplit');
+                if (overlay) overlay.classList.add('split-mode');
+                if (splitBtn) {
+                    splitBtn.classList.add('active');
+                    splitBtn.textContent = 'Full Map';
+                }
+                setTimeout(() => { if (crownMap) crownMap.updateSize(); }, 40);
+            }
+            showToast(`Centered 3D camera on Crown #${c.tree_id}`, 3000);
+        });
+    }
+}
+
+function fitCrownMapExtent() {
+    if (!crownMap || !crownMapVectorSource) return;
+    crownMap.updateSize();
+    const extent = crownMapVectorSource.getExtent();
+    const size = crownMap.getSize();
+    if (!extent || ol.extent.isEmpty(extent) || !size || size[0] <= 0 || size[1] <= 0) return;
+    crownMap.getView().fit(extent, size, {
+        padding: [36, 36, 36, 36],
+        maxZoom: 21,
+        constrainResolution: false
+    });
+}
+
+window.refreshCrownMap = function () {
+    ensureCrownMapInitialized();
+    if (!crownMap || !crownMapVectorSource) return;
+
+    const baseSel = document.getElementById('crownMapBasemap');
+    const basemap = baseSel ? baseSel.value : 'satellite';
+    const srcProj = resolveCrownMapSourceProj();
+    const useGeo = srcProj !== 'local' && basemap !== 'local' && typeof proj4 !== 'undefined';
+
+    if (crownMapTileLayer) {
+        if (useGeo) {
+            crownMapTileLayer.setSource(createBasemapSource(basemap));
+            crownMapTileLayer.setVisible(true);
+        } else {
+            crownMapTileLayer.setVisible(false);
+        }
+    }
+
+    const desiredViewProj = useGeo ? 'EPSG:3857' : 'LOCAL_XY';
+    if (crownMapViewProj !== desiredViewProj) {
+        crownMapViewProj = desiredViewProj;
+        if (desiredViewProj === 'LOCAL_XY') {
+            crownMap.setView(new ol.View({
+                projection: new ol.proj.Projection({ code: 'LOCAL_XY', units: 'm' }),
+                center: [0, 0],
+                zoom: 18,
+                maxResolution: 5000
+            }));
+        } else {
+            crownMap.setView(new ol.View({
+                projection: 'EPSG:3857',
+                center: [0, 0],
+                zoom: 2
+            }));
+        }
+    }
+
+    crownMapVectorSource.clear();
+    const crowns = (crownPolygonsData && crownPolygonsData.crowns) || [];
+    const statsEl = document.getElementById('crownMapStats');
+    if (statsEl) {
+        const area = (crownPolygonsData && crownPolygonsData.summary && crownPolygonsData.summary.total_area_m2) || 0;
+        statsEl.textContent = crowns.length > 0
+            ? `${crowns.length.toLocaleString()} crowns · ${Number(area).toLocaleString()} m²`
+            : '0 crowns';
+    }
+
+    if (crowns.length === 0) return;
+
+    const features = [];
+    for (const c of crowns) {
+        const coords = c.coords;
+        if (!coords || coords.length < 3) continue;
+        const ring = [];
+        for (const pt of coords) {
+            if (useGeo) {
+                ring.push(proj4(srcProj, 'EPSG:3857', [Number(pt[0]), Number(pt[1])]));
+            } else {
+                ring.push([Number(pt[0]), Number(pt[1])]);
+            }
+        }
+        ring.push(ring[0].slice());
+        const feat = new ol.Feature({
+            geometry: new ol.geom.Polygon([ring]),
+            crown: c
+        });
+        features.push(feat);
+    }
+
+    crownMapVectorSource.addFeatures(features);
+    setTimeout(() => fitCrownMapExtent(), 40);
+};
+
+window.openCrownMap = function (open) {
+    const overlay = document.getElementById('crownMapOverlay');
+    if (!overlay) return;
+    crownMapOpen = Boolean(open);
+    overlay.style.display = crownMapOpen ? 'flex' : 'none';
+    if (crownMapOpen) {
+        window.refreshCrownMap();
+    }
+};
+
+window.toggleCrownMap = function () {
+    window.openCrownMap(!crownMapOpen);
+};
+
+window.crownTopDownView = function () {
+    if (!viewer || !viewer.scene) return;
+    const crowns = (crownPolygonsData && crownPolygonsData.crowns) || [];
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity, sumZ = 0, zCnt = 0;
+
+    if (crowns.length > 0) {
+        for (const c of crowns) {
+            if (c.coords) {
+                for (const pt of c.coords) {
+                    if (pt[0] < minX) minX = pt[0];
+                    if (pt[0] > maxX) maxX = pt[0];
+                    if (pt[1] < minY) minY = pt[1];
+                    if (pt[1] > maxY) maxY = pt[1];
+                }
+            }
+            if (c.z_top !== undefined) {
+                sumZ += Number(c.z_top);
+                zCnt += 1;
+            }
+        }
+    } else if (viewer.scene.pointclouds && viewer.scene.pointclouds.length > 0) {
+        const bb = viewer.scene.pointclouds[0].boundingBox.clone().applyMatrix4(viewer.scene.pointclouds[0].matrixWorld);
+        minX = bb.min.x; minY = bb.min.y;
+        maxX = bb.max.x; maxY = bb.max.y;
+        sumZ = (bb.min.z + bb.max.z) * 0.5;
+        zCnt = 1;
+    } else {
+        showToast('Load a point cloud or extract crowns first.', 3500);
+        return;
+    }
+
+    const cx = (minX + maxX) * 0.5;
+    const cy = (minY + maxY) * 0.5;
+    const cz = zCnt > 0 ? (sumZ / zCnt) : 0;
+    const span = Math.max(maxX - minX, maxY - minY, 20);
+    const fov = (viewer.getFOV ? viewer.getFOV() : 60) * Math.PI / 180;
+    const dist = (span * 0.55) / Math.tan(fov * 0.5);
+
+    viewer.scene.view.position.set(cx, cy - 0.1, cz + dist);
+    viewer.scene.view.lookAt(new THREE.Vector3(cx, cy, cz));
+    viewer.render();
+    showToast('Switched to Top-Down 3D canopy view', 3000);
+};
+
+// ---------------------------------------------------------------------------
 // Polygon Selection Tool
 // ---------------------------------------------------------------------------
 let polygonPoints = [];
